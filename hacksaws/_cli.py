@@ -76,7 +76,7 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
     if context.args.ecr:
         _ecr.logout(aws_account)
 
-    if action in ("login", 'in'):
+    if action in ("login", "in"):
         _aws.login(context)
         if context.args.ecr:
             _ecr.login(context, aws_account)
@@ -86,7 +86,7 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
             message=f"Logged into profile {context.profile}",
         )
 
-    if action in ("logout", 'out'):
+    if action in ("logout", "out"):
         return _configs.Result(
             code="MFA_LOGOUT",
             message=f"Logged out of profile {context.profile}",

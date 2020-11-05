@@ -132,7 +132,6 @@ and more details can be found at
 
 Additional Resources:
 
-- (Allows MFA-authenticated IAM users...)[https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_examples_aws_my-sec-creds-self-manage-mfa-only.html]
-- (IAM: Allows IAM users to self-manage an MFA device)[https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_examples_iam_mfa-selfmanage.html]
-- (Configuring MFA-protected API access)[https://docs.amazonaws.cn/en_us/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html]
-
+- [Allows MFA-authenticated IAM users...](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_examples_aws_my-sec-creds-self-manage-mfa-only.html)
+- [IAM: Allows IAM users to self-manage an MFA device](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_examples_iam_mfa-selfmanage.html)
+- [Configuring MFA-protected API access](https://docs.amazonaws.cn/en_us/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html)
