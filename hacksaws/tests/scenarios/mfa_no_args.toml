@@ -1,0 +1,4 @@
+args = ['mfa']
+
+[expected]
+code = 'MFA_HELP'

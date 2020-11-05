@@ -1,0 +1,4 @@
+args = []
+
+[expected]
+code = 'ACCESS_TYPE_HELP'

@@ -1,0 +1,31 @@
+args = ['mfa', 'logout', 'foo-profile']
+
+[expected]
+code = 'MFA_LOGOUT'
+subprocess_run_call_count = 0
+
+[lobotomy.clients.sts.get_caller_identity]
+UserId = 'A1234567890'
+Account = '0987654321'
+Arn = 'arn:aws:iam::0987654321:user/foo-user'
+
+[lobotomy.clients.sts.get_session_token.Credentials]
+AccessKeyId = 'A12334567890'
+SecretAccessKey = '******'
+SessionToken = 'some-session-token'
+Expiration = '2020-11-04T19:35:47.861356Z'
+
+[aws.credentials.foo-profile]
+aws_access_key_id = 'aws_access_key_id'
+aws_secret_access_key = 'aws_secret_access_key'
+aws_access_token = "aaaaaaaaaaaaaaaa"
+
+[aws.'foo-profile.store.credentials'.foo-profile]
+aws_access_key_id = 'aws_access_key_id'
+aws_secret_access_key = 'aws_secret_access_key'
+
+[aws.config.'profile foo-profile']
+mfa_serial = 'arn:aws:iam::0987654321:mfa/foo-user'
+region = 'us-west-2'
+output = 'json'
+s3 = { signature_version = 's3v4' }

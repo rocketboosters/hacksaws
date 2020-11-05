@@ -1,0 +1,4 @@
+args = ['mfa', 'login', 'foo-profile']
+
+[expected]
+code = 'HELP'
