@@ -54,10 +54,11 @@ def test_scenario(
     command = scenario["args"]
     aws = scenario.get("aws")
 
-    aws_directory = None
     if aws:
         aws_directory = pathlib.Path(tempfile.mkdtemp())
         command.append(f"--directory={aws_directory}")
+    else:
+        aws_directory = pathlib.Path("/dev/null/.aws")
 
     for filename, contents in (aws or {}).items():
         _write_settings(aws_directory.joinpath(filename), contents)
@@ -71,10 +72,10 @@ def test_scenario(
             "subprocess_run_call_count",
             subprocess_run.call_count,
         )
-        if aws_directory:
+        if aws:
             assert (
                 expected.get("aws", {}).items() <= _read_settings(aws_directory).items()
             )
     finally:
-        if aws_directory:
+        if aws_directory and aws_directory.exists():
             shutil.rmtree(aws_directory)

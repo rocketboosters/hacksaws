@@ -4,6 +4,9 @@
 [![build status](https://gitlab.com/rocket-boosters/hacksaws/badges/main/pipeline.svg)](https://gitlab.com/rocket-boosters/hacksaws/commits/main)
 [![coverage report](https://gitlab.com/rocket-boosters/hacksaws/badges/main/coverage.svg)](https://gitlab.com/rocket-boosters/hacksaws/commits/main)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Code style: flake8](https://img.shields.io/badge/code%20style-flake8-white)](https://gitlab.com/pycqa/flake8)
+[![Code style: mypy](https://img.shields.io/badge/code%20style-mypy-white)](http://mypy-lang.org/)
+[![PyPI - License](https://img.shields.io/pypi/l/hacksaws)](https://pypi.org/project/hacksaws/)
 
 A command line utility for AWS profiles using dynamic authentication 
 methods such as MFA. The CLI allows for dynamic logins to update

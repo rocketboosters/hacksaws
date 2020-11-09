@@ -86,11 +86,11 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
             message=f"Logged into profile {context.profile}",
         )
 
-    if action in ("logout", "out"):
-        return _configs.Result(
-            code="MFA_LOGOUT",
-            message=f"Logged out of profile {context.profile}",
-        )
+    # Only other available action is logging out.
+    return _configs.Result(
+        code="MFA_LOGOUT",
+        message=f"Logged out of profile {context.profile}",
+    )
 
 
 def console_main(arguments: typing.List[str] = None) -> _configs.Result:

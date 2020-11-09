@@ -59,15 +59,15 @@ class AwsAccount:
     region_name: str
 
     @property
-    def id(self) -> str:
+    def id(self) -> typing.Optional[str]:
         return self.identity_response.get("Account")
 
     @property
-    def user_arn(self) -> str:
+    def user_arn(self) -> typing.Optional[str]:
         return self.identity_response.get("Arn")
 
     @property
-    def user_id(self) -> str:
+    def user_id(self) -> typing.Optional[str]:
         return self.identity_response.get("UserId")
 
     @property
