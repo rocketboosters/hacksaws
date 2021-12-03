@@ -57,6 +57,7 @@ class AwsAccount:
     #: Response object returned from an sts.get_caller_identity request.
     identity_response: dict
     region_name: str
+    ecr_additional_regions: typing.Tuple[str, ...]
 
     @property
     def id(self) -> typing.Optional[str]:
@@ -71,8 +72,9 @@ class AwsAccount:
         return self.identity_response.get("UserId")
 
     @property
-    def ecr_registry(self) -> str:
-        return f"{self.id}.dkr.ecr.{self.region_name}.amazonaws.com"
+    def ecr_registries(self) -> typing.List[str]:
+        region_names = [self.region_name] + list(self.ecr_additional_regions)
+        return [f"{self.id}.dkr.ecr.{rn}.amazonaws.com" for rn in region_names]
 
     @classmethod
     def from_context(cls, context: "Context") -> "AwsAccount":
@@ -80,6 +82,7 @@ class AwsAccount:
         return cls(
             identity_response=session.client("sts").get_caller_identity(),
             region_name=session.region_name or "us-east-1",
+            ecr_additional_regions=tuple(set(context.args.ecr_region or [])),
         )
 
 

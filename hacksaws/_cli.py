@@ -28,6 +28,7 @@ def _create_parser() -> argparse.ArgumentParser:
 
     for p in [login_parser, logout_parser]:
         p.add_argument("--ecr", action="store_true")
+        p.add_argument("--ecr-region", action="append")
         p.add_argument(
             "-d",
             "--dir",

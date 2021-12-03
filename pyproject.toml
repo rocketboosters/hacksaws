@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "hacksaws"
-version = "0.1.2"
+version = "0.2.0"
 license = "MIT"
 description = """\
     A command line utility for AWS profiles using dynamic authentication \
@@ -24,7 +24,7 @@ classifiers = [
 exclude = ["hacksaws/tests"]
 
 [tool.poetry.scripts]
-hacksaws = 'hacksaws:console_main'
+hacksaws = 'hacksaws:main'
 
 [tool.poetry.dependencies]
 python = "^3.8.1"
@@ -33,22 +33,23 @@ boto3 = "^1.16.0"
 [tool.poetry.dev-dependencies]
 pytest = "^6.1.2"
 toml = "^0.10.1"
-coverage = "^5.3"
-lobotomy = "^0.1.4"
+coverage = ">=5.3"
+lobotomy = ">=0.1.4"
 black = { version = "*", allow-prereleases = true }
-pytest-cov = "^2.10.1"
-flake8 = "^3.8.4"
+pytest-cov = ">=2.10.1"
+flake8 = ">=3.8.4"
 flake8-black = "^0.2.1"
-mypy = "^0.790"
+mypy = ">=0.900"
 taskipy = "^1.4.0"
 
 [tool.taskipy.tasks]
 # https://github.com/illBeRoy/taskipy
 black = "black ."
-mypy = "poetry run mypy ./hacksaws/ --ignore-missing-imports"
+black_lint = "black . --check"
+mypy = "mypy . --install-types --non-interactive --ignore-missing-imports"
 flake8 = "flake8 ."
 test = "pytest . --cov-report=term-missing --cov=."
-lint = "task black && task flake8 && task mypy"
+lint = "task black_lint && task flake8 && task mypy"
 check = "task black && task flake8 && task mypy && task test"
 
 [build-system]

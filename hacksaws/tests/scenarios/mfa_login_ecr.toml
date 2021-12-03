@@ -1,9 +1,9 @@
-args = [ "mfa", "login", "foo-profile", "123456", "--ecr",]
+args = [ "mfa", "login", "foo-profile", "123456", "--ecr", "--ecr-region=us-west-2"]
 
 [expected]
 code = "MFA_LOGIN"
-# Logout call and then a login call
-subprocess_run_call_count = 2
+# Logout call and then a login call for two ECR regions
+subprocess_run_call_count = 4
 
 [aws.credentials.foo-profile]
 aws_access_key_id = "aws_access_key_id"

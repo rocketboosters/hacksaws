@@ -30,8 +30,29 @@ $ hacksaws mfa login <PROFILE_NAME> <MFA_CODE>
 There is a `--lifespan` flag that can be appended here to adjust
 the amount of time the profile login is valid for before it expires.
 The default is 12 hours (`--lifetime=43200` seconds), but that can
-be adjust to a maximum of 24 hours if the profile login allows
+be adjusted to a maximum of 24 hours if the profile login allows
 authentication lifespans of that length.
+
+ECR logins with docker can also be handled with the command by adding the `--ecr`
+flag. This will the local docker environment into ECR in the default AWS region for
+the specified profile.
+
+```shell script
+$ hacksaws mfa login <PROFILE_NAME> <MFA_CODE> --ecr
+```
+
+It is also possible to login to ECR in multiple regions with the `--ecr-region` flag.
+
+```shell script
+$ hacksaws mfa login <PROFILE_NAME> <MFA_CODE> \
+    --ecr \
+    --ecr-region=eu-central-1 \
+    --ecr-region=us-west-2 \
+    --ecr-region=ca-central-1
+```
+
+ECR will always log into the AWS default region. The `--ecr-region` flag allows for
+adding additional regions to the login command.
 
 Then to log out:
 

@@ -1,7 +1,7 @@
 import pathlib as _pathlib
 from importlib import metadata as _metadata
 
-from hacksaws._cli import console_main  # noqa
+from hacksaws._cli import console_main as console_main  # noqa: F401
 
 try:
     __version__ = _metadata.version(__package__)
@@ -13,3 +13,8 @@ except _metadata.PackageNotFoundError:  # pragma: no-cover
     __version__ = _toml.loads(
         _pathlib.Path(__file__).parent.parent.joinpath("pyproject.toml").read_text()
     )["tool"]["poetry"]["version"]
+
+
+def main():
+    """Execute entrypoint for CLI commands."""
+    console_main()

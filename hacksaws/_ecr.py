@@ -7,12 +7,17 @@ import boto3
 from hacksaws import _configs
 
 
-def login(context: _configs.Context, aws_account: _configs.AwsAccount):
-    """Logs into the AWS ECR registry in the given account."""
-    session = boto3.Session(profile_name=context.profile)
+def _do_login(context: _configs.Context, registry: str):
+    """Carry out the loging process for a region-specific registry."""
+    print(f"[STARTED]: Logging into {registry}", flush=True)
+    parts = registry.split(".")
+    account_id = parts[0]
+    region_name = parts[3]
+
+    session = boto3.Session(profile_name=context.profile, region_name=region_name)
     response = (
         session.client("ecr")
-        .get_authorization_token(registryIds=[aws_account.id])
+        .get_authorization_token(registryIds=[account_id])
         .get("authorizationData", {})[0]
     )
 
@@ -25,7 +30,7 @@ def login(context: _configs.Context, aws_account: _configs.AwsAccount):
         "login",
         f"--username={user}",
         "--password-stdin",
-        aws_account.ecr_registry,
+        registry,
     ]
     subprocess.run(cmd, input=password.encode(), check=True)
 
@@ -34,14 +39,18 @@ def login(context: _configs.Context, aws_account: _configs.AwsAccount):
     )
 
     delta: datetime.timedelta = expires_at - datetime.datetime.utcnow()
-    print(
-        "[SUCCESS]: Login session will expire in {} hours".format(
-            int(round(delta.total_seconds() / 3600))
-        )
-    )
+    hours = int(round(delta.total_seconds() / 3600))
+    print(f"[SUCCESS]: Login session will expire in {hours} hours", flush=True)
+
+
+def login(context: _configs.Context, aws_account: _configs.AwsAccount):
+    """Logs into the AWS ECR registry in the given account."""
+    for registry in aws_account.ecr_registries:
+        _do_login(context, registry)
 
 
 def logout(aws_account: _configs.AwsAccount):
     """Logs out of the registry for the given AWS account."""
-    cmd = ["docker", "logout", aws_account.ecr_registry]
-    subprocess.run(cmd, check=True)
+    for registry in aws_account.ecr_registries:
+        cmd = ["docker", "logout", registry]
+        subprocess.run(cmd, check=True)
