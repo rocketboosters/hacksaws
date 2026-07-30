@@ -41,10 +41,18 @@ The `--lifespan` option changes how long the temporary session remains valid.
 The default is 12 hours (`--lifespan=43200` seconds). AWS allows at most 24
 hours, and the profile's role or account policy may set a lower maximum.
 
-Hacksaws can also log Docker into Amazon ECR in the profile's default region:
+Hacksaws can also log a container engine into Amazon ECR in the profile's
+default region. Docker is used by default:
 
 ```shell
 hacksaws mfa login <PROFILE_NAME> <MFA_CODE> --ecr
+```
+
+Select Podman by adding `--podman`. The option chooses the container engine but
+does not enable ECR by itself, so use it together with `--ecr`:
+
+```shell
+hacksaws mfa login <PROFILE_NAME> <MFA_CODE> --ecr --podman
 ```
 
 Use `--ecr-region` more than once to add regions. The profile's primary region
@@ -70,6 +78,12 @@ registries as well:
 
 ```shell
 hacksaws mfa logout <PROFILE_NAME> --ecr
+```
+
+Use the same `--podman` selection when logging Podman out:
+
+```shell
+hacksaws mfa logout <PROFILE_NAME> --ecr --podman
 ```
 
 Use `--directory` to select a different AWS configuration directory:
@@ -135,15 +149,18 @@ uv run task build
 
 Publishing is handled by the
 [`publish.yaml`](https://github.com/rocketboosters/hacksaws/blob/main/.github/workflows/publish.yaml)
-GitHub Actions workflow and PyPI trusted publishing.
+GitHub Actions workflow and PyPI trusted publishing. Each successful release
+publishes the wheel and source distribution to PyPI, then creates a GitHub
+Release for the same tag with those exact artifacts attached.
 
 1. Update `project.version` in `pyproject.toml`.
 2. Run `uv lock`, `npm ci`, and `uv run task check`.
 3. Build locally with `uv build` and inspect the wheel and source distribution.
 4. Merge the version change to `main`.
-5. Create and push a `v<version>` tag, such as `v0.3.0`.
+5. Create and push a `v<version>` tag, such as `v0.3.2`.
 
 The workflow verifies that the tag exactly matches the project version before it
-builds and publishes. The repository's `pypi` environment must be configured as
-a trusted publisher for owner `rocketboosters`, repository `hacksaws`, workflow
-`publish.yaml`, and environment `pypi`.
+builds once, publishes the resulting artifacts to PyPI, and creates the GitHub
+Release only after PyPI succeeds. The repository's `pypi` environment must be
+configured as a trusted publisher for owner `rocketboosters`, repository
+`hacksaws`, workflow `publish.yaml`, and environment `pypi`.

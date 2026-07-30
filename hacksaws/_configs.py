@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Mapping
 
+ContainerEngine = Literal["docker", "podman"]
+
 
 class OperationalError(Exception):
     """An expected operational failure that is safe to show without a traceback."""
@@ -32,6 +34,11 @@ class Context:
     def profile(self) -> str:
         """Return the AWS profile name for this invocation."""
         return cast("str", self.args.profile)
+
+    @property
+    def container_engine(self) -> ContainerEngine:
+        """Return the container engine selected for ECR authentication."""
+        return "podman" if cast("bool", self.args.podman) else "docker"
 
     @property
     def aws_directory(self) -> Path:
