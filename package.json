@@ -1,0 +1,11 @@
+{
+  "name": "hacksaws-development",
+  "private": true,
+  "scripts": {
+    "format": "prettier --write package.json package-lock.json example_mfa_iam_policy.json README.md .prettierrc .github/workflows/*.yaml",
+    "format:check": "prettier --check package.json package-lock.json example_mfa_iam_policy.json README.md .prettierrc .github/workflows/*.yaml"
+  },
+  "devDependencies": {
+    "prettier": "3.9.6"
+  }
+}

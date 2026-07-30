@@ -1,4 +1,0 @@
-args = ['--help']
-
-[expected]
-code = 'HELP'

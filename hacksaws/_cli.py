@@ -1,13 +1,22 @@
+"""Command-line parsing and orchestration."""
+
+from __future__ import annotations
+
 import argparse
 import os
-import typing
+from typing import TYPE_CHECKING
+from typing import cast
 
 from hacksaws import _aws
 from hacksaws import _configs
 from hacksaws import _ecr
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 
 def _create_parser() -> argparse.ArgumentParser:
+    """Create the Hacksaws argument parser."""
     parser = argparse.ArgumentParser(
         prog="hacksaws",
         description="CLI for dynamic credential login management in AWS.",
@@ -26,17 +35,17 @@ def _create_parser() -> argparse.ArgumentParser:
     logout_parser = subparsers.add_parser("logout", aliases=["out"])
     logout_parser.add_argument("profile")
 
-    for p in [login_parser, logout_parser]:
-        p.add_argument("--ecr", action="store_true")
-        p.add_argument("--ecr-region", action="append")
-        p.add_argument(
+    for action_parser in (login_parser, logout_parser):
+        action_parser.add_argument("--ecr", action="store_true")
+        action_parser.add_argument("--ecr-region", action="append")
+        action_parser.add_argument(
             "-d",
             "--dir",
             "--directory",
             dest="directory",
-            default=os.path.expanduser("~/.aws"),
+            default="~/.aws",
         )
-        p.add_argument(
+        action_parser.add_argument(
             "-n",
             "--name",
             "--account-name",
@@ -46,74 +55,76 @@ def _create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_help(command: typing.List[str] = None):
-    """Prints command help without exiting the program."""
+def _print_help(command: Sequence[str] = ()) -> None:
+    """Print command help without exiting the program."""
     try:
-        _create_parser().parse_args((command or []) + ["--help"])
+        _create_parser().parse_args([*command, "--help"])
     except SystemExit:
-        pass
+        return
 
 
 def _run_mfa(context: _configs.Context) -> _configs.Result:
-    """Executes an action for an mfa access type."""
-    action = context.args.action
+    """Execute an MFA login or logout action."""
+    action = cast("str | None", context.args.action)
     if not action:
-        _print_help(["mfa"])
+        _print_help(("mfa",))
         return _configs.Result(
             code="MFA_HELP",
             message="Not enough arguments specified for the mfa command.",
+            exit_code=2,
+            stream="stderr",
         )
 
-    # Configure the session credential file locations based on CLI input.
     os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(context.credentials_path)
     os.environ["AWS_CONFIG_FILE"] = str(context.config_path)
 
-    # Log out first no matter what action is taking place.
     _aws.logout(context)
-
-    # Get account data
     aws_account = _configs.AwsAccount.from_context(context)
 
-    if context.args.ecr:
+    if cast("bool", context.args.ecr):
         _ecr.logout(aws_account)
 
-    if action in ("login", "in"):
+    if action in {"login", "in"}:
         _aws.login(context)
-        if context.args.ecr:
+        if cast("bool", context.args.ecr):
             _ecr.login(context, aws_account)
-
         return _configs.Result(
             code="MFA_LOGIN",
             message=f"Logged into profile {context.profile}",
         )
 
-    # Only other available action is logging out.
     return _configs.Result(
         code="MFA_LOGOUT",
         message=f"Logged out of profile {context.profile}",
     )
 
 
-def console_main(arguments: typing.List[str] = None) -> _configs.Result:
-    """Entrypoint for command line invocations."""
+def console_main(arguments: Sequence[str] | None = None) -> _configs.Result:
+    """Run a command-line invocation and return its structured result."""
+    parser = _create_parser()
     try:
-        parser = _create_parser()
-        context = _configs.Context(args=parser.parse_args(arguments))
-    except SystemExit:
-        return _configs.Result("HELP", "Displayed command help.")
+        namespace = parser.parse_args(arguments)
+    except SystemExit as error:
+        exit_code = cast("int", error.code)
+        code = "HELP" if exit_code == 0 else "ARGUMENT_ERROR"
+        return _configs.Result(code=code, message="", exit_code=exit_code)
 
-    access_type = context.args.access_type
-    if not access_type:
+    if not namespace.access_type:
         _print_help()
-        result = _configs.Result(
+        return _configs.Result(
             code="ACCESS_TYPE_HELP",
             message="Not enough arguments.",
-        )
-    else:
-        result = _run_mfa(context)
+            exit_code=2,
+            stream="stderr",
+        ).echo()
 
+    try:
+        result = _run_mfa(_configs.Context(args=namespace))
+    except _configs.OperationalError as error:
+        return _configs.Result(
+            code="OPERATIONAL_ERROR",
+            message=f"Error: {error}",
+            exit_code=1,
+            stream="stderr",
+        ).echo()
     return result.echo()
-
-
-# if __name__ == '__main__':
-#     console_main(['mfa', 'login', '--name=scout', 'billing-ro', '123456'])

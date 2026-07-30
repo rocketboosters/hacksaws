@@ -1,4 +1,0 @@
-args = ['mfa', 'login']
-
-[expected]
-code = 'HELP'

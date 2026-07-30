@@ -1,0 +1,7 @@
+.git/
+.venv/
+build/
+dist/
+htmlcov/
+node_modules/
+uv.lock

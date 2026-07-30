@@ -1,0 +1,595 @@
+"""Behavioral tests for the Hacksaws command-line package."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import os
+import tomllib
+from contextlib import ExitStack
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
+from unittest.mock import call
+from unittest.mock import patch
+
+import boto3
+import pytest
+from botocore.stub import Stubber
+
+import hacksaws
+from hacksaws import _aws
+from hacksaws import _configs
+from hacksaws import _ecr
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from mypy_boto3_ecr.client import ECRClient
+    from mypy_boto3_sts.client import STSClient
+
+ACCOUNT_ID = "123456789012"
+PROFILE = "developers"
+MFA_SERIAL = f"arn:aws:iam::{ACCOUNT_ID}:mfa/example"
+STATIC_ACCESS_KEY = "AKIASTATICEXAMPLE"
+STATIC_SECRET_KEY = "static-" + "value"
+TEMPORARY_ACCESS_KEY = "ASIATEMPORARY0000"
+TEMPORARY_SECRET_KEY = "temporary-" + "value"
+SESSION_TOKEN = "session-" + "value"
+
+
+def _write_ini(path: Path, data: dict[str, dict[str, str]]) -> None:
+    parser = configparser.ConfigParser()
+    parser.read_dict(data)
+    with path.open("w", encoding="utf-8") as stream:
+        parser.write(stream)
+
+
+def _read_ini(path: Path) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    return parser
+
+
+def _prepare_aws_directory(path: Path) -> None:
+    _write_ini(
+        path / "config",
+        {
+            f"profile {PROFILE}": {
+                "region": "us-west-2",
+                "mfa_serial": MFA_SERIAL,
+            },
+        },
+    )
+    _write_ini(
+        path / "credentials",
+        {
+            PROFILE: {
+                "aws_access_key_id": STATIC_ACCESS_KEY,
+                "aws_secret_access_key": STATIC_SECRET_KEY,
+            },
+        },
+    )
+
+
+def _context(
+    directory: Path,
+    *,
+    action: str = "login",
+    ecr: bool = False,
+    regions: list[str] | None = None,
+) -> _configs.Context:
+    return _configs.Context(
+        argparse.Namespace(
+            access_type="mfa",
+            action=action,
+            profile=PROFILE,
+            mfa_code="123456",
+            lifespan=43200,
+            ecr=ecr,
+            ecr_region=regions,
+            directory=str(directory),
+            aws_account_name=None,
+        ),
+    )
+
+
+def _sts_client() -> STSClient:
+    session = boto3.Session(
+        aws_access_key_id=STATIC_ACCESS_KEY,
+        aws_secret_access_key=STATIC_SECRET_KEY,
+        region_name="us-west-2",
+    )
+    return session.client("sts")
+
+
+def _ecr_client(region_name: str) -> ECRClient:
+    session = boto3.Session(
+        aws_access_key_id=STATIC_ACCESS_KEY,
+        aws_secret_access_key=STATIC_SECRET_KEY,
+        region_name=region_name,
+    )
+    return session.client("ecr")
+
+
+def _session(*, region_name: str, clients: Mapping[str, object]) -> MagicMock:
+    session = MagicMock()
+    session.region_name = region_name
+    session.client.side_effect = clients.__getitem__
+    return session
+
+
+def _identity_response() -> dict[str, str]:
+    return {
+        "UserId": "AIDAEXAMPLE",
+        "Account": ACCOUNT_ID,
+        "Arn": f"arn:aws:iam::{ACCOUNT_ID}:user/example",
+    }
+
+
+def _temporary_credentials() -> dict[str, object]:
+    return {
+        "AccessKeyId": TEMPORARY_ACCESS_KEY,
+        "SecretAccessKey": TEMPORARY_SECRET_KEY,
+        "SessionToken": SESSION_TOKEN,
+        "Expiration": datetime.now(UTC) + timedelta(hours=12),
+    }
+
+
+def test_version_and_main_exit_status() -> None:
+    """Expose the project version and pass the result status to the shell."""
+    with Path(__file__).parents[2].joinpath("pyproject.toml").open("rb") as stream:
+        assert tomllib.load(stream)["project"]["version"] == "0.3.0"
+    assert hacksaws.__version__ == "0.3.0"
+    with patch(
+        "hacksaws.console_main",
+        return_value=_configs.Result("ERROR", "", exit_code=7),
+    ):
+        assert hacksaws.main() == 7
+
+
+def test_top_level_help(capsys: pytest.CaptureFixture[str]) -> None:
+    """Return success after argparse renders top-level help."""
+    result = hacksaws.console_main(["--help"])
+    captured = capsys.readouterr()
+
+    assert result.code == "HELP"
+    assert result.exit_code == 0
+    assert "usage: hacksaws" in captured.out
+    assert captured.err == ""
+
+
+def test_invalid_argument(capsys: pytest.CaptureFixture[str]) -> None:
+    """Return argparse's nonzero status for malformed input."""
+    result = hacksaws.console_main(["mfa", "login"])
+    captured = capsys.readouterr()
+
+    assert result.code == "ARGUMENT_ERROR"
+    assert result.exit_code == 2
+    assert "the following arguments are required" in captured.err
+
+
+def test_no_arguments_prints_help_and_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Explain incomplete top-level invocations and return a failure."""
+    result = hacksaws.console_main([])
+    captured = capsys.readouterr()
+
+    assert result.code == "ACCESS_TYPE_HELP"
+    assert result.exit_code == 2
+    assert "usage: hacksaws" in captured.out
+    assert captured.err == "Not enough arguments.\n"
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [("in", "login"), ("out", "logout")],
+)
+def test_action_aliases_are_preserved(alias: str, canonical: str) -> None:
+    """Accept the documented short aliases for MFA actions."""
+    observed_action = ""
+
+    def inspect_context(context: _configs.Context) -> _configs.Result:
+        nonlocal observed_action
+        observed_action = context.args.action
+        return _configs.Result("OK", "")
+
+    arguments = ["mfa", alias, PROFILE]
+    if canonical == "login":
+        arguments.append("123456")
+    with patch("hacksaws._cli._run_mfa", side_effect=inspect_context):
+        result = hacksaws.console_main(arguments)
+
+    assert result.exit_code == 0
+    assert observed_action == alias
+
+
+def test_mfa_without_action_prints_command_help(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reject an MFA command that omits its action."""
+    result = hacksaws.console_main(["mfa"])
+    captured = capsys.readouterr()
+
+    assert result.code == "MFA_HELP"
+    assert result.exit_code == 2
+    assert "usage: hacksaws mfa" in captured.out
+    assert "Not enough arguments specified" in captured.err
+
+
+def test_login_exchanges_and_stores_credentials(
+    tmp_path: Path,
+) -> None:
+    """Use STS with exact parameters and persist temporary credentials."""
+    _prepare_aws_directory(tmp_path)
+    identity_client = _sts_client()
+    token_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response(
+        "get_caller_identity",
+        _identity_response(),
+        {},
+    )
+    token_stubber = Stubber(token_client)
+    token_stubber.add_response(
+        "get_session_token",
+        {"Credentials": _temporary_credentials()},
+        {
+            "DurationSeconds": 43200,
+            "SerialNumber": MFA_SERIAL,
+            "TokenCode": "123456",
+        },
+    )
+    sessions = [
+        _session(region_name="us-west-2", clients={"sts": identity_client}),
+        _session(region_name="us-west-2", clients={"sts": token_client}),
+    ]
+
+    with (
+        identity_stubber,
+        token_stubber,
+        patch("boto3.Session", side_effect=sessions) as session_factory,
+    ):
+        result = hacksaws.console_main(
+            [
+                "mfa",
+                "login",
+                PROFILE,
+                "123456",
+                "--directory",
+                str(tmp_path),
+            ],
+        )
+
+    credentials = _read_ini(tmp_path / "credentials")
+    backup = _read_ini(tmp_path / f"{PROFILE}.store.credentials")
+    assert result.code == "MFA_LOGIN"
+    assert result.exit_code == 0
+    assert credentials[PROFILE] == {
+        "aws_access_key_id": TEMPORARY_ACCESS_KEY,
+        "aws_secret_access_key": TEMPORARY_SECRET_KEY,
+        "aws_session_token": SESSION_TOKEN,
+    }
+    assert backup[PROFILE] == {
+        "aws_access_key_id": STATIC_ACCESS_KEY,
+        "aws_secret_access_key": STATIC_SECRET_KEY,
+    }
+    assert os.environ["AWS_SHARED_CREDENTIALS_FILE"] == str(
+        tmp_path / "credentials",
+    )
+    assert os.environ["AWS_CONFIG_FILE"] == str(tmp_path / "config")
+    assert session_factory.call_args_list == [
+        call(profile_name=PROFILE),
+        call(profile_name=PROFILE),
+    ]
+
+
+def test_logout_restores_credentials(tmp_path: Path) -> None:
+    """Restore static credentials, remove the backup, and retain the profile."""
+    _prepare_aws_directory(tmp_path)
+    _write_ini(
+        tmp_path / "credentials",
+        {
+            PROFILE: {
+                "aws_access_key_id": TEMPORARY_ACCESS_KEY,
+                "aws_secret_access_key": TEMPORARY_SECRET_KEY,
+                "aws_session_token": SESSION_TOKEN,
+            },
+        },
+    )
+    _write_ini(
+        tmp_path / f"{PROFILE}.store.credentials",
+        {
+            PROFILE: {
+                "aws_access_key_id": STATIC_ACCESS_KEY,
+                "aws_secret_access_key": STATIC_SECRET_KEY,
+            },
+        },
+    )
+    identity_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
+
+    with (
+        identity_stubber,
+        patch(
+            "boto3.Session",
+            return_value=_session(
+                region_name="us-west-2",
+                clients={"sts": identity_client},
+            ),
+        ),
+    ):
+        result = hacksaws.console_main(
+            ["mfa", "out", PROFILE, "--directory", str(tmp_path)],
+        )
+
+    credentials = _read_ini(tmp_path / "credentials")
+    assert result.code == "MFA_LOGOUT"
+    assert credentials[PROFILE] == {
+        "aws_access_key_id": STATIC_ACCESS_KEY,
+        "aws_secret_access_key": STATIC_SECRET_KEY,
+    }
+    assert not (tmp_path / f"{PROFILE}.store.credentials").exists()
+
+
+def test_ecr_regions_and_docker_commands_are_ordered_and_exact(
+    tmp_path: Path,
+) -> None:
+    """Process primary and additional ECR regions once, in input order."""
+    _prepare_aws_directory(tmp_path)
+    regions = ["us-east-1", "us-west-2", "eu-west-1", "us-east-1"]
+    ordered_regions = ["us-west-2", "us-east-1", "eu-west-1"]
+
+    identity_client = _sts_client()
+    token_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
+    token_stubber = Stubber(token_client)
+    token_stubber.add_response(
+        "get_session_token",
+        {"Credentials": _temporary_credentials()},
+        {
+            "DurationSeconds": 43200,
+            "SerialNumber": MFA_SERIAL,
+            "TokenCode": "123456",
+        },
+    )
+    sessions = [
+        _session(region_name="us-west-2", clients={"sts": identity_client}),
+        _session(region_name="us-west-2", clients={"sts": token_client}),
+    ]
+    stack = ExitStack()
+    stack.enter_context(identity_stubber)
+    stack.enter_context(token_stubber)
+    for region in ordered_regions:
+        ecr_client = _ecr_client(region)
+        ecr_stubber = Stubber(ecr_client)
+        ecr_stubber.add_response(
+            "get_authorization_token",
+            {
+                "authorizationData": [
+                    {
+                        "authorizationToken": "QVdTOmVjci1wYXNzd29yZA==",
+                        "expiresAt": datetime.now(UTC) + timedelta(hours=12),
+                        "proxyEndpoint": (
+                            f"https://{ACCOUNT_ID}.dkr.ecr.{region}.amazonaws.com"
+                        ),
+                    },
+                ],
+            },
+            {"registryIds": [ACCOUNT_ID]},
+        )
+        stack.enter_context(ecr_stubber)
+        sessions.append(_session(region_name=region, clients={"ecr": ecr_client}))
+
+    arguments = [
+        "mfa",
+        "in",
+        PROFILE,
+        "123456",
+        "--directory",
+        str(tmp_path),
+        "--ecr",
+    ]
+    for region in regions:
+        arguments.extend(["--ecr-region", region])
+
+    with (
+        stack,
+        patch("boto3.Session", side_effect=sessions),
+        patch("subprocess.run") as subprocess_run,
+    ):
+        result = hacksaws.console_main(arguments)
+
+    registries = [
+        f"{ACCOUNT_ID}.dkr.ecr.{region}.amazonaws.com" for region in ordered_regions
+    ]
+    expected_calls = [
+        *[
+            call(["docker", "logout", registry], input=None, check=True)
+            for registry in registries
+        ],
+        *[
+            call(
+                [
+                    "docker",
+                    "login",
+                    "--username=AWS",
+                    "--password-stdin",
+                    registry,
+                ],
+                input=b"ecr-password",
+                check=True,
+            )
+            for registry in registries
+        ],
+    ]
+    assert result.exit_code == 0
+    assert subprocess_run.call_args_list == expected_calls
+
+
+def test_known_configuration_failure_is_concise(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Convert a missing AWS config into stderr and a nonzero result."""
+    _write_ini(
+        tmp_path / "credentials",
+        {
+            PROFILE: {
+                "aws_access_key_id": STATIC_ACCESS_KEY,
+                "aws_secret_access_key": STATIC_SECRET_KEY,
+            },
+        },
+    )
+    identity_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
+
+    with (
+        identity_stubber,
+        patch(
+            "boto3.Session",
+            return_value=_session(
+                region_name="us-west-2",
+                clients={"sts": identity_client},
+            ),
+        ),
+    ):
+        result = hacksaws.console_main(
+            [
+                "mfa",
+                "login",
+                PROFILE,
+                "123456",
+                "--directory",
+                str(tmp_path),
+            ],
+        )
+
+    captured = capsys.readouterr()
+    assert result.code == "OPERATIONAL_ERROR"
+    assert result.exit_code == 1
+    assert captured.err.startswith("Error: AWS config file does not exist:")
+    assert "Traceback" not in captured.err
+
+
+def test_aws_failure_is_concise(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Convert a known AWS service failure into stderr and a nonzero result."""
+    _prepare_aws_directory(tmp_path)
+    identity_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_client_error(
+        "get_caller_identity",
+        service_error_code="ExpiredToken",
+        service_message="The security token has expired.",
+        http_status_code=403,
+        expected_params={},
+    )
+
+    with (
+        identity_stubber,
+        patch(
+            "boto3.Session",
+            return_value=_session(
+                region_name="us-west-2",
+                clients={"sts": identity_client},
+            ),
+        ),
+    ):
+        result = hacksaws.console_main(
+            ["mfa", "logout", PROFILE, "--directory", str(tmp_path)],
+        )
+
+    captured = capsys.readouterr()
+    assert result.code == "OPERATIONAL_ERROR"
+    assert result.exit_code == 1
+    assert captured.err.startswith(f"Error: Unable to load AWS profile {PROFILE!r}:")
+    assert "Traceback" not in captured.err
+
+
+def test_docker_failure_is_concise() -> None:
+    """Normalize an unavailable Docker executable."""
+    with (
+        patch("subprocess.run", side_effect=FileNotFoundError),
+        pytest.raises(
+            _configs.OperationalError,
+            match="Docker is not installed",
+        ),
+    ):
+        _ecr.logout(
+            _configs.AwsAccount(
+                identity_response=_identity_response(),
+                region_name="us-west-2",
+                ecr_additional_regions=(),
+            ),
+        )
+
+
+def test_docker_launch_os_error_is_concise_through_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Convert a Docker launch permission error through the complete CLI path."""
+    _prepare_aws_directory(tmp_path)
+    identity_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
+
+    with (
+        identity_stubber,
+        patch(
+            "boto3.Session",
+            return_value=_session(
+                region_name="us-west-2",
+                clients={"sts": identity_client},
+            ),
+        ),
+        patch("subprocess.run", side_effect=PermissionError("access denied")),
+    ):
+        result = hacksaws.console_main(
+            [
+                "mfa",
+                "logout",
+                PROFILE,
+                "--directory",
+                str(tmp_path),
+                "--ecr",
+            ],
+        )
+
+    captured = capsys.readouterr()
+    assert result.code == "OPERATIONAL_ERROR"
+    assert result.exit_code == 1
+    assert captured.err == "Error: Unable to run Docker: access denied\n"
+    assert "Traceback" not in captured.err
+
+
+def test_unexpected_failures_remain_visible() -> None:
+    """Allow programming errors to retain their traceback for diagnosis."""
+    with (
+        patch("hacksaws._cli._run_mfa", side_effect=RuntimeError("bug")),
+        pytest.raises(RuntimeError, match="bug"),
+    ):
+        hacksaws.console_main(["mfa", "logout", PROFILE])
+
+
+def test_context_account_name_overrides_directory(tmp_path: Path) -> None:
+    """Preserve the account-name directory alias behavior."""
+    context = _context(tmp_path)
+    context.args.aws_account_name = "sandbox"
+
+    assert context.aws_directory == Path("~/.aws-sandbox").expanduser().absolute()
+
+
+def test_direct_aws_logout_is_noop_without_backup(tmp_path: Path) -> None:
+    """Permit logout when no temporary credential backup exists."""
+    _aws.logout(_context(tmp_path, action="logout"))

@@ -1,20 +1,21 @@
-import pathlib as _pathlib
-from importlib import metadata as _metadata
+"""Hacksaws command-line package."""
 
-from hacksaws._cli import console_main as console_main  # noqa: F401
+from __future__ import annotations
+
+import tomllib as _tomllib
+from importlib import metadata as _metadata
+from pathlib import Path as _Path
+from typing import cast as _cast
+
+from hacksaws._cli import console_main as console_main
 
 try:
-    __version__ = _metadata.version(__package__)
-except _metadata.PackageNotFoundError:  # pragma: no-cover
-    # If the package is not installed such that it has distribution metadata
-    # fallback to loading the version from the pyproject.toml file.
-    import toml as _toml
-
-    __version__ = _toml.loads(
-        _pathlib.Path(__file__).parent.parent.joinpath("pyproject.toml").read_text()
-    )["tool"]["poetry"]["version"]
+    __version__ = _metadata.version("hacksaws")
+except _metadata.PackageNotFoundError:
+    with _Path(__file__).parent.parent.joinpath("pyproject.toml").open("rb") as _stream:
+        __version__ = _cast("str", _tomllib.load(_stream)["project"]["version"])
 
 
-def main():
-    """Execute entrypoint for CLI commands."""
-    console_main()
+def main() -> int:
+    """Run the Hacksaws CLI and return its process exit status."""
+    return console_main().exit_code

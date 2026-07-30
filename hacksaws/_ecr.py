@@ -1,56 +1,103 @@
+"""Docker authentication operations for Amazon ECR."""
+
+from __future__ import annotations
+
 import base64
-import datetime
+import binascii
 import subprocess
+from datetime import UTC
+from datetime import datetime
+from typing import cast
 
 import boto3
+from botocore.exceptions import BotoCoreError
+from botocore.exceptions import ClientError
 
 from hacksaws import _configs
 
 
-def _do_login(context: _configs.Context, registry: str):
-    """Carry out the loging process for a region-specific registry."""
-    print(f"[STARTED]: Logging into {registry}", flush=True)
-    parts = registry.split(".")
-    account_id = parts[0]
-    region_name = parts[3]
+def _run_docker(command: list[str], *, password: bytes | None = None) -> None:
+    """Run a Docker command and normalize expected execution failures."""
+    try:
+        subprocess.run(command, input=password, check=True)  # noqa: S603
+    except FileNotFoundError as error:
+        message = "Docker is not installed or is not available on PATH."
+        raise _configs.OperationalError(message) from error
+    except OSError as error:
+        message = f"Unable to run Docker: {error}"
+        raise _configs.OperationalError(message) from error
+    except subprocess.CalledProcessError as error:
+        message = f"Docker command failed with exit code {error.returncode}."
+        raise _configs.OperationalError(message) from error
 
-    session = boto3.Session(profile_name=context.profile, region_name=region_name)
-    response = (
-        session.client("ecr")
-        .get_authorization_token(registryIds=[account_id])
-        .get("authorizationData", {})[0]
+
+def _do_login(
+    context: _configs.Context,
+    *,
+    account_id: str,
+    region_name: str,
+) -> None:
+    """Log Docker into one region-specific ECR registry."""
+    registry = f"{account_id}.dkr.ecr.{region_name}.amazonaws.com"
+    print(f"[STARTED]: Logging into {registry}", flush=True)  # noqa: T201
+    try:
+        session = boto3.Session(
+            profile_name=context.profile,
+            region_name=region_name,
+        )
+        response = session.client("ecr").get_authorization_token(
+            registryIds=[account_id],
+        )
+        authorization_data = response["authorizationData"][0]
+        decoded_token = base64.b64decode(
+            authorization_data["authorizationToken"],
+            validate=True,
+        ).decode()
+        user, password = decoded_token.split(":", maxsplit=1)
+        expires_at = cast("datetime", authorization_data["expiresAt"])
+    except (BotoCoreError, ClientError) as error:
+        message = f"Unable to get an ECR token for {region_name}: {error}"
+        raise _configs.OperationalError(message) from error
+    except (
+        binascii.Error,
+        IndexError,
+        KeyError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as error:
+        message = f"AWS returned an invalid ECR token for {region_name}."
+        raise _configs.OperationalError(message) from error
+
+    _run_docker(
+        [
+            "docker",
+            "login",
+            f"--username={user}",
+            "--password-stdin",
+            registry,
+        ],
+        password=password.encode(),
     )
 
-    user, password = (
-        base64.b64decode(response["authorizationToken"].encode()).decode().split(":")
+    expires_at_utc = expires_at.astimezone(UTC)
+    hours = round((expires_at_utc - datetime.now(UTC)).total_seconds() / 3600)
+    print(  # noqa: T201
+        f"[SUCCESS]: Login session will expire in {hours} hours",
+        flush=True,
     )
 
-    cmd = [
-        "docker",
-        "login",
-        f"--username={user}",
-        "--password-stdin",
-        registry,
-    ]
-    subprocess.run(cmd, input=password.encode(), check=True)
 
-    expires_at: datetime.datetime = (
-        response["expiresAt"].astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    )
-
-    delta: datetime.timedelta = expires_at - datetime.datetime.utcnow()
-    hours = int(round(delta.total_seconds() / 3600))
-    print(f"[SUCCESS]: Login session will expire in {hours} hours", flush=True)
+def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> None:
+    """Log Docker into every configured ECR region."""
+    for region_name in aws_account.ecr_regions:
+        _do_login(
+            context,
+            account_id=aws_account.id,
+            region_name=region_name,
+        )
 
 
-def login(context: _configs.Context, aws_account: _configs.AwsAccount):
-    """Logs into the AWS ECR registry in the given account."""
+def logout(aws_account: _configs.AwsAccount) -> None:
+    """Log Docker out of every configured ECR registry."""
     for registry in aws_account.ecr_registries:
-        _do_login(context, registry)
-
-
-def logout(aws_account: _configs.AwsAccount):
-    """Logs out of the registry for the given AWS account."""
-    for registry in aws_account.ecr_registries:
-        cmd = ["docker", "logout", registry]
-        subprocess.run(cmd, check=True)
+        _run_docker(["docker", "logout", registry])
