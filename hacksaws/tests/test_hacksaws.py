@@ -142,8 +142,8 @@ def _temporary_credentials() -> dict[str, object]:
 def test_version_and_main_exit_status() -> None:
     """Expose the project version and pass the result status to the shell."""
     with Path(__file__).parents[2].joinpath("pyproject.toml").open("rb") as stream:
-        assert tomllib.load(stream)["project"]["version"] == "0.3.0"
-    assert hacksaws.__version__ == "0.3.0"
+        assert tomllib.load(stream)["project"]["version"] == "0.3.1"
+    assert hacksaws.__version__ == "0.3.1"
     with patch(
         "hacksaws.console_main",
         return_value=_configs.Result("ERROR", "", exit_code=7),
