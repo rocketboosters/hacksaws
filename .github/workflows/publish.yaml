@@ -5,43 +5,112 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build distribution
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      previous_tag: ${{ steps.metadata.outputs.previous_tag }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
-      - name: Validate tag and project version
-        shell: python
+      - name: Validate and collect release metadata
+        id: metadata
+        shell: bash
         run: |
+          uv run --locked python - <<'PY'
           import os
+          import subprocess
           import tomllib
+
+          from packaging.version import Version
 
           with open("pyproject.toml", "rb") as stream:
               version = tomllib.load(stream)["project"]["version"]
+
           tag = os.environ["GITHUB_REF_NAME"]
           if tag != f"v{version}":
               raise SystemExit(
                   f"Tag {tag!r} does not match project version {version!r}."
               )
+
+          prerelease = Version(version).is_prerelease
+          tags = subprocess.run(
+              [
+                  "git",
+                  "tag",
+                  "--merged",
+                  "HEAD",
+                  "--list",
+                  "v*",
+                  "--sort=-version:refname",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.splitlines()
+          previous_tag = next(
+              (candidate for candidate in tags if candidate != tag),
+              "",
+          )
+          artifact_name = f"python-distributions-{tag}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
+              print(f"prerelease={str(prerelease).lower()}", file=output)
+              print(f"previous_tag={previous_tag}", file=output)
+              print(f"artifact_name={artifact_name}", file=output)
+          PY
       - name: Build wheel and source distribution
         run: uv build
+      - name: Validate distribution files
+        shell: python
+        run: |
+          from pathlib import Path
+
+          files = sorted(
+              path
+              for path in Path("dist").iterdir()
+              if path.is_file() and not path.name.startswith(".")
+          )
+          wheels = [path for path in files if path.suffix == ".whl"]
+          source_distributions = [
+              path for path in files if path.name.endswith(".tar.gz")
+          ]
+          if len(files) != 2 or len(wheels) != 1 or len(source_distributions) != 1:
+              names = ", ".join(path.name for path in files)
+              raise SystemExit(
+                  "Expected exactly one wheel and one source distribution; "
+                  f"found: {names or '<none>'}"
+              )
       - name: Upload distribution
         uses: actions/upload-artifact@v7
         with:
-          name: python-distributions
-          path: dist/
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
           if-no-files-found: error
+          retention-days: 30
 
   publish:
     name: Publish to PyPI
@@ -49,14 +118,63 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/hacksaws/
+      url: https://pypi.org/project/hacksaws/${{ needs.build.outputs.version }}/
     permissions:
       id-token: write
     steps:
       - name: Download distribution
         uses: actions/download-artifact@v8
         with:
-          name: python-distributions
+          name: ${{ needs.build.outputs.artifact_name }}
           path: dist/
       - name: Publish distribution
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub Release
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distribution
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          PREVIOUS_TAG: ${{ needs.build.outputs.previous_tag }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          source_distributions=(dist/*.tar.gz)
+          if (( ${#wheels[@]} != 1 || ${#source_distributions[@]} != 1 )); then
+            echo "Expected exactly one wheel and one source distribution." >&2
+            exit 1
+          fi
+
+          arguments=(
+            "$TAG"
+            "${wheels[0]}"
+            "${source_distributions[0]}"
+            --verify-tag
+            --title "hacksaws $TAG"
+            --generate-notes
+            --fail-on-no-commits
+          )
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            arguments+=(--notes-start-tag "$PREVIOUS_TAG")
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            arguments+=(--prerelease --latest=false)
+          fi
+
+          gh release create "${arguments[@]}"

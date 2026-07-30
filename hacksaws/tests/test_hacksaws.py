@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import subprocess
 import tomllib
 from contextlib import ExitStack
 from datetime import UTC
@@ -80,6 +81,7 @@ def _context(
     *,
     action: str = "login",
     ecr: bool = False,
+    podman: bool = False,
     regions: list[str] | None = None,
 ) -> _configs.Context:
     return _configs.Context(
@@ -90,6 +92,7 @@ def _context(
             mfa_code="123456",
             lifespan=43200,
             ecr=ecr,
+            podman=podman,
             ecr_region=regions,
             directory=str(directory),
             aws_account_name=None,
@@ -142,8 +145,8 @@ def _temporary_credentials() -> dict[str, object]:
 def test_version_and_main_exit_status() -> None:
     """Expose the project version and pass the result status to the shell."""
     with Path(__file__).parents[2].joinpath("pyproject.toml").open("rb") as stream:
-        assert tomllib.load(stream)["project"]["version"] == "0.3.1"
-    assert hacksaws.__version__ == "0.3.1"
+        assert tomllib.load(stream)["project"]["version"] == "0.3.2"
+    assert hacksaws.__version__ == "0.3.2"
     with patch(
         "hacksaws.console_main",
         return_value=_configs.Result("ERROR", "", exit_code=7),
@@ -206,6 +209,64 @@ def test_action_aliases_are_preserved(alias: str, canonical: str) -> None:
 
     assert result.exit_code == 0
     assert observed_action == alias
+
+
+@pytest.mark.parametrize(
+    ("action", "required_arguments"),
+    [
+        ("login", [PROFILE, "123456"]),
+        ("in", [PROFILE, "123456"]),
+        ("logout", [PROFILE]),
+        ("out", [PROFILE]),
+    ],
+)
+def test_container_engine_parser_defaults(
+    action: str,
+    required_arguments: list[str],
+) -> None:
+    """Default to Docker and keep Podman independent from ECR selection."""
+    parser = hacksaws._cli._create_parser()
+    default_context = _configs.Context(
+        parser.parse_args(["mfa", action, *required_arguments]),
+    )
+    podman_context = _configs.Context(
+        parser.parse_args(["mfa", action, *required_arguments, "--podman"]),
+    )
+
+    assert default_context.container_engine == "docker"
+    assert default_context.args.ecr is False
+    assert default_context.args.podman is False
+    assert podman_context.container_engine == "podman"
+    assert podman_context.args.ecr is False
+    assert podman_context.args.podman is True
+
+
+def test_podman_without_ecr_does_not_run_container_commands(
+    tmp_path: Path,
+) -> None:
+    """Treat --podman only as the engine choice for an explicit ECR operation."""
+    context = _context(tmp_path, podman=True)
+    account = _configs.AwsAccount(
+        identity_response=_identity_response(),
+        region_name="us-west-2",
+        ecr_additional_regions=(),
+    )
+
+    with (
+        patch("hacksaws._aws.logout"),
+        patch("hacksaws._aws.login"),
+        patch(
+            "hacksaws._configs.AwsAccount.from_context",
+            return_value=account,
+        ),
+        patch("hacksaws._ecr.logout") as ecr_logout,
+        patch("hacksaws._ecr.login") as ecr_login,
+    ):
+        result = hacksaws._cli._run_mfa(context)
+
+    assert result.exit_code == 0
+    ecr_logout.assert_not_called()
+    ecr_login.assert_not_called()
 
 
 def test_mfa_without_action_prints_command_help(
@@ -337,10 +398,16 @@ def test_logout_restores_credentials(tmp_path: Path) -> None:
     assert not (tmp_path / f"{PROFILE}.store.credentials").exists()
 
 
-def test_ecr_regions_and_docker_commands_are_ordered_and_exact(
+@pytest.mark.parametrize(
+    ("engine", "podman"),
+    [("docker", False), ("podman", True)],
+)
+def test_ecr_regions_and_container_commands_are_ordered_and_exact(
     tmp_path: Path,
+    engine: str,
+    podman: bool,
 ) -> None:
-    """Process primary and additional ECR regions once, in input order."""
+    """Run exact engine commands in primary-first, duplicate-free region order."""
     _prepare_aws_directory(tmp_path)
     regions = ["us-east-1", "us-west-2", "eu-west-1", "us-east-1"]
     ordered_regions = ["us-west-2", "us-east-1", "eu-west-1"]
@@ -398,6 +465,8 @@ def test_ecr_regions_and_docker_commands_are_ordered_and_exact(
     ]
     for region in regions:
         arguments.extend(["--ecr-region", region])
+    if podman:
+        arguments.append("--podman")
 
     with (
         stack,
@@ -411,13 +480,13 @@ def test_ecr_regions_and_docker_commands_are_ordered_and_exact(
     ]
     expected_calls = [
         *[
-            call(["docker", "logout", registry], input=None, check=True)
+            call([engine, "logout", registry], input=None, check=False)
             for registry in registries
         ],
         *[
             call(
                 [
-                    "docker",
+                    engine,
                     "login",
                     "--username=AWS",
                     "--password-stdin",
@@ -431,6 +500,55 @@ def test_ecr_regions_and_docker_commands_are_ordered_and_exact(
     ]
     assert result.exit_code == 0
     assert subprocess_run.call_args_list == expected_calls
+
+
+@pytest.mark.parametrize("action", ["logout", "out"])
+@pytest.mark.parametrize(
+    ("engine", "podman"),
+    [("docker", False), ("podman", True)],
+)
+def test_explicit_ecr_logout_is_strict(
+    tmp_path: Path,
+    action: str,
+    engine: str,
+    podman: bool,
+) -> None:
+    """Run explicit Docker and Podman logout commands with check enabled."""
+    _prepare_aws_directory(tmp_path)
+    identity_client = _sts_client()
+    identity_stubber = Stubber(identity_client)
+    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
+    arguments = [
+        "mfa",
+        action,
+        PROFILE,
+        "--directory",
+        str(tmp_path),
+        "--ecr",
+    ]
+    if podman:
+        arguments.append("--podman")
+
+    with (
+        identity_stubber,
+        patch(
+            "boto3.Session",
+            return_value=_session(
+                region_name="us-west-2",
+                clients={"sts": identity_client},
+            ),
+        ),
+        patch("subprocess.run") as subprocess_run,
+    ):
+        result = hacksaws.console_main(arguments)
+
+    registry = f"{ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com"
+    assert result.exit_code == 0
+    subprocess_run.assert_called_once_with(
+        [engine, "logout", registry],
+        input=None,
+        check=True,
+    )
 
 
 def test_known_configuration_failure_is_concise(
@@ -516,16 +634,67 @@ def test_aws_failure_is_concise(
     assert "Traceback" not in captured.err
 
 
-def test_docker_failure_is_concise() -> None:
-    """Normalize an unavailable Docker executable."""
-    with (
-        patch("subprocess.run", side_effect=FileNotFoundError),
-        pytest.raises(
-            _configs.OperationalError,
-            match="Docker is not installed",
+@pytest.mark.parametrize(
+    ("engine", "podman", "failure", "message"),
+    [
+        (
+            "docker",
+            False,
+            FileNotFoundError(),
+            "Docker is not installed or is not available on PATH.",
         ),
+        (
+            "podman",
+            True,
+            FileNotFoundError(),
+            "Podman is not installed or is not available on PATH.",
+        ),
+        (
+            "docker",
+            False,
+            PermissionError("access denied"),
+            "Unable to run Docker: access denied",
+        ),
+        (
+            "podman",
+            True,
+            PermissionError("access denied"),
+            "Unable to run Podman: access denied",
+        ),
+        (
+            "docker",
+            False,
+            subprocess.CalledProcessError(9, ["docker"]),
+            "Docker command failed with exit code 9.",
+        ),
+        (
+            "podman",
+            True,
+            subprocess.CalledProcessError(9, ["podman"]),
+            "Podman command failed with exit code 9.",
+        ),
+    ],
+)
+def test_container_engine_failures_are_normalized(
+    tmp_path: Path,
+    engine: str,
+    podman: bool,
+    failure: OSError | subprocess.CalledProcessError,
+    message: str,
+) -> None:
+    """Normalize expected launch and nonzero failures for both engines."""
+    context = _context(
+        tmp_path,
+        action="logout",
+        ecr=True,
+        podman=podman,
+    )
+    with (
+        patch("subprocess.run", side_effect=failure) as subprocess_run,
+        pytest.raises(_configs.OperationalError, match=f"^{message}$"),
     ):
         _ecr.logout(
+            context,
             _configs.AwsAccount(
                 identity_response=_identity_response(),
                 region_name="us-west-2",
@@ -533,12 +702,71 @@ def test_docker_failure_is_concise() -> None:
             ),
         )
 
+    registry = f"{ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com"
+    subprocess_run.assert_called_once_with(
+        [engine, "logout", registry],
+        input=None,
+        check=True,
+    )
 
-def test_docker_launch_os_error_is_concise_through_cli(
+
+@pytest.mark.parametrize(
+    ("podman", "failure", "message"),
+    [
+        (
+            False,
+            FileNotFoundError(),
+            "Docker is not installed or is not available on PATH.",
+        ),
+        (
+            True,
+            FileNotFoundError(),
+            "Podman is not installed or is not available on PATH.",
+        ),
+        (
+            False,
+            PermissionError("access denied"),
+            "Unable to run Docker: access denied",
+        ),
+        (
+            True,
+            PermissionError("access denied"),
+            "Unable to run Podman: access denied",
+        ),
+    ],
+)
+def test_non_strict_logout_still_normalizes_launch_failures(
+    tmp_path: Path,
+    podman: bool,
+    failure: OSError,
+    message: str,
+) -> None:
+    """Do not suppress missing or unlaunchable engines during pre-login cleanup."""
+    context = _context(tmp_path, ecr=True, podman=podman)
+    account = _configs.AwsAccount(
+        identity_response=_identity_response(),
+        region_name="us-west-2",
+        ecr_additional_regions=(),
+    )
+
+    with (
+        patch("subprocess.run", side_effect=failure),
+        pytest.raises(_configs.OperationalError, match=f"^{message}$"),
+    ):
+        _ecr.logout(context, account, check=False)
+
+
+@pytest.mark.parametrize(
+    ("engine", "podman"),
+    [("docker", False), ("podman", True)],
+)
+def test_container_engine_launch_os_error_is_concise_through_cli(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    engine: str,
+    podman: bool,
 ) -> None:
-    """Convert a Docker launch permission error through the complete CLI path."""
+    """Convert an engine launch permission error through the complete CLI path."""
     _prepare_aws_directory(tmp_path)
     identity_client = _sts_client()
     identity_stubber = Stubber(identity_client)
@@ -555,21 +783,22 @@ def test_docker_launch_os_error_is_concise_through_cli(
         ),
         patch("subprocess.run", side_effect=PermissionError("access denied")),
     ):
-        result = hacksaws.console_main(
-            [
-                "mfa",
-                "logout",
-                PROFILE,
-                "--directory",
-                str(tmp_path),
-                "--ecr",
-            ],
-        )
+        arguments = [
+            "mfa",
+            "logout",
+            PROFILE,
+            "--directory",
+            str(tmp_path),
+            "--ecr",
+        ]
+        if podman:
+            arguments.append("--podman")
+        result = hacksaws.console_main(arguments)
 
     captured = capsys.readouterr()
     assert result.code == "OPERATIONAL_ERROR"
     assert result.exit_code == 1
-    assert captured.err == "Error: Unable to run Docker: access denied\n"
+    assert captured.err == f"Error: Unable to run {engine.title()}: access denied\n"
     assert "Traceback" not in captured.err
 
 

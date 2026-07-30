@@ -1,4 +1,4 @@
-"""Docker authentication operations for Amazon ECR."""
+"""Container-engine authentication operations for Amazon ECR."""
 
 from __future__ import annotations
 
@@ -16,18 +16,25 @@ from botocore.exceptions import ClientError
 from hacksaws import _configs
 
 
-def _run_docker(command: list[str], *, password: bytes | None = None) -> None:
-    """Run a Docker command and normalize expected execution failures."""
+def _run_container_engine(
+    engine: _configs.ContainerEngine,
+    command: list[str],
+    *,
+    password: bytes | None = None,
+    check: bool = True,
+) -> None:
+    """Run a container-engine command and normalize expected execution failures."""
+    executable_name = engine.title()
     try:
-        subprocess.run(command, input=password, check=True)  # noqa: S603
+        subprocess.run(command, input=password, check=check)  # noqa: S603
     except FileNotFoundError as error:
-        message = "Docker is not installed or is not available on PATH."
+        message = f"{executable_name} is not installed or is not available on PATH."
         raise _configs.OperationalError(message) from error
     except OSError as error:
-        message = f"Unable to run Docker: {error}"
+        message = f"Unable to run {executable_name}: {error}"
         raise _configs.OperationalError(message) from error
     except subprocess.CalledProcessError as error:
-        message = f"Docker command failed with exit code {error.returncode}."
+        message = f"{executable_name} command failed with exit code {error.returncode}."
         raise _configs.OperationalError(message) from error
 
 
@@ -37,7 +44,7 @@ def _do_login(
     account_id: str,
     region_name: str,
 ) -> None:
-    """Log Docker into one region-specific ECR registry."""
+    """Log the selected container engine into one region-specific ECR registry."""
     registry = f"{account_id}.dkr.ecr.{region_name}.amazonaws.com"
     print(f"[STARTED]: Logging into {registry}", flush=True)  # noqa: T201
     try:
@@ -68,9 +75,11 @@ def _do_login(
         message = f"AWS returned an invalid ECR token for {region_name}."
         raise _configs.OperationalError(message) from error
 
-    _run_docker(
+    engine = context.container_engine
+    _run_container_engine(
+        engine,
         [
-            "docker",
+            engine,
             "login",
             f"--username={user}",
             "--password-stdin",
@@ -88,7 +97,7 @@ def _do_login(
 
 
 def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> None:
-    """Log Docker into every configured ECR region."""
+    """Log the selected container engine into every configured ECR region."""
     for region_name in aws_account.ecr_regions:
         _do_login(
             context,
@@ -97,7 +106,17 @@ def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> None:
         )
 
 
-def logout(aws_account: _configs.AwsAccount) -> None:
-    """Log Docker out of every configured ECR registry."""
+def logout(
+    context: _configs.Context,
+    aws_account: _configs.AwsAccount,
+    *,
+    check: bool = True,
+) -> None:
+    """Log the selected container engine out of every configured ECR registry."""
+    engine = context.container_engine
     for registry in aws_account.ecr_registries:
-        _run_docker(["docker", "logout", registry])
+        _run_container_engine(
+            engine,
+            [engine, "logout", registry],
+            check=check,
+        )

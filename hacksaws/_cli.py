@@ -37,6 +37,7 @@ def _create_parser() -> argparse.ArgumentParser:
 
     for action_parser in (login_parser, logout_parser):
         action_parser.add_argument("--ecr", action="store_true")
+        action_parser.add_argument("--podman", action="store_true")
         action_parser.add_argument("--ecr-region", action="append")
         action_parser.add_argument(
             "-d",
@@ -82,7 +83,11 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
     aws_account = _configs.AwsAccount.from_context(context)
 
     if cast("bool", context.args.ecr):
-        _ecr.logout(aws_account)
+        _ecr.logout(
+            context,
+            aws_account,
+            check=action not in {"login", "in"},
+        )
 
     if action in {"login", "in"}:
         _aws.login(context)

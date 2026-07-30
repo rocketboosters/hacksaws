@@ -169,7 +169,7 @@ wheels = [
 
 [[package]]
 name = "hacksaws"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -179,6 +179,7 @@ dependencies = [
 dev = [
     { name = "boto3-stubs", extra = ["ecr", "sts"] },
     { name = "mypy" },
+    { name = "packaging" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -192,6 +193,7 @@ requires-dist = [{ name = "boto3", specifier = ">=1.40,<2" }]
 dev = [
     { name = "boto3-stubs", extras = ["ecr", "sts"], specifier = ">=1.40,<2" },
     { name = "mypy", specifier = ">=1.14" },
+    { name = "packaging", specifier = ">=25.0" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.8" },
