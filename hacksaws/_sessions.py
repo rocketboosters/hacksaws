@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import configparser
 import copy
+import fnmatch
 import getpass
+import importlib
 import json
 import os
 import re
@@ -20,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 
 import boto3
 import yaml
@@ -45,6 +48,7 @@ _CONFLICTING_ENV = {
     "AWS_DEFAULT_PROFILE",
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_CONFIG_FILE",
+    "AWS_LOGIN_CACHE_DIRECTORY",
 }
 
 
@@ -106,6 +110,7 @@ def _begin(
 ) -> dict[str, Any]:
     cache_snapshots = []
     for cache_root in cache_roots or []:
+        root_exists = cache_root.exists()
         existing = (
             [
                 _snapshot(path.absolute())
@@ -115,7 +120,23 @@ def _begin(
             if cache_root.exists()
             else []
         )
-        cache_snapshots.append({"root": str(cache_root.absolute()), "files": existing})
+        directories = (
+            [
+                str(path.absolute())
+                for path in [cache_root, *cache_root.rglob("*")]
+                if path.is_dir()
+            ]
+            if root_exists
+            else []
+        )
+        cache_snapshots.append(
+            {
+                "root": str(cache_root.absolute()),
+                "root_exists": root_exists,
+                "directories": directories,
+                "files": existing,
+            }
+        )
     journal = {
         "schema_version": 1,
         "started_at": _state.iso_now(),
@@ -165,6 +186,24 @@ def _rollback(journal: dict[str, Any]) -> None:
                 _restore(cache_file_snapshot)
             except OSError as error:
                 failures.append(f"cache {cache_file_snapshot['path']}: {error}")
+        before_directories = {
+            str(Path(value).absolute()) for value in snapshot.get("directories", [])
+        }
+        if "directories" in snapshot and cache_root.exists():
+            current_directories = sorted(
+                (path for path in cache_root.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            )
+            if not snapshot.get("root_exists", True):
+                current_directories.append(cache_root)
+            for directory in current_directories:
+                if str(directory.absolute()) in before_directories:
+                    continue
+                try:
+                    directory.rmdir()
+                except OSError as error:
+                    failures.append(f"cache directory {directory}: {error}")
     for snapshot in reversed(journal["files"]):
         try:
             _restore(snapshot)
@@ -202,6 +241,33 @@ def _commit() -> None:
     _journal_path().unlink(missing_ok=True)
 
 
+def _changed_cache_files(snapshot: dict[str, Any]) -> list[str]:
+    """Return cache files created or changed by the current transaction."""
+    cache_root = Path(snapshot["root"]).absolute()
+    before = {
+        item["path"]: base64.b64decode(item["data"])
+        for item in snapshot.get("files", [])
+    }
+    if not cache_root.exists():
+        return []
+    changed = []
+    for path in cache_root.rglob("*"):
+        if not path.is_file():
+            continue
+        absolute = str(path.absolute())
+        if absolute not in before or path.read_bytes() != before[absolute]:
+            changed.append(absolute)
+    return sorted(changed)
+
+
+def _cache_fingerprints(paths: list[str]) -> dict[str, str]:
+    """Fingerprint tracked cache content so logout cannot remove replacements."""
+    return {
+        str(Path(value).absolute()): _state.digest(Path(value).read_bytes())
+        for value in paths
+    }
+
+
 def _read_ini(path: Path) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None)
     if path.exists():
@@ -224,6 +290,75 @@ def _write_ini(path: Path, parser: configparser.ConfigParser) -> None:
 
 def _section(profile: str, *, config: bool) -> str:
     return profile if not config or profile == "default" else f"profile {profile}"
+
+
+def _section_values(
+    parser: configparser.ConfigParser, section: str
+) -> dict[str, str] | None:
+    if section not in parser:
+        return None
+    return dict(parser[section].items())
+
+
+def _section_fingerprint(values: dict[str, str] | None) -> str:
+    if values is None:
+        return _state.digest(b"hacksaws:absent-section")
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return _state.digest(encoded)
+
+
+def _section_state(path: Path, section: str) -> dict[str, Any]:
+    values = _section_values(_read_ini(path), section)
+    return {
+        "exists": values is not None,
+        "fingerprint": _section_fingerprint(values),
+    }
+
+
+def _snapshot_bytes(journal: dict[str, Any], path: Path) -> bytes | None:
+    absolute = path.absolute()
+    for snapshot in journal.get("files", []):
+        if Path(str(snapshot.get("path", ""))).absolute() != absolute:
+            continue
+        if not snapshot.get("exists"):
+            return None
+        return base64.b64decode(str(snapshot["data"]))
+    return path.read_bytes() if path.exists() else None
+
+
+def _section_backup(
+    destination: Path,
+    profile: str,
+    journal: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    previous_sections = previous.get("section_backup", {}) if previous else {}
+    for kind, filename, is_config in (
+        ("credentials", "credentials", False),
+        ("config", "config", True),
+    ):
+        path = destination / filename
+        section = _section(profile, config=is_config)
+        previous_item = previous_sections.get(kind)
+        if isinstance(previous_item, dict) and isinstance(
+            previous_item.get("original"), dict
+        ):
+            original = copy.deepcopy(previous_item["original"])
+        else:
+            original_parser = _parser_from_bytes(_snapshot_bytes(journal, path), path)
+            original_values = _section_values(original_parser, section)
+            original = {
+                "exists": original_values is not None,
+                "values": original_values or {},
+            }
+        result[kind] = {
+            "path": str(path.absolute()),
+            "section": section,
+            "original": original,
+            "installed": _section_state(path, section),
+        }
+    return result
 
 
 def _partition(arn: str) -> str:
@@ -260,32 +395,43 @@ def _paths(args: Any) -> tuple[Path, str, Path, str]:
             if target.get("source_directory")
             else _state.aws_directory(target.get("source_location"))
         )
-        source_profile = str(target.get("source_profile", "default"))
+        source_profile = _normalize_profile(target.get("source_profile"))
         if target.get("destination_directory"):
             destination_dir = Path(target["destination_directory"])
         elif target.get("destination_location"):
             destination_dir = _state.aws_directory(target["destination_location"])
         else:
             destination_dir = source_dir
-        destination_profile = str(target.get("destination_profile", source_profile))
+        destination_profile = _normalize_profile(
+            target.get("destination_profile", source_profile)
+        )
         return source_dir, source_profile, destination_dir, destination_profile
     source = Path(args.directory).expanduser().absolute()
-    profile = args.profile or "default"
+    profile = _normalize_profile(args.profile)
     if getattr(args, "aws_account_name", None):
         source = _state.aws_directory(args.aws_account_name)
     if getattr(args, "to", None):
         location, separator, destination_profile = args.to.partition(":")
         if not separator or not destination_profile:
             raise _configs.OperationalError("--to must be LOCATION:PROFILE.")
-        return source, profile, _state.aws_directory(location), destination_profile
+        return (
+            source,
+            profile,
+            _state.aws_directory(location),
+            _normalize_profile(destination_profile),
+        )
     if getattr(args, "to_directory", None):
         return (
             source,
             profile,
             Path(args.to_directory).expanduser().absolute(),
-            args.to_profile,
+            _normalize_profile(args.to_profile),
         )
     return source, profile, source, profile
+
+
+def _normalize_profile(value: object) -> str:
+    return "default" if value in {None, ".", "default"} else str(value)
 
 
 def _target_details(args: Any, source_account: str, partition: str) -> dict[str, Any]:
@@ -375,6 +521,13 @@ def _require_concrete_role(args: Any, role: str | None) -> None:
             f"{', '.join(supplied)} require a concrete role or boundary; the "
             "selected target is unbounded."
         )
+
+
+def _require_bounded_browser_role(role: str | None) -> str:
+    """Return a resolved browser boundary role or fail closed."""
+    if not role:
+        raise _configs.OperationalError("Bounded browser login requires a role.")
+    return role
 
 
 def _configured_role_before_auth(args: Any) -> str | None:
@@ -543,6 +696,7 @@ def _record(
     *,
     method: str,
     ecr: list[str] | None = None,
+    ecr_engine: str | None = None,
 ) -> None:
     sessions = _state.load_sessions()
     key = f"{destination.absolute()}::{profile}"
@@ -557,6 +711,23 @@ def _record(
         metadata["login_cache_files"] = list(
             dict.fromkeys([*previous_cache, *current_cache])
         )
+    previous_cache_directories = (
+        previous.get("login_cache_directories", []) if previous else []
+    )
+    current_cache_directories = metadata.get("login_cache_directories", [])
+    if previous_cache_directories or current_cache_directories:
+        metadata["login_cache_directories"] = list(
+            dict.fromkeys([*previous_cache_directories, *current_cache_directories])
+        )
+    previous_fingerprints = (
+        previous.get("login_cache_fingerprints", {}) if previous else {}
+    )
+    current_fingerprints = metadata.get("login_cache_fingerprints", {})
+    if previous_fingerprints or current_fingerprints:
+        metadata["login_cache_fingerprints"] = {
+            **previous_fingerprints,
+            **current_fingerprints,
+        }
     sessions[key] = {
         **metadata,
         "destination": str(destination.absolute()),
@@ -564,7 +735,11 @@ def _record(
         "auth_method": method,
         "started_at": _state.iso_now(),
         "backup": original_backup,
+        "section_backup": _section_backup(destination, profile, journal, previous),
         "ecr": list(dict.fromkeys([*previous_ecr, *(ecr or [])])),
+        "ecr_engine": (
+            previous.get("ecr_engine") if previous and not ecr_engine else ecr_engine
+        ),
     }
     _state.save_sessions(sessions)
 
@@ -743,6 +918,7 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
             journal,
             method="mfa",
             ecr=ecr_registries,
+            ecr_engine=context.container_engine if ecr_registries else None,
         )
         _commit()
     except Exception:
@@ -777,8 +953,31 @@ def _aws_cli_version() -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
+def _require_browser_runtime() -> None:
+    """Fail before browser authentication when the Boto3 login provider is unusable."""
+    try:
+        importlib.import_module("awscrt.auth")
+        importlib.import_module("awscrt.io")
+    except (ImportError, OSError) as error:
+        raise _configs.OperationalError(
+            "Browser login requires AWS Common Runtime (CRT) support. Reinstall "
+            "Hacksaws with its runtime dependencies (use `uv sync` in a source "
+            "checkout, or refresh the `uvx hacksaws` installation) and retry."
+        ) from error
+
+
+def _native_login_cache() -> Path:
+    """Resolve the cache directory external AWS tools will use after native login."""
+    configured = os.environ.get("AWS_LOGIN_CACHE_DIRECTORY")
+    if configured:
+        return Path(configured).expanduser().absolute()
+    return Path.home() / ".aws" / "login" / "cache"
+
+
 def _clean_env(
-    config: Path | None = None, credentials: Path | None = None
+    config: Path | None = None,
+    credentials: Path | None = None,
+    login_cache: Path | None = None,
 ) -> dict[str, str]:
     env = {
         key: value for key, value in os.environ.items() if key not in _CONFLICTING_ENV
@@ -787,17 +986,22 @@ def _clean_env(
         env["AWS_CONFIG_FILE"] = str(config)
     if credentials:
         env["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
+    if login_cache:
+        env["AWS_LOGIN_CACHE_DIRECTORY"] = str(login_cache)
     return env
 
 
 @contextmanager
-def _aws_environment(config: Path, credentials: Path) -> Iterator[None]:
+def _aws_environment(
+    config: Path, credentials: Path, login_cache: Path
+) -> Iterator[None]:
     """Temporarily scrub inherited AWS identity/path variables for one staging area."""
     previous = {key: os.environ.get(key) for key in _CONFLICTING_ENV}
     for key in _CONFLICTING_ENV:
         os.environ.pop(key, None)
     os.environ["AWS_CONFIG_FILE"] = str(config)
     os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
+    os.environ["AWS_LOGIN_CACHE_DIRECTORY"] = str(login_cache)
     try:
         yield
     finally:
@@ -809,20 +1013,32 @@ def _aws_environment(config: Path, credentials: Path) -> Iterator[None]:
                 os.environ[key] = value
 
 
-def _aws_login(config: Path, credentials: Path, profile: str, *, remote: bool) -> None:
+def _aws_login(
+    config: Path,
+    credentials: Path,
+    profile: str,
+    *,
+    remote: bool,
+    login_cache: Path,
+) -> None:
     _aws_cli_version()
     config.parent.mkdir(parents=True, exist_ok=True)
     command = ["aws", "login", "--profile", profile]
     if remote:
         command.append("--remote")
     try:
-        subprocess.run(command, check=True, env=_clean_env(config, credentials))
+        subprocess.run(
+            command,
+            check=True,
+            env=_clean_env(config, credentials, login_cache),
+        )
     except (FileNotFoundError, OSError, subprocess.CalledProcessError) as error:
         raise _configs.OperationalError(f"AWS browser login failed: {error}") from error
 
 
 def browser_login(context: _configs.Context) -> _configs.Result:
     """Run AWS-native browser login or isolate it before a role boundary."""
+    _require_browser_runtime()
     args = context.args
     source_dir, source_profile, destination_dir, destination_profile = _paths(args)
     # Determine role from config without requiring caller identity first.
@@ -830,7 +1046,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     _require_concrete_role(args, configured_role)
     has_boundary = configured_role is not None
     if not has_boundary:
-        native_cache = destination_dir / "login" / "cache"
+        native_cache = _native_login_cache()
         journal = _begin(
             [
                 destination_dir / "config",
@@ -840,30 +1056,23 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             cache_roots=[native_cache],
         )
         ecr_registries: list[str] = []
+        login_completed = False
         try:
             _aws_login(
                 destination_dir / "config",
                 destination_dir / "credentials",
                 destination_profile,
                 remote=args.remote,
+                login_cache=native_cache,
             )
+            login_completed = True
             with _aws_environment(
-                destination_dir / "config", destination_dir / "credentials"
+                destination_dir / "config",
+                destination_dir / "credentials",
+                native_cache,
             ):
                 native = boto3.Session(profile_name=destination_profile)
                 account, partition, _ = _identity(native, label="browser login")
-            cache_before = {
-                item["path"] for item in journal["cache_snapshots"][0]["files"]
-            }
-            cache_after = (
-                {
-                    str(path.absolute())
-                    for path in native_cache.rglob("*")
-                    if path.is_file()
-                }
-                if native_cache.exists()
-                else set()
-            )
             target = _target_details(args, account, partition)
             if args.ecr:
                 aws_account = _configs.AwsAccount(
@@ -882,6 +1091,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                         journal, context.container_engine, registry
                     ),
                 )
+            changed_cache = _changed_cache_files(journal["cache_snapshots"][0])
             _record(
                 destination_dir,
                 destination_profile,
@@ -894,15 +1104,23 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                     "policy": None,
                     "policy_provenance": "AWS-native login_session",
                     "expires_at": None,
-                    "login_cache_files": sorted(cache_after - cache_before),
+                    "login_cache_files": changed_cache,
+                    "login_cache_directories": [str(native_cache.absolute())],
+                    "login_cache_fingerprints": _cache_fingerprints(changed_cache),
                 },
                 journal,
                 method="browser-native",
                 ecr=ecr_registries,
+                ecr_engine=context.container_engine if ecr_registries else None,
             )
             _commit()
-        except Exception:
+        except Exception as error:
             _rollback(journal)
+            if login_completed and isinstance(error, _configs.OperationalError):
+                raise _configs.OperationalError(
+                    f"{error} Browser login changes for profile "
+                    f"{destination_profile!r} were rolled back."
+                ) from error
             raise
         return _configs.Result(
             "BROWSER_LOGIN",
@@ -912,6 +1130,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     staging = _state.root() / "staging" / uuid.uuid4().hex
     staging_config = staging / "config"
     staging_credentials = staging / "credentials"
+    staging_cache = staging / "login" / "cache"
     journal = _begin(
         [
             destination_dir / "config",
@@ -921,22 +1140,17 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         cache_roots=[staging],
     )
     ecr_registries = []
+    login_completed = False
     try:
         _aws_login(
-            staging_config, staging_credentials, source_profile, remote=args.remote
+            staging_config,
+            staging_credentials,
+            source_profile,
+            remote=args.remote,
+            login_cache=staging_cache,
         )
-        env = _clean_env(staging_config, staging_credentials)
-        old = {
-            key: os.environ.get(key)
-            for key in ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE")
-        }
-        os.environ.update(
-            {
-                key: env[key]
-                for key in ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE")
-            }
-        )
-        try:
+        login_completed = True
+        with _aws_environment(staging_config, staging_credentials, staging_cache):
             intermediate = boto3.Session(profile_name=source_profile)
             source_account, partition, _ = _identity(
                 intermediate, label="browser staging login"
@@ -945,10 +1159,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             role, policy, external_id, boundary_name = _role_details(
                 args, target, source_account, partition
             )
-            if not role:
-                raise _configs.OperationalError(
-                    "Bounded browser login requires a role."
-                )
+            role = _require_bounded_browser_role(role)
             if args.ecr:
                 aws_account = _configs.AwsAccount(
                     {
@@ -976,12 +1187,6 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 external_id=external_id,
                 boundary_name=boundary_name,
             )
-        finally:
-            for key, value in old.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
         _save_credentials(
             destination_dir / "credentials", destination_profile, credentials
         )
@@ -1005,10 +1210,16 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             journal,
             method="browser-boundary",
             ecr=ecr_registries,
+            ecr_engine=context.container_engine if ecr_registries else None,
         )
         _commit()
-    except Exception:
+    except Exception as error:
         _rollback(journal)
+        if login_completed and isinstance(error, _configs.OperationalError):
+            raise _configs.OperationalError(
+                f"{error} Browser login changes for profile "
+                f"{destination_profile!r} were rolled back."
+            ) from error
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1018,61 +1229,586 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     )
 
 
-def logout(context: _configs.Context) -> bool:
-    """Restore an expanded session locally, making no AWS logout call."""
-    _source, _source_profile, destination, profile = _paths(context.args)
-    sessions = _state.load_sessions()
-    key = f"{destination.absolute()}::{profile}"
-    session = sessions.get(key)
-    if not session:
-        return False
-    for snapshot in reversed(session.get("backup", [])):
-        if Path(snapshot["path"]) == _state.sessions_path():
-            continue
-        _restore(snapshot)
-    if session.get("auth_method") == "browser-native":
-        allowed_root = (destination / "login" / "cache").absolute()
-        for value in session.get("login_cache_files", []):
-            cache_file = Path(value).absolute()
-            if allowed_root in cache_file.parents:
-                cache_file.unlink(missing_ok=True)
-    if context.args.ecr:
-        for registry in session.get("ecr", []):
-            _ecr._run_container_engine(
-                context.container_engine, [context.container_engine, "logout", registry]
+def _location_for_directory(directory: Path) -> str | None:
+    absolute = directory.expanduser().absolute()
+    default = (Path.home() / ".aws").absolute()
+    if absolute == default:
+        return "default"
+    if absolute.parent == Path.home().absolute() and absolute.name.startswith(".aws-"):
+        return absolute.name[5:] or None
+    return None
+
+
+def _managed_section_state(session: dict[str, Any]) -> str | None:
+    sections = session.get("section_backup")
+    if not isinstance(sections, dict) or not sections:
+        return None
+    missing = False
+    for item in sections.values():
+        if not isinstance(item, dict):
+            return "drifted"
+        path = Path(str(item.get("path", ""))).absolute()
+        section = str(item.get("section", ""))
+        installed = item.get("installed")
+        if not section or not isinstance(installed, dict):
+            return "drifted"
+        current = _section_state(path, section)
+        if current != installed:
+            if installed.get("exists") and not current["exists"]:
+                missing = True
+            else:
+                return "drifted"
+    return "missing" if missing else None
+
+
+def _public_session(session: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    hidden = {
+        "backup",
+        "section_backup",
+        "login_cache_files",
+        "login_cache_directories",
+        "login_cache_fingerprints",
+    }
+    public = {key: value for key, value in session.items() if key not in hidden}
+    destination = Path(str(public.get("destination", Path.home() / ".aws"))).absolute()
+    public["destination"] = str(destination)
+    public["location"] = _location_for_directory(destination)
+    public["managed"] = True
+    drift = _managed_section_state(session)
+    expiry = public.get("expires_at")
+    remaining: int | None = None
+    if expiry:
+        try:
+            remaining = max(
+                0, int((datetime.fromisoformat(str(expiry)) - now).total_seconds())
             )
-        del sessions[key]
-    elif session.get("ecr"):
-        sessions[key] = {
-            "destination": str(destination.absolute()),
-            "profile": profile,
-            "auth_method": "ecr-only",
-            "started_at": session.get("started_at"),
-            "backup": [],
-            "ecr": session["ecr"],
-        }
+        except ValueError:
+            remaining = None
+    public["remaining_seconds"] = remaining
+    if public.get("auth_method") in {"browser-cache-residue", "logout-residue"}:
+        state = "logout-residue"
+    elif public.get("auth_method") == "ecr-only":
+        state = "ecr-only"
+    elif drift:
+        state = drift
+    elif not session.get("section_backup"):
+        state = "legacy-unverified"
+    elif remaining == 0 and expiry:
+        state = "expired"
+    elif remaining is not None and remaining <= 900:
+        state = "expiring"
     else:
-        del sessions[key]
-    _state.save_sessions(sessions)
-    return True
+        state = "active"
+    public["state"] = state
+    return public
 
 
 def status() -> list[dict[str, Any]]:
-    """Return secret-free active session status."""
+    """Return secret-free, local-only managed-session status."""
     now = datetime.now(UTC)
-    result = []
-    for session in _state.load_sessions().values():
-        public = {key: value for key, value in session.items() if key != "backup"}
-        expiry = public.get("expires_at")
-        if expiry:
-            try:
-                public["remaining_seconds"] = max(
-                    0, int((datetime.fromisoformat(expiry) - now).total_seconds())
+    return sorted(
+        (_public_session(item, now=now) for item in _state.load_sessions().values()),
+        key=lambda item: (str(item.get("destination")), str(item.get("profile"))),
+    )
+
+
+def _verify_status(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("state") in {"ecr-only", "missing", "drifted"}:
+        return {"status": "skipped", "reason": f"local state is {item['state']}"}
+    directory = Path(str(item["destination"]))
+    profile = str(item.get("profile", "default"))
+    try:
+        with _aws_environment(
+            directory / "config", directory / "credentials", _native_login_cache()
+        ):
+            account, partition, arn = _identity(
+                boto3.Session(profile_name=profile), label=f"profile {profile!r}"
+            )
+    except _configs.OperationalError as error:
+        return {"status": "error", "message": str(error)}
+    return {
+        "status": "verified",
+        "account": account,
+        "partition": partition,
+        "arn": arn,
+    }
+
+
+def status_report(
+    *,
+    profile: str | None = None,
+    location: str | None = None,
+    directory: Path | None = None,
+    verify: bool = False,
+) -> dict[str, Any]:
+    """Return filtered local lifecycle state with optional explicit AWS verification."""
+    sessions = status()
+    if profile:
+        sessions = [item for item in sessions if item.get("profile") == profile]
+    if location:
+        normalized = _state.normalize_location(location)
+        sessions = [item for item in sessions if item.get("location") == normalized]
+    if directory:
+        wanted = str(directory.expanduser().absolute())
+        sessions = [item for item in sessions if item.get("destination") == wanted]
+    if verify:
+        for item in sessions:
+            item["verification"] = _verify_status(item)
+    counts: dict[str, int] = {}
+    for item in sessions:
+        state = str(item["state"])
+        counts[state] = counts.get(state, 0) + 1
+    return {"sessions": sessions, "counts": counts, "warnings": []}
+
+
+def _known_directories() -> dict[Path, str | None]:
+    directories: dict[Path, str | None] = {(Path.home() / ".aws").absolute(): "default"}
+    try:
+        for path in Path.home().glob(".aws-*"):
+            if path.is_dir():
+                directories[path.absolute()] = path.name[5:] or None
+    except OSError:
+        pass
+    data = _state.load_config()
+    for target in data["targets"].values():
+        for prefix in ("source", "destination"):
+            raw_directory = target.get(f"{prefix}_directory")
+            raw_location = target.get(f"{prefix}_location")
+            if raw_directory:
+                path = Path(str(raw_directory)).expanduser().absolute()
+                directories.setdefault(path, None)
+            elif raw_location:
+                path = _state.aws_directory(str(raw_location)).absolute()
+                directories.setdefault(
+                    path, _state.normalize_location(str(raw_location))
                 )
-            except ValueError:
-                public["remaining_seconds"] = None
-        result.append(public)
-    return result
+    for session in _state.load_sessions().values():
+        if session.get("destination"):
+            path = Path(str(session["destination"])).absolute()
+            directories.setdefault(path, _location_for_directory(path))
+    return directories
+
+
+def profile_inventory(
+    patterns: list[str] | None = None, *, verify: bool = False
+) -> dict[str, Any]:
+    """Enumerate local profile names without reading or returning credential values."""
+    warnings: list[dict[str, str]] = []
+    found: dict[tuple[str, str], dict[str, Any]] = {}
+    managed = {
+        (str(item["destination"]), str(item.get("profile", "default"))): item
+        for item in status()
+    }
+    for directory, location in _known_directories().items():
+        names: set[str] = set()
+        for filename, is_config in (("credentials", False), ("config", True)):
+            path = directory / filename
+            try:
+                parser = _read_ini(path)
+            except _configs.OperationalError as error:
+                warnings.append({"path": str(path), "message": str(error)})
+                continue
+            for section in parser.sections():
+                if is_config:
+                    if section == "default":
+                        names.add("default")
+                    elif section.startswith("profile ") and section[8:]:
+                        names.add(section[8:])
+                else:
+                    names.add(section)
+        if directory.exists():
+            try:
+                for path in directory.glob("*.store.credentials"):
+                    names.add(path.name[: -len(".store.credentials")])
+            except OSError as error:
+                warnings.append({"path": str(directory), "message": str(error)})
+        for destination, profile_name in managed:
+            if destination == str(directory):
+                names.add(profile_name)
+        for profile_name in names:
+            key = (str(directory), profile_name)
+            lifecycle = managed.get(key)
+            legacy = (directory / f"{profile_name}.store.credentials").is_file()
+            found[key] = {
+                "location": location,
+                "directory": str(directory),
+                "profile": profile_name,
+                "managed": lifecycle is not None or legacy,
+                "state": (
+                    lifecycle["state"]
+                    if lifecycle
+                    else "legacy-unverified"
+                    if legacy
+                    else "unmanaged"
+                ),
+                "auth_method": (
+                    lifecycle.get("auth_method")
+                    if lifecycle
+                    else "legacy-mfa"
+                    if legacy
+                    else None
+                ),
+            }
+    profiles = sorted(
+        found.values(),
+        key=lambda item: (
+            str(item.get("location") or "~"),
+            str(item["directory"]),
+            str(item["profile"]),
+        ),
+    )
+    if patterns:
+        profiles = [
+            item
+            for item in profiles
+            if any(
+                fnmatch.fnmatchcase(candidate.casefold(), pattern.casefold())
+                for pattern in patterns
+                for candidate in (
+                    str(item["profile"]),
+                    f"{item.get('location') or item['directory']}:{item['profile']}",
+                )
+            )
+        ]
+    if verify:
+        for item in profiles:
+            item["verification"] = _verify_status(
+                {
+                    **item,
+                    "destination": item["directory"],
+                }
+            )
+    return {"profiles": profiles, "count": len(profiles), "warnings": warnings}
+
+
+def _restore_profile_sections(
+    session: dict[str, Any], destination: Path, profile: str, *, force: bool
+) -> None:
+    plans = _profile_section_plans(session, destination, profile, force=force)
+    _apply_profile_section_plans(plans)
+
+
+def _profile_section_plans(
+    session: dict[str, Any], destination: Path, profile: str, *, force: bool
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    sections = session.get("section_backup")
+    if not isinstance(sections, dict) or not sections:
+        snapshots = {
+            Path(str(item.get("path", ""))).absolute(): item
+            for item in session.get("backup", [])
+            if isinstance(item, dict)
+        }
+        relevant = any(
+            (destination / filename).absolute() in snapshots
+            for filename in ("credentials", "config")
+        )
+        if relevant and not force:
+            raise _configs.OperationalError(
+                "This legacy session has no installed-section fingerprint; retry "
+                "with --force to restore only its recorded profile sections."
+            )
+        if not relevant:
+            return []
+        sections = {}
+        for kind, filename, is_config in (
+            ("credentials", "credentials", False),
+            ("config", "config", True),
+        ):
+            path = (destination / filename).absolute()
+            snapshot = snapshots.get(path)
+            if snapshot is None:
+                continue
+            raw = base64.b64decode(snapshot["data"]) if snapshot.get("exists") else None
+            parser = _parser_from_bytes(raw, path)
+            section = _section(profile, config=is_config)
+            values = _section_values(parser, section)
+            sections[kind] = {
+                "path": str(path),
+                "section": section,
+                "original": {"exists": values is not None, "values": values or {}},
+            }
+    plans: list[tuple[Path, str, dict[str, Any]]] = []
+    for kind, item in sections.items():
+        if not isinstance(item, dict):
+            raise _configs.OperationalError("Managed session section state is invalid.")
+        expected_path = (
+            destination / ("config" if kind == "config" else "credentials")
+        ).absolute()
+        path = Path(str(item.get("path", ""))).absolute()
+        expected_section = _section(profile, config=kind == "config")
+        if path != expected_path or item.get("section") != expected_section:
+            raise _configs.OperationalError(
+                "Managed session section state does not match its destination."
+            )
+        installed = item.get("installed")
+        if not force and (
+            isinstance(installed, dict)
+            and _section_state(path, expected_section) != installed
+        ):
+            raise _configs.OperationalError(
+                f"Profile {profile!r} changed after login in {path}; retry with "
+                "--force only after reviewing the local changes."
+            )
+        original = item.get("original")
+        if not isinstance(original, dict):
+            raise _configs.OperationalError(
+                "Managed session original section is invalid."
+            )
+        plans.append((path, expected_section, original))
+    return plans
+
+
+def _apply_profile_section_plans(
+    plans: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    for path, section, original in plans:
+        parser = _read_ini(path)
+        if original.get("exists"):
+            values = original.get("values")
+            if not isinstance(values, dict):
+                raise _configs.OperationalError(
+                    "Managed session original section values are invalid."
+                )
+            parser[section] = {str(key): str(value) for key, value in values.items()}
+        else:
+            parser.remove_section(section)
+        _write_ini(path, parser)
+
+
+def _tracked_login_cache_plan(
+    session: dict[str, Any], destination: Path, *, force: bool
+) -> tuple[list[Path], list[Path], list[dict[str, str]]]:
+    if session.get("auth_method") not in {
+        "browser-native",
+        "browser-cache-residue",
+        "logout-residue",
+    }:
+        return [], [], []
+    configured_roots = session.get("login_cache_directories") or [
+        str((destination / "login" / "cache").absolute())
+    ]
+    allowed_roots = [Path(str(value)).absolute() for value in configured_roots]
+    fingerprints = session.get("login_cache_fingerprints", {})
+    removals: list[Path] = []
+    residue: list[dict[str, str]] = []
+    for value in session.get("login_cache_files", []):
+        cache_file = Path(str(value)).absolute()
+        expected = fingerprints.get(str(cache_file))
+        in_scope = any(
+            root == cache_file.parent or root in cache_file.parents
+            for root in allowed_roots
+        )
+        if not in_scope:
+            residue.append(
+                {"path": str(cache_file), "reason": "outside tracked cache roots"}
+            )
+            continue
+        if not cache_file.exists():
+            continue
+        try:
+            current = _state.digest(cache_file.read_bytes())
+        except OSError as error:
+            if force:
+                removals.append(cache_file)
+                continue
+            residue.append({"path": str(cache_file), "reason": f"unreadable: {error}"})
+            continue
+        if not isinstance(expected, str) or current != expected:
+            if force:
+                removals.append(cache_file)
+                continue
+            residue.append(
+                {"path": str(cache_file), "reason": "fingerprint changed after login"}
+            )
+            continue
+        removals.append(cache_file)
+    if residue and not force:
+        details = "; ".join(f"{item['path']}: {item['reason']}" for item in residue)
+        raise _configs.OperationalError(
+            "Tracked browser login cache changed after login; no logout changes were "
+            f"made. Review the cache or retry with --force: {details}"
+        )
+    return allowed_roots, removals, residue
+
+
+def _remove_tracked_login_cache(
+    removals: list[Path], residue: list[dict[str, str]], *, force: bool
+) -> list[dict[str, str]]:
+    for cache_file in removals:
+        try:
+            cache_file.unlink()
+        except OSError as error:
+            if not force:
+                raise _configs.OperationalError(
+                    f"Unable to remove tracked browser login cache {cache_file}: {error}"
+                ) from error
+            residue.append(
+                {"path": str(cache_file), "reason": f"remove failed: {error}"}
+            )
+    return residue
+
+
+def _matches_except(session: dict[str, Any], excluded: set[str]) -> bool:
+    if not excluded:
+        return False
+    profile = str(session.get("profile", "default"))
+    destination = Path(str(session.get("destination", Path.home() / ".aws")))
+    location = session.get("location") or _location_for_directory(destination)
+    candidates = {profile, f"{location or destination}:{profile}"}
+    target_name = session.get("target")
+    if target_name:
+        candidates.add(f"+{str(target_name).lstrip('+')}")
+    try:
+        for name, target in _state.load_config()["targets"].items():
+            source = (
+                Path(str(target["source_directory"])).expanduser().absolute()
+                if target.get("source_directory")
+                else _state.aws_directory(target.get("source_location"))
+            )
+            target_destination = (
+                Path(str(target["destination_directory"])).expanduser().absolute()
+                if target.get("destination_directory")
+                else _state.aws_directory(target["destination_location"])
+                if target.get("destination_location")
+                else source
+            )
+            target_profile = _normalize_profile(
+                target.get("destination_profile", target.get("source_profile"))
+            )
+            if (
+                target_destination == destination.absolute()
+                and target_profile == profile
+            ):
+                candidates.add(f"+{name}")
+    except _configs.OperationalError:
+        pass
+    return any(
+        fnmatch.fnmatchcase(candidate.casefold(), pattern.casefold())
+        for candidate in candidates
+        for pattern in excluded
+    )
+
+
+def matches_logout_exclusion(
+    *, destination: str, profile: str, excluded: set[str], location: str | None = None
+) -> bool:
+    """Match bulk-logout selectors without exposing credential contents."""
+    return _matches_except(
+        {"destination": destination, "profile": profile, "location": location}, excluded
+    )
+
+
+def _logout_key(key: str, args: Any) -> dict[str, Any]:
+    sessions = _state.load_sessions()
+    session = sessions.get(key)
+    if not session:
+        return {"key": key, "state": "not-managed", "changed": False}
+    destination = Path(str(session["destination"])).absolute()
+    profile = str(session.get("profile", "default"))
+    if _matches_except(session, set(getattr(args, "except_profiles", []) or [])):
+        return {"key": key, "state": "excluded", "changed": False}
+    keep_ecr = bool(getattr(args, "keep_ecr", False))
+    force = bool(getattr(args, "force", False))
+    registries = list(session.get("ecr", []))
+    plans = _profile_section_plans(session, destination, profile, force=force)
+    cache_roots, cache_removals, cache_residue = _tracked_login_cache_plan(
+        session, destination, force=force
+    )
+    journal = _begin(
+        [destination / "credentials", destination / "config", _state.sessions_path()],
+        cache_roots=cache_roots,
+    )
+    residual: dict[str, Any] = {
+        "destination": str(destination),
+        "profile": profile,
+        "auth_method": "ecr-only",
+        "started_at": session.get("started_at"),
+        "backup": [],
+        "section_backup": {},
+        "ecr": registries,
+        "ecr_engine": session.get("ecr_engine"),
+    }
+    try:
+        _apply_profile_section_plans(plans)
+        cache_residue = _remove_tracked_login_cache(
+            cache_removals, cache_residue, force=force
+        )
+        if cache_residue:
+            residual.update(
+                auth_method="logout-residue" if registries else "browser-cache-residue",
+                login_cache_residue=cache_residue,
+                login_cache_directories=[str(path) for path in cache_roots],
+                login_cache_files=[item["path"] for item in cache_residue],
+                login_cache_fingerprints={},
+            )
+        if registries or cache_residue:
+            sessions[key] = residual
+        else:
+            del sessions[key]
+        _state.save_sessions(sessions)
+        _commit()
+    except Exception:
+        _rollback(journal)
+        raise
+    if registries and not keep_ecr:
+        engine = cast(
+            "_configs.ContainerEngine",
+            str(
+                session.get("ecr_engine")
+                or ("podman" if getattr(args, "podman", False) else "docker")
+            ),
+        )
+        remaining = list(registries)
+        for registry in registries:
+            try:
+                _ecr._run_container_engine(engine, [engine, "logout", registry])
+            except _configs.OperationalError:
+                sessions = _state.load_sessions()
+                sessions[key] = {**residual, "ecr": remaining}
+                _state.save_sessions(sessions)
+                raise
+            remaining.remove(registry)
+            sessions = _state.load_sessions()
+            if remaining:
+                sessions[key] = {**residual, "ecr": remaining}
+            elif cache_residue:
+                sessions[key] = {**residual, "ecr": []}
+            else:
+                sessions.pop(key, None)
+            _state.save_sessions(sessions)
+    return {
+        "key": key,
+        "destination": str(destination),
+        "profile": profile,
+        "state": (
+            "logout-residue"
+            if cache_residue
+            else "ecr-only"
+            if registries and keep_ecr
+            else "logged-out"
+        ),
+        "residue": cache_residue,
+        "changed": True,
+    }
+
+
+def logout(context: _configs.Context) -> bool:
+    """Restore one managed session locally using compare-and-swap sections."""
+    _source, _source_profile, destination, profile = _paths(context.args)
+    key = f"{destination.absolute()}::{profile}"
+    return bool(_logout_key(key, context.args)["changed"])
+
+
+def logout_all(args: Any) -> dict[str, Any]:
+    """Log out every managed session except explicit profile selectors."""
+    outcomes = []
+    errors = []
+    for key in sorted(_state.load_sessions()):
+        try:
+            outcomes.append(_logout_key(key, args))
+        except _configs.OperationalError as error:
+            errors.append({"key": key, "message": str(error)})
+    return {"outcomes": outcomes, "errors": errors}
 
 
 def explain_target(value: str) -> dict[str, Any]:
@@ -1144,32 +1880,74 @@ def _check_config(args: Any) -> dict[str, Any]:
         data = _state.load_config()
     except _configs.OperationalError as error:
         return {"ok": False, "errors": [str(error)], "warnings": []}
-    for name in data["policies"]:
+    remote = bool(getattr(args, "remote", False) or getattr(args, "probe", False))
+    scoped_accounts: set[str] = set()
+    if getattr(args, "account", None):
+        account_name, _ = _state.get_resource(data, "account", args.account)
+        scoped_accounts.add(account_name.casefold())
+    check_session: Any | None = None
+    profile = "default"
+    account: str | None = None
+    partition: str | None = None
+    if remote:
         try:
-            _policies.parse_policy(_policies.stored_directory() / f"{name}.yaml")
-        except _configs.OperationalError as error:
-            errors.append(str(error))
-    if args.remote or args.probe:
-        profile = args.profile or "default"
-        if args.target:
-            target_name, target = _state.get_resource(
-                data, "target", args.target.lstrip("+")
-            )
-            profile = target.get("source_profile", "default")
-            source_directory = (
-                Path(target["source_directory"])
-                if target.get("source_directory")
-                else _state.aws_directory(target.get("source_location"))
-            )
+            selector = _configs.resolve_credential_selector(args)
+            profile = selector.profile
+            if selector.target:
+                target_name, target = _state.get_resource(
+                    data, "target", selector.target.lstrip("+")
+                )
+                profile = target.get("source_profile", "default")
+                source_directory = (
+                    Path(target["source_directory"])
+                    if target.get("source_directory")
+                    else _state.aws_directory(target.get("source_location"))
+                )
+                warnings.append(f"Using target {target_name} credential source.")
+            else:
+                source_directory = selector.directory or _state.aws_directory(
+                    selector.location
+                )
             os.environ["AWS_CONFIG_FILE"] = str(source_directory / "config")
             os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(
                 source_directory / "credentials"
             )
-            warnings.append(f"Using target {target_name} credential source.")
-        try:
             check_session = boto3.Session(profile_name=profile)
             account, partition, _ = _identity(check_session, label="config check")
-            if args.account:
+            if not scoped_accounts:
+                scoped_accounts = {
+                    name.casefold()
+                    for name, configured in data["accounts"].items()
+                    if configured["id"] == account
+                    and configured["partition"] == partition
+                }
+        except _configs.OperationalError as error:
+            errors.append(f"Remote resources unverifiable: {error}")
+    scoped_policies: set[str] | None = None
+    if getattr(args, "account", None) or remote:
+        scoped_policies = {
+            str(boundary["policy"])
+            for boundary in data["boundaries"].values()
+            if str(boundary["account"]).casefold() in scoped_accounts
+            and boundary.get("policy")
+        }
+    for name in data["policies"]:
+        if scoped_policies is not None and not any(
+            name.casefold() == policy.casefold() for policy in scoped_policies
+        ):
+            continue
+        try:
+            _policies.parse_policy(_policies.stored_directory() / f"{name}.yaml")
+        except _configs.OperationalError as error:
+            errors.append(str(error))
+    if (
+        remote
+        and check_session is not None
+        and account is not None
+        and partition is not None
+    ):
+        try:
+            if getattr(args, "account", None):
                 _, configured = _state.get_resource(data, "account", args.account)
                 if configured["id"] != account or configured["partition"] != partition:
                     errors.append(
@@ -1193,7 +1971,18 @@ def _check_config(args: Any) -> dict[str, Any]:
                     errors.append(f"Boundary {name}: {label} ({error}).")
                 except BotoCoreError as error:
                     errors.append(f"Boundary {name}: unverifiable ({error}).")
-            if args.probe:
+                if boundary.get("policy"):
+                    try:
+                        _policies.resolve(
+                            str(boundary["policy"]),
+                            account_id=account,
+                            partition=partition,
+                            profile=profile,
+                            session=check_session,
+                        )
+                    except _configs.OperationalError as error:
+                        errors.append(f"Boundary {name} policy: {error}")
+            if getattr(args, "probe", False):
                 deny_all = json.dumps(
                     {
                         "Version": "2012-10-17",
@@ -1247,11 +2036,48 @@ def fix_config(args: Any) -> _configs.Result:
         _state.atomic_write(backup, path.read_bytes())
     issues: list[tuple[str, str, str]] = []
     scoped_policies: set[str] | None = None
+    scoped_account_names: set[str] = set()
     if args.account:
+        scoped_account_names.add(account_name.casefold())
+    elif getattr(args, "remote", False) or getattr(args, "probe", False):
+        try:
+            selector = _configs.resolve_credential_selector(args)
+            profile = selector.profile
+            if selector.target:
+                _, target = _state.get_resource(
+                    data, "target", selector.target.lstrip("+")
+                )
+                profile = str(target.get("source_profile", "default"))
+                source_directory = (
+                    Path(str(target["source_directory"])).expanduser().absolute()
+                    if target.get("source_directory")
+                    else _state.aws_directory(target.get("source_location"))
+                )
+            else:
+                source_directory = selector.directory or _state.aws_directory(
+                    selector.location
+                )
+            with _aws_environment(
+                source_directory / "config",
+                source_directory / "credentials",
+                _native_login_cache(),
+            ):
+                caller_account, caller_partition, _ = _identity(
+                    boto3.Session(profile_name=profile), label="config fix"
+                )
+            scoped_account_names = {
+                name.casefold()
+                for name, configured in data["accounts"].items()
+                if configured["id"] == caller_account
+                and configured["partition"] == caller_partition
+            }
+        except _configs.OperationalError:
+            scoped_account_names = set()
+    if args.account or getattr(args, "remote", False) or getattr(args, "probe", False):
         scoped_policies = {
             str(boundary["policy"])
             for boundary in data["boundaries"].values()
-            if str(boundary["account"]).casefold() == account_name.casefold()
+            if str(boundary["account"]).casefold() in scoped_account_names
             and boundary.get("policy")
         }
     for name in data["policies"]:
@@ -1299,6 +2125,114 @@ def fix_config(args: Any) -> _configs.Result:
             (_policies.stored_directory() / f"{name}.yaml").unlink(missing_ok=True)
         else:
             unresolved.append(message)
+    if getattr(args, "remote", False) or getattr(args, "probe", False):
+        report = _check_config(args)
+        local_messages = {message for _kind, _name, message in issues}
+        for message in report["errors"]:
+            if message in local_messages:
+                continue
+            boundary_match = re.match(r"Boundary ([^:]+):", message)
+            boundary_policy_match = re.match(r"Boundary ([^:]+) policy:", message)
+            kind = (
+                "boundary-policy"
+                if boundary_policy_match
+                else "boundary"
+                if boundary_match
+                else "account"
+                if message.startswith("Selected account does not match caller ")
+                else "remote"
+            )
+            name = (
+                boundary_policy_match.group(1)
+                if boundary_policy_match
+                else boundary_match.group(1)
+                if boundary_match
+                else str(getattr(args, "account", "verification"))
+            )
+            if args.yes or not sys.stdin.isatty():
+                unresolved.append(message)
+                continue
+            answer = (
+                input(
+                    f"Issue {kind}:{name}: {message}\n"
+                    "Choose update, leave, or remove [u/l/x]: "
+                )
+                .strip()
+                .casefold()
+            )
+            if answer in {"u", "update", "r", "repair"} and kind == "boundary":
+                role_arn = input("Replacement role ARN: ").strip()
+                if not re.fullmatch(r"arn:[^:]+:iam::\d{12}:role/.+", role_arn):
+                    unresolved.append(
+                        f"Update for boundary {name!r} failed: replacement must be "
+                        "a complete IAM role ARN."
+                    )
+                    continue
+                canonical, boundary = _state.get_resource(data, "boundary", name)
+                boundary["role_arn"] = role_arn
+                data["boundaries"][canonical] = boundary
+            elif answer in {"u", "update", "r", "repair"} and kind == "boundary-policy":
+                policy = input("Replacement policy name, ARN, or file: ").strip()
+                canonical, boundary = _state.get_resource(data, "boundary", name)
+                if policy:
+                    boundary["policy"] = policy
+                else:
+                    boundary.pop("policy", None)
+                data["boundaries"][canonical] = boundary
+            elif answer in {"u", "update", "r", "repair"} and kind == "account":
+                caller = re.search(r"caller ([^:]+):(\d{12})", message)
+                if not caller:
+                    unresolved.append(message)
+                    continue
+                canonical, account = _state.get_resource(data, "account", name)
+                account.update(partition=caller.group(1), id=caller.group(2))
+                data["accounts"][canonical] = account
+                for boundary in data["boundaries"].values():
+                    if (
+                        str(boundary.get("account", "")).casefold()
+                        != canonical.casefold()
+                    ):
+                        continue
+                    role_path = str(boundary["role_arn"]).split(":role/", 1)[-1]
+                    boundary["role_arn"] = (
+                        f"arn:{caller.group(1)}:iam::{caller.group(2)}:role/{role_path}"
+                    )
+            elif answer in {"x", "remove"} and kind in {
+                "boundary",
+                "boundary-policy",
+                "account",
+            }:
+                resource_kind = "boundary" if kind == "boundary-policy" else kind
+                canonical, _ = _state.get_resource(data, resource_kind, name)
+                removed_boundaries: set[str] = set()
+                if resource_kind == "boundary":
+                    removed_boundaries.add(canonical.casefold())
+                else:
+                    removed_boundaries = {
+                        key.casefold()
+                        for key, value in data["boundaries"].items()
+                        if str(value.get("account", "")).casefold()
+                        == canonical.casefold()
+                    }
+                    data["boundaries"] = {
+                        key: value
+                        for key, value in data["boundaries"].items()
+                        if key.casefold() not in removed_boundaries
+                    }
+                data["targets"] = {
+                    key: value
+                    for key, value in data["targets"].items()
+                    if str(value.get("boundary", "")).casefold()
+                    not in removed_boundaries
+                    and not (
+                        resource_kind == "account"
+                        and str(value.get("source_account", "")).casefold()
+                        == canonical.casefold()
+                    )
+                }
+                del data[_state.collection_name(resource_kind)][canonical]
+            else:
+                unresolved.append(message)
     _state.save_config(data)
     if unresolved:
         return _configs.Result(

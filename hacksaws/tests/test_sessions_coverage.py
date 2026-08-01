@@ -7,6 +7,7 @@ import configparser
 import json
 import os
 import subprocess
+import tomllib
 import zipfile
 from datetime import UTC
 from datetime import datetime
@@ -153,8 +154,9 @@ def test_journal_commit_and_crash_recovery_restore_files_and_cache(
     created = tmp_path / "config"
     cache = tmp_path / "cache"
     old_cache = cache / "old.json"
+    preexisting_directory = cache / "keep" / "empty"
     original.write_bytes(b"original")
-    old_cache.parent.mkdir()
+    preexisting_directory.mkdir(parents=True)
     old_cache.write_bytes(b"cached")
 
     journal = _sessions._begin([original, created], cache_roots=[cache])
@@ -163,18 +165,38 @@ def test_journal_commit_and_crash_recovery_restore_files_and_cache(
     created.write_bytes(b"new")
     old_cache.write_bytes(b"changed-cache")
     (cache / "new.json").write_bytes(b"new-cache")
+    nested_cache = cache / "created" / "nested" / "new.json"
+    nested_cache.parent.mkdir(parents=True)
+    nested_cache.write_bytes(b"nested-cache")
 
     _sessions.recover_journal()
     assert original.read_bytes() == b"original"
     assert not created.exists()
     assert old_cache.read_bytes() == b"cached"
     assert not (cache / "new.json").exists()
+    assert not (cache / "created").exists()
+    assert preexisting_directory.is_dir()
     assert not _sessions._journal_path().exists()
 
     _sessions._begin([])
     _sessions._commit()
     assert not _sessions._journal_path().exists()
     assert journal["safe_to_rollback"] is True
+
+
+def test_cache_rollback_removes_an_entire_new_nested_cache_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    cache = tmp_path / "absent-before"
+    assert not cache.exists()
+    journal = _sessions._begin([], cache_roots=[cache])
+    token = cache / "provider" / "nested" / "token.json"
+    token.parent.mkdir(parents=True)
+    token.write_text("broad", encoding="utf-8")
+    _sessions._rollback(journal)
+    assert not cache.exists()
+    assert not _sessions._journal_path().exists()
 
 
 def test_recovery_rejects_corrupt_or_unsafe_journal(
@@ -592,11 +614,14 @@ def test_aws_environment_scrubs_and_restores_all_conflicts(
         monkeypatch.setenv(key, f"old-{key}")
     config = tmp_path / "config"
     credentials = tmp_path / "credentials"
-    cleaned = _sessions._clean_env(config, credentials)
+    login_cache = tmp_path / "login-cache"
+    cleaned = _sessions._clean_env(config, credentials, login_cache)
     assert cleaned["AWS_CONFIG_FILE"] == str(config)
+    assert cleaned["AWS_LOGIN_CACHE_DIRECTORY"] == str(login_cache)
     assert "AWS_PROFILE" not in cleaned
-    with _sessions._aws_environment(config, credentials):
+    with _sessions._aws_environment(config, credentials, login_cache):
         assert os.environ["AWS_CONFIG_FILE"] == str(config)
+        assert os.environ["AWS_LOGIN_CACHE_DIRECTORY"] == str(login_cache)
         assert "AWS_PROFILE" not in os.environ
     for key in _sessions._CONFLICTING_ENV:
         assert os.environ[key] == f"old-{key}"
@@ -605,13 +630,21 @@ def test_aws_environment_scrubs_and_restores_all_conflicts(
 def test_aws_login_passes_remote_and_wraps_subprocess_errors(tmp_path: Path) -> None:
     config = tmp_path / "nested" / "config"
     credentials = tmp_path / "nested" / "credentials"
+    login_cache = tmp_path / "login-cache"
     with (
         patch("hacksaws._sessions._aws_cli_version"),
         patch("hacksaws._sessions.subprocess.run") as run,
     ):
-        _sessions._aws_login(config, credentials, "dev", remote=True)
+        _sessions._aws_login(
+            config,
+            credentials,
+            "dev",
+            remote=True,
+            login_cache=login_cache,
+        )
     assert run.call_args.args[0] == ["aws", "login", "--profile", "dev", "--remote"]
     assert run.call_args.kwargs["env"]["AWS_CONFIG_FILE"] == str(config)
+    assert run.call_args.kwargs["env"]["AWS_LOGIN_CACHE_DIRECTORY"] == str(login_cache)
     with (
         patch("hacksaws._sessions._aws_cli_version"),
         patch(
@@ -620,7 +653,28 @@ def test_aws_login_passes_remote_and_wraps_subprocess_errors(tmp_path: Path) -> 
         ),
         pytest.raises(_configs.OperationalError, match="browser login failed"),
     ):
-        _sessions._aws_login(config, credentials, "dev", remote=False)
+        _sessions._aws_login(
+            config,
+            credentials,
+            "dev",
+            remote=False,
+            login_cache=login_cache,
+        )
+
+
+def test_browser_runtime_dependency_is_declared_and_preflight_is_actionable() -> None:
+    project = tomllib.loads(
+        (Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert "boto3[crt]>=1.41,<2" in project["project"]["dependencies"]
+    with (
+        patch(
+            "hacksaws._sessions.importlib.import_module",
+            side_effect=ImportError("missing CRT"),
+        ),
+        pytest.raises(_configs.OperationalError, match=r"CRT.*uv sync"),
+    ):
+        _sessions._require_browser_runtime()
 
 
 def test_native_browser_remote_cache_ecr_success_and_logout(
@@ -632,6 +686,7 @@ def test_native_browser_remote_cache_ecr_success_and_logout(
     old_cache.parent.mkdir(parents=True)
     old_cache.write_text("old")
     new_cache = old_cache.with_name("new.json")
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(old_cache.parent))
     native = MagicMock(region_name="us-west-2")
     registry = f"{ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com"
 
@@ -662,6 +717,104 @@ def test_native_browser_remote_cache_ecr_success_and_logout(
     engine.assert_called_once()
 
 
+def test_native_browser_logout_preserves_a_later_same_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "alternate-aws"
+    cache = tmp_path / "shared-login-cache"
+    old_cache = cache / "old.json"
+    new_cache = cache / "debug.json"
+    old_cache.parent.mkdir(parents=True)
+    old_cache.write_text("old", encoding="utf-8")
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache))
+    native = MagicMock(region_name="us-west-2")
+
+    def login(
+        config: Path,
+        credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del credentials, remote
+        assert profile == "debug"
+        assert login_cache == cache.absolute()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "[profile debug]\nregion=us-west-2\nlogin_session=x\n",
+            encoding="utf-8",
+        )
+        new_cache.write_text("new", encoding="utf-8")
+
+    args = _args(directory=str(aws), profile="debug")
+    with (
+        patch("hacksaws._sessions._aws_login", side_effect=login),
+        patch("hacksaws._sessions.boto3.Session", return_value=native),
+        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+    ):
+        _sessions.browser_login(_configs.Context(args))
+    saved = _state.load_sessions()[f"{aws.absolute()}::debug"]
+    assert saved["login_cache_files"] == [str(new_cache.absolute())]
+    assert saved["login_cache_directories"] == [str(cache.absolute())]
+    assert old_cache.read_text(encoding="utf-8") == "old"
+    new_cache.write_text("independent replacement", encoding="utf-8")
+    with pytest.raises(_configs.OperationalError, match="changed after login"):
+        _sessions.logout(_configs.Context(args))
+    assert new_cache.read_text(encoding="utf-8") == "independent replacement"
+    assert old_cache.read_text(encoding="utf-8") == "old"
+    assert f"{aws.absolute()}::debug" in _state.load_sessions()
+
+
+def test_native_browser_post_login_failure_reports_complete_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    config = aws / "config"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"[default]\nregion=us-east-1\n")
+    cache = tmp_path / "cache"
+    old_cache = cache / "old.json"
+    new_cache = cache / "new.json"
+    cache.mkdir()
+    old_cache.write_text("old", encoding="utf-8")
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache))
+
+    def login(
+        config_path: Path,
+        credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del credentials, profile, remote
+        assert login_cache == cache.absolute()
+        config_path.write_text("[profile debug]\nlogin_session=x\n", encoding="utf-8")
+        new_cache.write_text("broad", encoding="utf-8")
+
+    args = _args(directory=str(aws), profile="debug")
+    with (
+        patch("hacksaws._sessions._aws_login", side_effect=login),
+        patch("hacksaws._sessions.boto3.Session", return_value=MagicMock()),
+        patch(
+            "hacksaws._sessions._identity",
+            side_effect=_configs.OperationalError("identity failed"),
+        ),
+        pytest.raises(
+            _configs.OperationalError,
+            match=r"identity failed.*profile 'debug' were rolled back",
+        ),
+    ):
+        _sessions.browser_login(_configs.Context(args))
+    assert config.read_bytes() == b"[default]\nregion=us-east-1\n"
+    assert old_cache.read_text(encoding="utf-8") == "old"
+    assert not new_cache.exists()
+    assert not _sessions._journal_path().exists()
+
+
 def test_bounded_browser_success_removes_login_session_and_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -669,10 +822,26 @@ def test_bounded_browser_success_removes_login_session_and_staging(
     aws = tmp_path / "aws"
     intermediate = MagicMock(region_name="us-west-2")
 
-    def login(config: Path, credentials: Path, *args: object, **kwargs: object) -> None:
+    inherited_cache = tmp_path / "global-cache"
+    inherited_cache.mkdir()
+    unrelated = inherited_cache / "unrelated.json"
+    unrelated.write_text("old", encoding="utf-8")
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(inherited_cache))
+
+    def login(
+        config: Path,
+        credentials: Path,
+        *args: object,
+        login_cache: Path,
+        **kwargs: object,
+    ) -> None:
+        assert root / "staging" in login_cache.parents
+        assert login_cache != inherited_cache
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text("[profile dev]\nregion=us-west-2\nlogin_session=x\n")
         credentials.write_text("[dev]\na=x\n")
+        login_cache.mkdir(parents=True)
+        (login_cache / "broad.json").write_text("broad", encoding="utf-8")
 
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
@@ -689,6 +858,7 @@ def test_bounded_browser_success_removes_login_session_and_staging(
     assert "login_session" not in config["profile out"]
     assert config["profile out"]["region"] == "us-west-2"
     assert not (root / "staging").exists() or not any((root / "staging").iterdir())
+    assert unrelated.read_text(encoding="utf-8") == "old"
 
 
 def test_bounded_browser_restores_environment_when_assume_fails(
@@ -697,8 +867,27 @@ def test_bounded_browser_restores_environment_when_assume_fails(
     _configured(tmp_path, monkeypatch)
     monkeypatch.setenv("AWS_CONFIG_FILE", "original-config")
     monkeypatch.delenv("AWS_SHARED_CREDENTIALS_FILE", raising=False)
+    inherited_cache = tmp_path / "inherited-cache"
+    inherited_cache.mkdir()
+    unrelated = inherited_cache / "unrelated.json"
+    unrelated.write_text("old", encoding="utf-8")
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(inherited_cache))
+
+    def login(
+        config: Path,
+        credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del config, credentials, profile, remote
+        assert inherited_cache not in login_cache.parents
+        login_cache.mkdir(parents=True)
+        (login_cache / "broad.json").write_text("broad", encoding="utf-8")
+
     with (
-        patch("hacksaws._sessions._aws_login"),
+        patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=MagicMock()),
         patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
         patch("hacksaws._sessions._assume", side_effect=RuntimeError("after-auth")),
@@ -707,6 +896,10 @@ def test_bounded_browser_restores_environment_when_assume_fails(
         _sessions.browser_login(_configs.Context(_args(target="Prod")))
     assert os.environ["AWS_CONFIG_FILE"] == "original-config"
     assert "AWS_SHARED_CREDENTIALS_FILE" not in os.environ
+    assert os.environ["AWS_LOGIN_CACHE_DIRECTORY"] == str(inherited_cache)
+    assert unrelated.read_text(encoding="utf-8") == "old"
+    staging = _state.root() / "staging"
+    assert not staging.exists() or not any(staging.iterdir())
 
 
 def test_record_preserves_original_backup_and_merges_cache_and_ecr(
@@ -758,15 +951,52 @@ def test_logout_missing_snapshot_ecr_only_and_cache_path_guard(
                 "auth_method": "browser-native",
                 "backup": [{"path": str(_state.sessions_path()), "exists": False}],
                 "login_cache_files": [str(cache), str(outside)],
+                "login_cache_fingerprints": {
+                    str(cache.absolute()): _state.digest(cache.read_bytes()),
+                    str(outside.absolute()): _state.digest(outside.read_bytes()),
+                },
+                "ecr": [],
+            }
+        }
+    )
+    context = _configs.Context(_args(directory=str(aws), profile="dev", force=True))
+    assert _sessions.logout(context) is True
+    assert not cache.exists()
+    assert outside.exists()
+    saved = _state.load_sessions()[key]
+    assert saved["auth_method"] == "browser-cache-residue"
+    assert saved["login_cache_residue"][0]["path"] == str(outside.absolute())
+
+
+def test_logout_conservatively_preserves_legacy_unfingerprinted_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    cache = aws / "login" / "cache" / "legacy.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("unknown owner", encoding="utf-8")
+    key = f"{aws.absolute()}::dev"
+    _state.save_sessions(
+        {
+            key: {
+                "destination": str(aws.absolute()),
+                "profile": "dev",
+                "auth_method": "browser-native",
+                "backup": [],
+                "login_cache_files": [str(cache)],
                 "ecr": [],
             }
         }
     )
     context = _configs.Context(_args(directory=str(aws), profile="dev"))
-    assert _sessions.logout(context) is True
+    with pytest.raises(_configs.OperationalError, match="changed after login"):
+        _sessions.logout(context)
+    assert cache.read_text(encoding="utf-8") == "unknown owner"
+    assert _sessions.logout(
+        _configs.Context(_args(directory=str(aws), profile="dev", force=True))
+    )
     assert not cache.exists()
-    assert outside.exists()
-    assert _sessions.logout(context) is False
 
 
 def test_status_is_secret_free_and_handles_expiry_values(
@@ -1094,7 +1324,21 @@ def test_shared_test_runner_preserves_pytest_exit_code() -> None:
     completed: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(
         ["pytest"], 7
     )
-    with patch("hacksaws._test_runner.subprocess.run", return_value=completed) as run:
-        assert _test_runner.main() == 7
+    with (
+        patch("hacksaws._test_runner.find_spec", return_value=object()),
+        patch("hacksaws._test_runner.subprocess.run", return_value=completed) as run,
+    ):
+        assert _test_runner.main(["-k", "focused"]) == 7
     assert run.call_args.args[0][1:3] == ["-m", "pytest"]
     assert "--cov-fail-under=95" in run.call_args.args[0]
+    assert run.call_args.args[0][-2:] == ["-k", "focused"]
+
+
+def test_shared_test_runner_explains_missing_development_dependencies(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hacksaws import _test_runner
+
+    with patch("hacksaws._test_runner.find_spec", return_value=None):
+        assert _test_runner.main([]) == 2
+    assert "requires development dependencies" in capsys.readouterr().err

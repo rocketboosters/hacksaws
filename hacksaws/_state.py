@@ -22,7 +22,22 @@ ROLE_ARN_RE = re.compile(
     r"((?:[A-Za-z0-9_+=,.@-]+/)*[A-Za-z0-9_+=,.@-]{1,64})$"
 )
 PARTITIONS = {"aws", "aws-us-gov", "aws-cn"}
-TOP_LEVEL = {"schema_version", "accounts", "boundaries", "targets", "policies", "cache"}
+TOP_LEVEL = {
+    "schema_version",
+    "accounts",
+    "boundaries",
+    "targets",
+    "policies",
+    "cache",
+    "naming",
+    "iam",
+    "session",
+    "output",
+}
+NAMING_FIELDS = {"case", "prefix", "suffix", "enforcement"}
+NAMING_CASES = {"Pascal", "camel", "snake", "kebab"}
+ENFORCEMENT_LEVELS = {"off", "warn", "error"}
+COLOR_MODES = {"auto", "always", "never"}
 
 
 def collection_name(kind: str) -> str:
@@ -49,6 +64,20 @@ def default_config() -> dict[str, Any]:
         "targets": {},
         "policies": {},
         "cache": {"max_age": 3600},
+        "naming": {
+            "global": {
+                "case": "Pascal",
+                "prefix": "",
+                "suffix": "",
+                "enforcement": "off",
+            },
+            "resources": {},
+            "accounts": {},
+            "account_resources": {},
+        },
+        "iam": {"path": "/hacksaws/"},
+        "session": {"packed_policy_warning": 80, "packed_policy_enforcement": "off"},
+        "output": {"color": "auto"},
     }
 
 
@@ -116,6 +145,9 @@ def atomic_write(path: Path, data: bytes) -> None:
 def _validate_config(data: object) -> dict[str, Any]:
     if type(data) is not dict:
         raise OperationalError("Hacksaws config must be a JSON object.")
+    defaults = default_config()
+    for key in ("naming", "iam", "session", "output"):
+        data.setdefault(key, deepcopy(defaults[key]))
     unknown = set(data) - TOP_LEVEL
     if unknown:
         raise OperationalError(
@@ -134,8 +166,91 @@ def _validate_config(data: object) -> dict[str, Any]:
         raise OperationalError("Config cache accepts only the max_age setting.")
     if type(cache.get("max_age")) is not int or cache["max_age"] < 0:
         raise OperationalError("Config cache.max_age must be non-negative seconds.")
+    _validate_foundation_settings(data)
     _validate_resources(data)
     return data
+
+
+def _validate_naming_override(value: object, *, label: str, require_all: bool) -> None:
+    """Validate one naming layer while allowing sparse resource overrides."""
+    if type(value) is not dict or set(value) - NAMING_FIELDS:
+        raise OperationalError(f"Config naming {label} contains unsupported settings.")
+    if require_all and set(value) != NAMING_FIELDS:
+        raise OperationalError(
+            f"Config naming {label} must define every naming setting."
+        )
+    if "case" in value and value["case"] not in NAMING_CASES:
+        raise OperationalError(f"Config naming {label}.case is unsupported.")
+    if "enforcement" in value and value["enforcement"] not in ENFORCEMENT_LEVELS:
+        raise OperationalError(f"Config naming {label}.enforcement is unsupported.")
+    for field in ("prefix", "suffix"):
+        if field in value and type(value[field]) is not str:
+            raise OperationalError(f"Config naming {label}.{field} must be text.")
+
+
+def _validate_foundation_settings(data: dict[str, Any]) -> None:
+    """Validate schema-one UX and IAM defaults without changing schema version."""
+    naming = data["naming"]
+    if type(naming) is not dict or set(naming) != {
+        "global",
+        "resources",
+        "accounts",
+        "account_resources",
+    }:
+        raise OperationalError("Config naming has an unsupported shape.")
+    _validate_naming_override(naming["global"], label="global", require_all=True)
+    for layer in ("resources", "accounts"):
+        if type(naming[layer]) is not dict:
+            raise OperationalError(f"Config naming.{layer} must be an object.")
+        for name, override in naming[layer].items():
+            validate_name(name, kind=f"naming {layer[:-1]}")
+            _validate_naming_override(
+                override, label=f"{layer}.{name}", require_all=False
+            )
+    if type(naming["account_resources"]) is not dict:
+        raise OperationalError("Config naming.account_resources must be an object.")
+    for account, resources in naming["account_resources"].items():
+        validate_name(account, kind="naming account")
+        if type(resources) is not dict:
+            raise OperationalError(
+                "Config naming.account_resources entries must be objects."
+            )
+        for resource, override in resources.items():
+            validate_name(resource, kind="naming resource")
+            _validate_naming_override(
+                override,
+                label=f"account_resources.{account}.{resource}",
+                require_all=False,
+            )
+    iam = data["iam"]
+    if type(iam) is not dict or set(iam) != {"path"} or type(iam["path"]) is not str:
+        raise OperationalError("Config iam accepts only a text path setting.")
+    if not iam["path"].startswith("/") or not iam["path"].endswith("/"):
+        raise OperationalError("Config iam.path must start and end with '/'.")
+    session = data["session"]
+    if type(session) is not dict or set(session) != {
+        "packed_policy_warning",
+        "packed_policy_enforcement",
+    }:
+        raise OperationalError("Config session has an unsupported shape.")
+    if (
+        type(session["packed_policy_warning"]) is not int
+        or not 0 <= session["packed_policy_warning"] <= 100
+    ):
+        raise OperationalError(
+            "Config session.packed_policy_warning must be 0 through 100."
+        )
+    if session["packed_policy_enforcement"] not in ENFORCEMENT_LEVELS:
+        raise OperationalError(
+            "Config session.packed_policy_enforcement is unsupported."
+        )
+    output = data["output"]
+    if (
+        type(output) is not dict
+        or set(output) != {"color"}
+        or output["color"] not in COLOR_MODES
+    ):
+        raise OperationalError("Config output.color must be auto, always, or never.")
 
 
 def _validate_resources(data: dict[str, Any]) -> None:
@@ -154,7 +269,13 @@ def _validate_resources(data: dict[str, Any]) -> None:
                     f"{collection[:-1].title()} {name!r} must be an object."
                 )
     for name, account in data["accounts"].items():
-        unknown = set(account) - {"id", "partition", "description", "unverified"}
+        unknown = set(account) - {
+            "id",
+            "partition",
+            "description",
+            "unverified",
+            "credential_target",
+        }
         if unknown:
             raise OperationalError(
                 f"Unknown account field(s) for {name}: {', '.join(unknown)}."
@@ -170,6 +291,11 @@ def _validate_resources(data: dict[str, Any]) -> None:
             raise OperationalError(f"Account {name!r} has an unsupported partition.")
         if "description" in account and type(account["description"]) is not str:
             raise OperationalError(f"Account {name!r} description must be text.")
+        if "credential_target" in account and (
+            type(account["credential_target"]) is not str
+            or not account["credential_target"]
+        ):
+            raise OperationalError(f"Account {name!r} credential_target must be text.")
         if "unverified" in account and (
             type(account["unverified"]) is not bool or account["unverified"] is not True
         ):
@@ -311,6 +437,209 @@ def _validate_resources(data: dict[str, Any]) -> None:
             raise OperationalError(
                 f"Target {name!r} references missing boundary {boundary!r}."
             )
+
+
+CONFIG_OPTION_PATTERNS: dict[str, dict[str, object]] = {
+    "naming.global.{case|prefix|suffix|enforcement}": {
+        "description": "Default naming policy; later layers override earlier layers.",
+        "default": {"case": "Pascal", "prefix": "", "suffix": "", "enforcement": "off"},
+    },
+    "naming.resources.<resource>.{case|prefix|suffix|enforcement}": {
+        "description": "Naming override for one resource kind.",
+    },
+    "naming.accounts.<account>.{case|prefix|suffix|enforcement}": {
+        "description": "Naming override for one AWS account.",
+    },
+    "naming.account_resources.<account>.<resource>.{case|prefix|suffix|enforcement}": {
+        "description": "Most-specific account and resource naming override.",
+    },
+    "iam.path": {
+        "description": "IAM resource path for managed artifacts.",
+        "default": "/hacksaws/",
+    },
+    "session.packed_policy_warning": {
+        "description": "Packed-policy warning threshold, in percent.",
+        "default": 80,
+    },
+    "session.packed_policy_enforcement": {
+        "description": "Packed-policy action: off, warn, or error.",
+        "default": "off",
+    },
+    "output.color": {
+        "description": "Color mode: auto, always, or never.",
+        "default": "auto",
+    },
+    "accounts.<account>.credential_target": {
+        "description": "Per-account credential target used only when explicitly selected.",
+    },
+}
+
+
+def config_option_patterns() -> dict[str, dict[str, object]]:
+    """Return self-documenting, stable configuration option descriptions."""
+    return deepcopy(CONFIG_OPTION_PATTERNS)
+
+
+def resolve_naming(
+    data: dict[str, Any],
+    *,
+    resource: str,
+    account: str | None = None,
+    explicit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve naming in built-in/global/resource/account/account-resource/explicit order."""
+    naming = data["naming"]
+    resolved = {"case": "Pascal", "prefix": "", "suffix": "", "enforcement": "off"}
+    resolved.update(naming["global"])
+    resolved.update(naming["resources"].get(resource, {}))
+    if account:
+        resolved.update(naming["accounts"].get(account, {}))
+        resolved.update(naming["account_resources"].get(account, {}).get(resource, {}))
+    if explicit:
+        resolved.update(explicit)
+    return resolved
+
+
+def _option_parts(key: str) -> list[str]:
+    if not key or any(not part for part in key.split(".")):
+        raise OperationalError("Config option key must use dotted names.")
+    return key.split(".")
+
+
+def get_config_option(data: dict[str, Any], key: str) -> object:
+    """Read a declared configuration option by its dotted path."""
+    current: object = data
+    for part in _option_parts(key):
+        if type(current) is not dict or part not in current:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        current = current[part]
+    return deepcopy(current)
+
+
+def set_config_option(data: dict[str, Any], key: str, value: object) -> None:
+    """Set a known leaf option and validate the complete schema-one document."""
+    parts = _option_parts(key)
+    if parts[:2] == ["naming", "resources"] and len(parts) == 4:
+        resource, field = parts[2:]
+        validate_name(resource, kind="naming resource")
+        if field not in NAMING_FIELDS:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        data["naming"]["resources"].setdefault(resource, {})[field] = value
+        _validate_config(data)
+        return
+    if parts[:2] == ["naming", "accounts"] and len(parts) == 4:
+        account, field = parts[2:]
+        validate_name(account, kind="naming account")
+        if field not in NAMING_FIELDS:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        data["naming"]["accounts"].setdefault(account, {})[field] = value
+        _validate_config(data)
+        return
+    if parts[:2] == ["naming", "account_resources"] and len(parts) == 5:
+        account, resource, field = parts[2:]
+        validate_name(account, kind="naming account")
+        validate_name(resource, kind="naming resource")
+        if field not in NAMING_FIELDS:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        data["naming"]["account_resources"].setdefault(account, {}).setdefault(
+            resource, {}
+        )[field] = value
+        _validate_config(data)
+        return
+    if (
+        parts[:1] == ["accounts"]
+        and len(parts) == 3
+        and parts[2] == "credential_target"
+    ):
+        account, value_map = get_resource(data, "account", parts[1])
+        data["accounts"][account] = {**value_map, "credential_target": value}
+        _validate_config(data)
+        return
+    current: dict[str, Any] = data
+    for part in parts[:-1]:
+        child = current.get(part)
+        if type(child) is not dict:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        current = child
+    if parts[-1] not in current or type(current[parts[-1]]) is dict:
+        raise OperationalError(f"Config option {key!r} is not a settable leaf.")
+    current[parts[-1]] = value
+    _validate_config(data)
+
+
+def reset_config_option(data: dict[str, Any], key: str) -> None:
+    """Reset a known option to its schema-one default where one exists."""
+    defaults = default_config()
+    parts = _option_parts(key)
+    if parts[:2] == ["naming", "resources"] and len(parts) == 4:
+        resource, field = parts[2:]
+        override = data["naming"]["resources"].get(resource)
+        if (
+            field not in NAMING_FIELDS
+            or type(override) is not dict
+            or field not in override
+        ):
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        del override[field]
+        if not override:
+            del data["naming"]["resources"][resource]
+        _validate_config(data)
+        return
+    if parts[:2] == ["naming", "accounts"] and len(parts) == 4:
+        account, field = parts[2:]
+        override = data["naming"]["accounts"].get(account)
+        if (
+            field not in NAMING_FIELDS
+            or type(override) is not dict
+            or field not in override
+        ):
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        del override[field]
+        if not override:
+            del data["naming"]["accounts"][account]
+        _validate_config(data)
+        return
+    if parts[:2] == ["naming", "account_resources"] and len(parts) == 5:
+        account, resource, field = parts[2:]
+        resources = data["naming"]["account_resources"].get(account)
+        override = resources.get(resource) if type(resources) is dict else None
+        if (
+            field not in NAMING_FIELDS
+            or type(override) is not dict
+            or field not in override
+        ):
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        del override[field]
+        if not override:
+            del resources[resource]
+        if not resources:
+            del data["naming"]["account_resources"][account]
+        _validate_config(data)
+        return
+    current: dict[str, Any] = data
+    default_current: dict[str, Any] = defaults
+    for part in parts[:-1]:
+        if (
+            type(current.get(part)) is not dict
+            or type(default_current.get(part)) is not dict
+        ):
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        current = current[part]
+        default_current = default_current[part]
+    if parts[-1] not in default_current:
+        raise OperationalError(f"Config option {key!r} has no reset default.")
+    current[parts[-1]] = deepcopy(default_current[parts[-1]])
+    _validate_config(data)
 
 
 def load_config(*, create: bool = False) -> dict[str, Any]:

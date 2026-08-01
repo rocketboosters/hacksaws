@@ -20,8 +20,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "boto3>=1.40,<2",
+    "boto3[crt]>=1.41,<2",
     "pyyaml>=6.0,<7",
+    "rich>=13.9,<15",
 ]
 
 [dependency-groups]
@@ -124,6 +125,8 @@ ignore = [
     "SIM105", "TRY003",
 ]
 "hacksaws/_test_runner.py" = ["S603"]
+"hacksaws/_iam_cli.py" = ["TRY003", "TRY301"]
+"scripts/prettier.py" = ["S603"]
 "**/tests/**" = [
     "ARG001",
     "ARG002",
@@ -152,6 +155,25 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 
+# IAM command tests intentionally exercise argparse namespaces and lightweight
+# recording doubles.  Keep production modules fully checked while suppressing
+# only the dynamic-test-double diagnostics that cannot describe that runtime
+# surface accurately.
+[[tool.mypy.overrides]]
+module = [
+    "hacksaws.tests.test_iam_cli_scaffold",
+    "hacksaws.tests.test_iam_policy_cli",
+    "hacksaws.tests.test_iam_role_cli",
+    "hacksaws.tests.test_iam_roles",
+]
+disable_error_code = [
+    "arg-type",
+    "attr-defined",
+    "func-returns-value",
+    "index",
+    "method-assign",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["hacksaws/tests"]
 cache_dir = ".cache/pytest"
@@ -164,17 +186,20 @@ omit = ["hacksaws/tests/*"]
 precision = 2
 
 [tool.taskipy.tasks]
-format_ruff = "ruff format ."
-format_prettier = "npm run format"
-format = "task format_ruff && task format_prettier"
-lint_ruff = "ruff check ."
-lint_ruff_format = "ruff format --check ."
-lint_mypy = "mypy hacksaws"
-lint_prettier = "npm run format:check"
-lint = "task lint_ruff_format && task lint_ruff && task lint_mypy && task lint_prettier"
+format_ruff = "uvx ruff format"
+format_prettier = "python scripts/prettier.py write"
+format = "task format_ruff . && task format_prettier ."
+lint_ruff = "uvx ruff check"
+lint_ruff_format = "uvx ruff format --check"
+lint_mypy = "mypy --install-types --non-interactive --ignore-missing-imports"
+lint_prettier = "python scripts/prettier.py check"
+lint = "task lint_ruff_format . && task lint_ruff . && task lint_mypy . && task lint_prettier ."
 test = "python -m hacksaws._test_runner"
-check = "task lint && task test"
+check = "task format && task lint && task test"
 build = "uv build"
+
+[tool.hatch.build]
+artifacts = ["hacksaws/py.typed"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hacksaws"]

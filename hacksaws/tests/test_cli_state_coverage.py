@@ -179,6 +179,95 @@ def test_resource_cli_add_get_list_update_and_clear(state_home: Path) -> None:
     }
 
 
+def test_resource_updates_cover_explicit_source_and_destination_switches(
+    state_home: Path,
+) -> None:
+    _seed_connected(state_home)
+    data = _state.load_config()
+    data["accounts"]["Other"] = {"id": "999999999999", "partition": "aws"}
+    data["boundaries"]["OtherGuard"] = {
+        "role_arn": "arn:aws:iam::999999999999:role/Other",
+        "account": "Other",
+        "verified": False,
+    }
+    _state.save_config(data)
+
+    assert (
+        _run(
+            [
+                "boundary",
+                "update",
+                "Guard",
+                "--account",
+                "Other",
+                "--role",
+                "Other",
+                "--no-verify",
+            ]
+        ).exit_code
+        == 0
+    )
+    new_source = state_home / "new-source"
+    assert (
+        _run(
+            [
+                "target",
+                "update",
+                "Deploy",
+                "--source-account",
+                "Other",
+                "--source-profile",
+                "operator",
+                "--source-directory",
+                str(new_source),
+                "--boundary",
+                "OtherGuard",
+                "--to",
+                "west:agent",
+            ]
+        ).exit_code
+        == 0
+    )
+    target = _state.load_config()["targets"]["Deploy"]
+    assert target["source_account"] == "Other"
+    assert target["source_profile"] == "operator"
+    assert target["source_directory"] == str(new_source.absolute())
+    assert target["destination_location"] == "west"
+    assert target["destination_profile"] == "agent"
+
+    assert (
+        _run(
+            [
+                "target",
+                "update",
+                "Deploy",
+                "--to",
+                "west:agent",
+                "--to-directory",
+                str(state_home / "destination"),
+                "--to-profile",
+                "agent",
+            ]
+        ).code
+        == "OPERATIONAL_ERROR"
+    )
+    assert _run(["target", "update", "Deploy", "--to", "invalid"]).code == (
+        "OPERATIONAL_ERROR"
+    )
+    assert (
+        _run(
+            [
+                "target",
+                "update",
+                "Deploy",
+                "--to-directory",
+                str(state_home / "destination"),
+            ]
+        ).code
+        == "OPERATIONAL_ERROR"
+    )
+
+
 def test_verified_account_and_boundary_adds_use_authoritative_identity(
     state_home: Path,
 ) -> None:
@@ -370,7 +459,6 @@ def test_policy_cache_config_status_and_logout_dispatch(state_home: Path) -> Non
     (cache_root / "one.json").write_text("{}", encoding="utf-8")
     assert json.loads(_run(["cache", "get", "--json"]).message) == {
         "max_age": 0,
-        "entries": 1,
     }
     assert _run(["cache", "clear", "--yes"]).code == "CACHE_CLEAR"
 
@@ -382,10 +470,17 @@ def test_policy_cache_config_status_and_logout_dispatch(state_home: Path) -> Non
         == "Prod"
     )
     with (
-        patch("hacksaws._sessions.status", return_value={"sessions": []}),
+        patch(
+            "hacksaws._sessions.status_report",
+            return_value={"sessions": [], "counts": {}, "warnings": []},
+        ),
         patch("hacksaws._cli._run_logout", return_value=_configs.Result("OUT", "ok")),
     ):
-        assert json.loads(_run(["status", "--json"]).message) == {"sessions": []}
+        assert _run(["status", "--json"]).data == {
+            "sessions": [],
+            "counts": {},
+            "warnings": [],
+        }
         assert _run(["logout"]).code == "OUT"
 
 
@@ -488,3 +583,114 @@ def test_state_rename_rejects_collisions_without_rewriting(state_home: Path) -> 
     with pytest.raises(_configs.OperationalError, match="already exists"):
         _state.rename_resource(data, "account", "Prod", "Other")
     assert data == before
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda data: data.update(accounts=[]), "accounts.*object"),
+        (lambda data: data.update(cache={}), "cache accepts"),
+        (lambda data: data.update(cache={"max_age": -1}), "non-negative"),
+        (lambda data: data["naming"].update(global_={}), "unsupported shape"),
+        (
+            lambda data: data["naming"].update({"global": {"case": "Pascal"}}),
+            "must define every",
+        ),
+        (
+            lambda data: data["naming"]["global"].update(case="title"),
+            "case is unsupported",
+        ),
+        (
+            lambda data: data["naming"]["global"].update(enforcement="force"),
+            "enforcement is unsupported",
+        ),
+        (
+            lambda data: data["naming"]["global"].update(prefix=3),
+            "prefix must be text",
+        ),
+        (lambda data: data["naming"].update(resources=[]), "resources must be"),
+        (
+            lambda data: data["naming"].update(account_resources=[]),
+            "account_resources must be",
+        ),
+        (
+            lambda data: data["naming"]["account_resources"].update(Prod=[]),
+            "entries must be objects",
+        ),
+        (lambda data: data.update(iam={"path": 3}), "iam accepts"),
+        (lambda data: data.update(iam={"path": "hacksaws"}), "start and end"),
+        (lambda data: data.update(session={}), "session has an unsupported"),
+        (
+            lambda data: data["session"].update(packed_policy_warning=101),
+            "must be 0 through 100",
+        ),
+        (
+            lambda data: data["session"].update(packed_policy_enforcement="force"),
+            "enforcement is unsupported",
+        ),
+        (lambda data: data.update(output={"color": "sometimes"}), "output.color"),
+        (
+            lambda data: data["accounts"].update(
+                Prod={
+                    "id": ACCOUNT_ID,
+                    "partition": "aws",
+                    "credential_target": "",
+                }
+            ),
+            "credential_target must be text",
+        ),
+        (
+            lambda data: data["policies"].update(
+                Guard={
+                    "file": "stored_session_policies/Guard.yaml",
+                    "description": 3,
+                }
+            ),
+            "description must be text",
+        ),
+    ],
+)
+def test_foundation_schema_rejects_each_unsafe_shape(
+    mutate: object, message: str
+) -> None:
+    data = _state.default_config()
+    mutate(data)  # type: ignore[operator]
+    with pytest.raises(_configs.OperationalError, match=message):
+        _state._validate_config(data)
+
+
+def test_config_option_layers_round_trip_and_resolve_precedence() -> None:
+    data = _state.default_config()
+    data["accounts"]["Prod"] = {"id": ACCOUNT_ID, "partition": "aws"}
+    _state.set_config_option(data, "naming.resources.role.prefix", "resource-")
+    _state.set_config_option(data, "naming.accounts.Prod.suffix", "-account")
+    _state.set_config_option(data, "naming.account_resources.Prod.role.case", "snake")
+    _state.set_config_option(data, "accounts.Prod.credential_target", "+Deploy")
+    resolved = _state.resolve_naming(data, resource="role", account="Prod")
+    assert resolved == {
+        "case": "snake",
+        "prefix": "resource-",
+        "suffix": "-account",
+        "enforcement": "off",
+    }
+    assert (
+        _state.get_config_option(data, "accounts.Prod.credential_target") == "+Deploy"
+    )
+
+    _state.reset_config_option(data, "naming.resources.role.prefix")
+    _state.reset_config_option(data, "naming.accounts.Prod.suffix")
+    _state.reset_config_option(data, "naming.account_resources.Prod.role.case")
+    assert data["naming"]["resources"] == {}
+    assert data["naming"]["accounts"] == {}
+    assert data["naming"]["account_resources"] == {}
+
+    with pytest.raises(_configs.OperationalError, match="dotted names"):
+        _state.get_config_option(data, "bad..key")
+    with pytest.raises(_configs.OperationalError, match="Unknown config option"):
+        _state.set_config_option(data, "naming.accounts.Prod.unknown", "x")
+    with pytest.raises(_configs.OperationalError, match="no reset default"):
+        _state.reset_config_option(data, "naming.resources.role.prefix")
+    with pytest.raises(_configs.OperationalError, match="not a settable leaf"):
+        _state.set_config_option(data, "output", {})
+    with pytest.raises(_configs.OperationalError, match="IAM role ARN must be text"):
+        _state.parse_role_arn(None)

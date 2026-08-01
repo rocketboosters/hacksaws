@@ -623,7 +623,7 @@ def test_aws_failure_is_concise(
         )
 
     captured = capsys.readouterr()
-    assert result.code == "MFA_LOGOUT"
+    assert result.code == "LOGOUT_NO_STATE"
     assert result.exit_code == 0
     assert captured.err == ""
     assert "Traceback" not in captured.err
@@ -791,7 +791,7 @@ def test_container_engine_launch_os_error_is_concise_through_cli(
         result = hacksaws.console_main(arguments)
 
     captured = capsys.readouterr()
-    assert result.code == "MFA_LOGOUT"
+    assert result.code == "LOGOUT_NO_STATE"
     assert result.exit_code == 0
     assert captured.err == ""
     assert "Traceback" not in captured.err

@@ -248,6 +248,7 @@ def test_native_browser_cache_is_removed_after_identity_failure(
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "home"))
     _minimal_target(tmp_path)
     cache_file = tmp_path / "aws" / "login" / "cache" / "new.json"
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache_file.parent))
 
     def fake_login(*args: object, **kwargs: object) -> None:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -280,7 +281,10 @@ def test_import_rejects_extra_and_corrupt_members(
         _sessions.import_config(archive, replace=False, yes=False)
 
     clean = _sessions.export_config(str(tmp_path / "clean.zip"))
-    with zipfile.ZipFile(clean, "a") as zipped:
+    with (
+        pytest.warns(UserWarning, match="Duplicate name"),
+        zipfile.ZipFile(clean, "a") as zipped,
+    ):
         zipped.writestr("config.json", b"{}")
     with pytest.raises(_configs.OperationalError, match="duplicate"):
         _sessions.import_config(clean, replace=False, yes=False)
@@ -622,7 +626,7 @@ def test_bounded_browser_ecr_is_cleaned_when_assume_role_fails(
     )
 
 
-def test_plain_logout_retains_ecr_record_then_explicit_logout_cleans_it(
+def test_logout_cleans_ecr_by_default_and_keep_ecr_retains_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "home"))
@@ -649,10 +653,11 @@ def test_plain_logout_retains_ecr_record_then_explicit_logout_cleans_it(
         to_directory=None,
         ecr=False,
         podman=False,
+        keep_ecr=True,
     )
     assert _sessions.logout(_configs.Context(args)) is True
     assert _state.load_sessions()[key]["auth_method"] == "ecr-only"
-    args.ecr = True
+    args.keep_ecr = False
     with patch("hacksaws._ecr._run_container_engine") as engine:
         assert _sessions.logout(_configs.Context(args)) is True
     engine.assert_called_once_with("docker", ["docker", "logout", registry])

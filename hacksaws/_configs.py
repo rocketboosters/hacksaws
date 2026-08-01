@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -13,15 +14,45 @@ import boto3
 from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
+from hacksaws import _output
+
 if TYPE_CHECKING:
     import argparse
     from collections.abc import Mapping
 
 ContainerEngine = Literal["docker", "podman"]
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_POLICY = 3
+EXIT_CANCELLED = 4
+EXIT_INTERRUPTED = 130
+
+_output_options = [_output.OutputOptions()]
+
+
+def configure_output(
+    *, color: _output.ColorMode = "auto", json_output: bool = False
+) -> None:
+    """Set invocation output behavior after global CLI options are normalized."""
+    _output_options[0] = _output.OutputOptions(color=color, json=json_output)
 
 
 class OperationalError(Exception):
     """An expected operational failure that is safe to show without a traceback."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        data: object | None = None,
+        details: object | None = None,
+        repairs: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.data = data
+        self.details = details
+        self.repairs = repairs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,7 +64,8 @@ class Context:
     @property
     def profile(self) -> str:
         """Return the AWS profile name for this invocation."""
-        return cast("str", getattr(self.args, "profile", None) or "default")
+        value = cast("str | None", getattr(self.args, "profile", None))
+        return "default" if value in {None, ".", "default"} else value
 
     @property
     def container_engine(self) -> ContainerEngine:
@@ -47,7 +79,13 @@ class Context:
         """Return the directory containing AWS configuration and credentials."""
         account_name = cast("str | None", getattr(self.args, "aws_account_name", None))
         configured_directory = cast("str", getattr(self.args, "directory", "~/.aws"))
-        value = f"~/.aws-{account_name}" if account_name else configured_directory
+        value = (
+            "~/.aws"
+            if account_name in {".", "default"}
+            else f"~/.aws-{account_name}"
+            if account_name
+            else configured_directory
+        )
         return Path(value).expanduser().absolute()
 
     @property
@@ -64,6 +102,31 @@ class Context:
     def storage_path(self) -> Path:
         """Return the backup path used while temporary credentials are active."""
         return self.aws_directory / f"{self.profile}.store.credentials"
+
+
+@dataclasses.dataclass(frozen=True)
+class CredentialSelector:
+    """Resolved local credential source; resolution never performs a login."""
+
+    profile: str = "default"
+    location: str = "default"
+    directory: Path | None = None
+    target: str | None = None
+
+
+def resolve_credential_selector(args: argparse.Namespace) -> CredentialSelector:
+    """Normalize credential selection without AWS side effects."""
+    profile = cast("str", getattr(args, "profile", None) or "default")
+    location = cast("str", getattr(args, "location", None) or "default")
+    directory_value = cast("str | None", getattr(args, "directory", None))
+    return CredentialSelector(
+        profile=profile,
+        location=location,
+        directory=(
+            Path(directory_value).expanduser().absolute() if directory_value else None
+        ),
+        target=cast("str | None", getattr(args, "target", None)),
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,10 +217,41 @@ class Result:
     message: str
     exit_code: int = 0
     stream: Literal["stdout", "stderr"] = "stdout"
+    data: object | None = None
+    details: object | None = None
+    repairs: object | None = None
+    kind: Literal["info", "success", "warning", "error"] | None = None
 
     def echo(self) -> Result:
         """Write the result message to its intended output stream."""
-        if self.message:
-            output = sys.stderr if self.stream == "stderr" else sys.stdout
-            print(self.message, file=output)
+        output = sys.stderr if self.stream == "stderr" else sys.stdout
+        if _output_options[0].json:
+            envelope: dict[str, object] = {
+                "schemaVersion": _output.SCHEMA_VERSION,
+                "ok": self.exit_code == EXIT_OK,
+                "code": self.code,
+            }
+            if self.exit_code == EXIT_OK:
+                envelope["data"] = (
+                    self.data if self.data is not None else {"message": self.message}
+                )
+            else:
+                envelope["error"] = {
+                    "message": self.message,
+                    "exitCode": self.exit_code,
+                    "data": self.data if self.data is not None else {},
+                    "details": self.details if self.details is not None else [],
+                    "repairs": self.repairs if self.repairs is not None else [],
+                }
+            print(json.dumps(envelope, indent=2, default=str), file=output)
+        elif self.message:
+            kind = self.kind or ("error" if self.stream == "stderr" else "success")
+            _output.print_message(
+                self.message, stream=output, options=_output_options[0], kind=kind
+            )
         return self
+
+
+def json_output_enabled() -> bool:
+    """Return whether the current invocation requires one machine envelope."""
+    return _output_options[0].json

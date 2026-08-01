@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 import tomllib
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
@@ -203,14 +205,20 @@ def cache_write(
     source_identity: str,
 ) -> str:
     compact = minify(document)
-    record = {
-        "schema_version": 1,
+    bound = {
+        "identity": identity,
         "origin": origin,
         "resolver": resolver,
         "source_identity": source_identity,
-        "fetched_at": datetime.now(UTC).isoformat(),
-        "digest": _state.digest(compact.encode()),
         "document": json.loads(compact),
+    }
+    record = {
+        "schema_version": 2,
+        **bound,
+        "fetched_at": datetime.now(UTC).isoformat(),
+        "digest": _state.digest(
+            json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()
+        ),
     }
     _state.atomic_write(
         _cache_path(identity), (json.dumps(record, indent=2) + "\n").encode()
@@ -225,16 +233,146 @@ def cache_read(identity: str, max_age: int) -> tuple[dict[str, Any], float] | No
     if not path.exists():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        fetched = datetime.fromisoformat(value["fetched_at"])
+        value, fetched, _digest = _validated_cache_record(
+            json.loads(path.read_text(encoding="utf-8")), identity=identity
+        )
         age = (datetime.now(UTC) - fetched).total_seconds()
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise OperationalError(f"Invalid policy cache entry {path}: {error}") from error
     if age > max_age:
         return None
-    if not isinstance(value, dict):
-        raise OperationalError(f"Invalid policy cache entry {path}.")
     return value, age
+
+
+def _validated_cache_record(
+    value: object, *, identity: str
+) -> tuple[dict[str, Any], datetime, str]:
+    if not isinstance(value, dict):
+        raise TypeError("entry is not an object")
+    fetched = datetime.fromisoformat(str(value["fetched_at"]))
+    document = json.loads(minify(value["document"]))
+    if value.get("schema_version") != 2:
+        raise ValueError("unsupported schema version")
+    if value.get("identity") != identity:
+        raise ValueError("entry identity does not match its cache key")
+    bound = {
+        "identity": identity,
+        "origin": str(value["origin"]),
+        "resolver": str(value["resolver"]),
+        "source_identity": str(value["source_identity"]),
+        "document": document,
+    }
+    digest = _state.digest(
+        json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()
+    )
+    if value.get("digest") != digest:
+        raise ValueError("document digest mismatch")
+    return value, fetched, digest
+
+
+def _public_cache_entry(path: Path, max_age: int) -> dict[str, Any]:
+    identity = path.stem
+    base: dict[str, Any] = {
+        "identity": identity,
+        "path": str(path),
+    }
+    try:
+        base["size"] = path.stat().st_size
+        value, fetched, digest = _validated_cache_record(
+            json.loads(path.read_text(encoding="utf-8")), identity=identity
+        )
+        age = max(0.0, (datetime.now(UTC) - fetched).total_seconds())
+        base.update(
+            {
+                "state": "fresh" if max_age > 0 and age <= max_age else "stale",
+                "origin": value.get("origin"),
+                "resolver": value.get("resolver"),
+                "source_identity": value.get("source_identity"),
+                "fetched_at": value["fetched_at"],
+                "age_seconds": int(age),
+                "digest": digest,
+            }
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        base.update(
+            {"size": int(base.get("size", 0)), "state": "invalid", "error": str(error)}
+        )
+    return base
+
+
+def cache_inventory(*, max_age: int | None = None) -> dict[str, Any]:
+    """Return secret-free policy-cache metadata, including invalid entries."""
+    configured_age = (
+        _state.load_config()["cache"]["max_age"] if max_age is None else max_age
+    )
+    paths = sorted(cache_root().glob("*.json")) if cache_root().exists() else []
+    entries = [_public_cache_entry(path, configured_age) for path in paths]
+    counts = {"fresh": 0, "stale": 0, "invalid": 0}
+    for entry in entries:
+        counts[str(entry["state"])] += 1
+    return {
+        "root": str(cache_root()),
+        "max_age": configured_age,
+        "entries": entries,
+        "counts": counts,
+        "total_bytes": sum(int(item["size"]) for item in entries),
+    }
+
+
+def _validated_cache_path(identity: str) -> Path:
+    normalized = identity.removesuffix(".json")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", normalized):
+        raise OperationalError(f"Invalid policy cache identity {identity!r}.")
+    return _cache_path(normalized)
+
+
+def cache_show(identity: str) -> dict[str, Any]:
+    """Read one explicitly requested policy-cache entry, including its document."""
+    path = _validated_cache_path(identity)
+    if not path.is_file():
+        raise OperationalError(f"Policy cache entry does not exist: {identity}")
+    try:
+        value, _fetched, _digest = _validated_cache_record(
+            json.loads(path.read_text(encoding="utf-8")), identity=path.stem
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise OperationalError(f"Invalid policy cache entry {path}: {error}") from error
+    return {"identity": path.stem, "path": str(path), **value}
+
+
+def clear_cache_entries(
+    identities: list[str] | None = None, *, stale_only: bool = False
+) -> list[str]:
+    """Remove selected policy-cache records and return removed identities."""
+    if identities:
+        inventory = cache_inventory()
+        paths = [
+            Path(str(item["path"]))
+            for item in inventory["entries"]
+            if any(
+                fnmatch.fnmatchcase(
+                    str(item["identity"]).casefold(), selector.casefold()
+                )
+                for selector in identities
+            )
+        ]
+    else:
+        inventory = cache_inventory()
+        allowed = {"stale", "invalid"} if stale_only else {"fresh", "stale", "invalid"}
+        paths = [
+            Path(str(item["path"]))
+            for item in inventory["entries"]
+            if item["state"] in allowed
+        ]
+    removed = []
+    for path in paths:
+        if path.is_file():
+            path.unlink()
+            removed.append(path.stem)
+    if cache_root().exists():
+        with suppress(OSError):
+            cache_root().rmdir()
+    return removed
 
 
 def resolve(
@@ -324,6 +462,25 @@ def _get_document(client: Any, arn: str, version: str) -> object:
     return document
 
 
+def _require_cache_metadata(
+    record: dict[str, Any],
+    *,
+    identity: str,
+    origin: str,
+    resolver: str,
+    source_identity: str | None = None,
+) -> None:
+    expected = {"origin": origin, "resolver": resolver}
+    mismatches = [key for key, value in expected.items() if record.get(key) != value]
+    if source_identity is not None and record.get("source_identity") != source_identity:
+        mismatches.append("source_identity")
+    if mismatches:
+        raise OperationalError(
+            f"Policy cache entry {identity!r} metadata does not match the requested "
+            f"policy ({', '.join(mismatches)}). Clear the entry and retry."
+        )
+
+
 def _fetch_aws_managed(
     arn: str,
     *,
@@ -339,6 +496,13 @@ def _fetch_aws_managed(
     )
     cached = cache_read(identity, configured_age)
     if cached:
+        _require_cache_metadata(
+            cached[0],
+            identity=identity,
+            origin="aws-managed",
+            resolver="arn",
+            source_identity=arn,
+        )
         compact = minify(cached[0]["document"])
         enforce_inline_limit(compact)
         return ResolvedPolicy(
@@ -385,32 +549,30 @@ def _resolve_remote_name(
     )
     cached = cache_read(identity, configured_age)
     if cached:
-        origin = str(cached[0]["origin"])
-        compact = minify(cached[0]["document"])
-        if origin == "remote-customer":
-            cached_arn = str(cached[0]["source_identity"])
-            cached_match = POLICY_ARN.fullmatch(cached_arn)
-            if (
-                cached_match is None
-                or cached_match.group(1) != partition
-                or cached_match.group(2) != account_id
-            ):
-                raise OperationalError(
-                    "Cached customer policy identity does not match the target account."
-                )
-            return ResolvedPolicy(
-                identity,
-                origin,
-                f"cached policy ({cached[1]:.0f}s old)",
-                arn=cached_arn,
-                cached=True,
+        _require_cache_metadata(
+            cached[0],
+            identity=identity,
+            origin="remote-customer",
+            resolver="name",
+        )
+        origin = "remote-customer"
+        cached_arn = str(cached[0]["source_identity"])
+        cached_match = POLICY_ARN.fullmatch(cached_arn)
+        if (
+            cached_match is None
+            or cached_match.group(1) != partition
+            or cached_match.group(2) != account_id
+            or cached_match.group(3).rsplit("/", 1)[-1] != name
+        ):
+            raise OperationalError(
+                "Cached customer policy identity does not match the requested policy "
+                "name and target account."
             )
-        enforce_inline_limit(compact)
         return ResolvedPolicy(
             identity,
             origin,
             f"cached policy ({cached[1]:.0f}s old)",
-            document=compact,
+            arn=cached_arn,
             cached=True,
         )
     resolution_session = session or boto3.Session(profile_name=profile)

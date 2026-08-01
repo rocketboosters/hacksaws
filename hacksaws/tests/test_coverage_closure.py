@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import importlib
+import subprocess
 import tomllib
 from copy import deepcopy
 from importlib import metadata
@@ -25,6 +26,7 @@ from hacksaws import _ecr
 from hacksaws import _policies
 from hacksaws import _state
 from hacksaws import _test_runner
+from scripts import prettier
 
 ACCOUNT = "123456789012"
 ROLE = f"arn:aws:iam::{ACCOUNT}:role/Guard"
@@ -90,6 +92,124 @@ def test_coverage_gate_uses_two_decimal_precision() -> None:
     assert should_fail_under(94.99, 95, precision) is True
     assert should_fail_under(95.00, 95, precision) is False
     assert "--cov-fail-under=95" in _test_runner.PYTEST_ARGUMENTS
+
+
+def test_task_leaves_follow_toolbelt_calling_convention() -> None:
+    project = Path(__file__).parents[2] / "pyproject.toml"
+    with project.open("rb") as stream:
+        configuration = tomllib.load(stream)
+    tasks = configuration["tool"]["taskipy"]["tasks"]
+
+    assert tasks["format_ruff"] == "uvx ruff format"
+    assert tasks["format_prettier"] == "python scripts/prettier.py write"
+    assert tasks["lint_ruff_format"] == "uvx ruff format --check"
+    assert tasks["lint_ruff"] == "uvx ruff check"
+    assert tasks["lint_mypy"] == (
+        "mypy --install-types --non-interactive --ignore-missing-imports"
+    )
+    assert tasks["lint_prettier"] == "python scripts/prettier.py check"
+    for name, command in tasks.items():
+        if name.startswith(("format_", "lint_")):
+            assert not command.endswith(" .")
+    assert tasks["format"] == "task format_ruff . && task format_prettier ."
+    assert tasks["check"] == "task format && task lint && task test"
+
+
+def test_typed_marker_and_build_metadata() -> None:
+    project = Path(__file__).parents[2] / "pyproject.toml"
+    with project.open("rb") as stream:
+        configuration = tomllib.load(stream)
+
+    assert configuration["project"]["name"] == "hacksaws"
+    assert configuration["project"]["scripts"]["hacksaws"] == "hacksaws:main"
+    assert "Typing :: Typed" in configuration["project"]["classifiers"]
+    assert configuration["tool"]["hatch"]["build"]["artifacts"] == ["hacksaws/py.typed"]
+    assert project.with_name("hacksaws").joinpath("py.typed").is_file()
+
+
+def test_prettier_wrapper_forwards_paths_without_scanning_ignored_cache() -> None:
+    git_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["git"], 0, b"README.md\0CHEATSHEET.md\0"
+    )
+    prettier_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["npx"], 0
+    )
+    with (
+        patch(
+            "scripts.prettier.subprocess.run",
+            side_effect=[git_result, prettier_result],
+        ) as run,
+        patch("scripts.prettier.shutil.which", side_effect=["git", "npx"]),
+    ):
+        assert prettier.main(["check", "docs", "."]) == 0
+
+    assert run.call_args_list[0].args[0][-3:] == ["--", "docs", "."]
+    assert run.call_args_list[1].args[0] == [
+        "npx",
+        "prettier",
+        "--check",
+        "--ignore-unknown",
+        "--",
+        "README.md",
+        "CHEATSHEET.md",
+    ]
+    assert not any(".cache" in argument for argument in run.call_args_list[1].args[0])
+
+
+def test_prettier_wrapper_terminates_options_before_git_filenames() -> None:
+    git_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["git"], 0, b"--foo.md\0"
+    )
+    prettier_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["npx"], 0
+    )
+    with (
+        patch(
+            "scripts.prettier.subprocess.run",
+            side_effect=[git_result, prettier_result],
+        ) as run,
+        patch("scripts.prettier.shutil.which", side_effect=["git", "npx"]),
+    ):
+        assert prettier.main(["write", "."]) == 0
+
+    prettier_command = run.call_args_list[1].args[0]
+    assert prettier_command[-2:] == ["--", "--foo.md"]
+
+
+def test_prettier_wrapper_handles_no_candidates_and_propagates_errors() -> None:
+    no_files: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["git"], 0, b""
+    )
+    with (
+        patch("scripts.prettier.subprocess.run", return_value=no_files) as run,
+        patch("scripts.prettier.shutil.which", return_value="git"),
+    ):
+        assert prettier.main(["write", "."]) == 0
+    run.assert_called_once()
+
+    git_error: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["git"], 3, b""
+    )
+    with (
+        patch("scripts.prettier.subprocess.run", return_value=git_error),
+        patch("scripts.prettier.shutil.which", return_value="git"),
+    ):
+        assert prettier.main(["check", "."]) == 3
+
+    files: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["git"], 0, b"README.md\0"
+    )
+    prettier_error: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
+        ["npx"], 7
+    )
+    with (
+        patch(
+            "scripts.prettier.subprocess.run",
+            side_effect=[files, prettier_error],
+        ),
+        patch("scripts.prettier.shutil.which", side_effect=["git", "npx"]),
+    ):
+        assert prettier.main(["check", "."]) == 7
 
 
 def test_aws_ini_helpers_translate_parser_write_and_profile_errors(
