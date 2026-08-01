@@ -1,6 +1,6 @@
 [project]
 name = "hacksaws"
-version = "0.3.2"
+version = "0.4.0"
 description = "A command-line utility for AWS profiles using dynamic authentication methods such as MFA."
 authors = [
     { name = "Scott Ernst", email = "swernst@gmail.com" },
@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "boto3>=1.40,<2",
+    "pyyaml>=6.0,<7",
 ]
 
 [dependency-groups]
@@ -36,6 +37,7 @@ dev = [
 
 [project.scripts]
 hacksaws = "hacksaws:main"
+test = "hacksaws._test_runner:main"
 
 [project.urls]
 Homepage = "https://github.com/rocketboosters/hacksaws"
@@ -102,6 +104,26 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"hacksaws/_cli.py" = [
+    "C901", "E501", "FBT001", "PLR0911", "PLR0912", "PLR0915", "SLF001",
+    "TRY003", "TRY203",
+]
+"hacksaws/_duration.py" = ["TRY003"]
+"hacksaws/_ecr.py" = ["ANN401"]
+"hacksaws/_policies.py" = [
+    "ANN401", "C901", "E501", "PERF102", "PLR0912", "PLR0913", "PLR0915",
+    "PLR1714", "PLR2004", "RUF059", "TRY003",
+]
+"hacksaws/_sessions.py" = [
+    "ANN401", "ARG001", "B007", "C901", "E501", "PLC0415", "PLR0912",
+    "PLR0913", "PLR0915", "PLR2004", "RUF059", "S603", "S607", "SIM105",
+    "SLF001", "TRY003",
+]
+"hacksaws/_state.py" = [
+    "C901", "E501", "PLR0912", "PLR0915", "PLR2004", "PTH105", "RUF059",
+    "SIM105", "TRY003",
+]
+"hacksaws/_test_runner.py" = ["S603"]
 "**/tests/**" = [
     "ARG001",
     "ARG002",
@@ -113,6 +135,8 @@ ignore = [
     "RET504",
     "S101",
     "SLF001",
+    "TC003",
+    "D103",
 ]
 
 [tool.ruff.lint.isort]
@@ -136,6 +160,9 @@ cache_dir = ".cache/pytest"
 source = ["hacksaws"]
 omit = ["hacksaws/tests/*"]
 
+[tool.coverage.report]
+precision = 2
+
 [tool.taskipy.tasks]
 format_ruff = "ruff format ."
 format_prettier = "npm run format"
@@ -145,7 +172,7 @@ lint_ruff_format = "ruff format --check ."
 lint_mypy = "mypy hacksaws"
 lint_prettier = "npm run format:check"
 lint = "task lint_ruff_format && task lint_ruff && task lint_mypy && task lint_prettier"
-test = "pytest --cov=hacksaws --cov-report=term-missing --cov-report=xml"
+test = "python -m hacksaws._test_runner"
 check = "task lint && task test"
 build = "uv build"
 

@@ -7,6 +7,8 @@ import binascii
 import subprocess
 from datetime import UTC
 from datetime import datetime
+from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import boto3
@@ -14,6 +16,9 @@ from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
 from hacksaws import _configs
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _run_container_engine(
@@ -43,16 +48,23 @@ def _do_login(
     *,
     account_id: str,
     region_name: str,
-) -> None:
+    dns_suffix: str = "amazonaws.com",
+    session: Any | None = None,
+) -> str:
     """Log the selected container engine into one region-specific ECR registry."""
-    registry = f"{account_id}.dkr.ecr.{region_name}.amazonaws.com"
+    registry = f"{account_id}.dkr.ecr.{region_name}.{dns_suffix}"
     print(f"[STARTED]: Logging into {registry}", flush=True)  # noqa: T201
     try:
-        session = boto3.Session(
+        aws_session = session or boto3.Session(
             profile_name=context.profile,
             region_name=region_name,
         )
-        response = session.client("ecr").get_authorization_token(
+        client = (
+            aws_session.client("ecr", region_name=region_name)
+            if session is not None
+            else aws_session.client("ecr")
+        )
+        response = client.get_authorization_token(
             registryIds=[account_id],
         )
         authorization_data = response["authorizationData"][0]
@@ -94,16 +106,43 @@ def _do_login(
         f"[SUCCESS]: Login session will expire in {hours} hours",
         flush=True,
     )
+    return registry
 
 
-def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> None:
+def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> list[str]:
     """Log the selected container engine into every configured ECR region."""
-    for region_name in aws_account.ecr_regions:
+    return [
         _do_login(
             context,
             account_id=aws_account.id,
             region_name=region_name,
+            dns_suffix=aws_account.dns_suffix,
         )
+        for region_name in aws_account.ecr_regions
+    ]
+
+
+def login_with_session(
+    context: _configs.Context,
+    aws_account: _configs.AwsAccount,
+    session: Any,
+    *,
+    on_success: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Install ECR tokens using broad intermediate credentials."""
+    completed: list[str] = []
+    for region_name in aws_account.ecr_regions:
+        registry = _do_login(
+            context,
+            account_id=aws_account.id,
+            region_name=region_name,
+            dns_suffix=aws_account.dns_suffix,
+            session=session,
+        )
+        completed.append(registry)
+        if on_success:
+            on_success(registry)
+    return completed
 
 
 def logout(

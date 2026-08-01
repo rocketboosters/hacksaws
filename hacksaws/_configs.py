@@ -33,18 +33,20 @@ class Context:
     @property
     def profile(self) -> str:
         """Return the AWS profile name for this invocation."""
-        return cast("str", self.args.profile)
+        return cast("str", getattr(self.args, "profile", None) or "default")
 
     @property
     def container_engine(self) -> ContainerEngine:
         """Return the container engine selected for ECR authentication."""
-        return "podman" if cast("bool", self.args.podman) else "docker"
+        return (
+            "podman" if cast("bool", getattr(self.args, "podman", False)) else "docker"
+        )
 
     @property
     def aws_directory(self) -> Path:
         """Return the directory containing AWS configuration and credentials."""
-        account_name = cast("str | None", self.args.aws_account_name)
-        configured_directory = cast("str", self.args.directory)
+        account_name = cast("str | None", getattr(self.args, "aws_account_name", None))
+        configured_directory = cast("str", getattr(self.args, "directory", "~/.aws"))
         value = f"~/.aws-{account_name}" if account_name else configured_directory
         return Path(value).expanduser().absolute()
 
@@ -94,6 +96,24 @@ class AwsAccount:
         return value if isinstance(value, str) else None
 
     @property
+    def partition(self) -> str:
+        """Return the caller partition, defaulting to commercial for legacy data."""
+        arn = self.user_arn
+        if arn:
+            try:
+                partition = arn.split(":", 2)[1]
+            except IndexError:
+                partition = ""
+            if partition in {"aws", "aws-us-gov", "aws-cn"}:
+                return partition
+        return "aws"
+
+    @property
+    def dns_suffix(self) -> str:
+        """Return the AWS DNS suffix for this partition."""
+        return "amazonaws.com.cn" if self.partition == "aws-cn" else "amazonaws.com"
+
+    @property
     def ecr_regions(self) -> tuple[str, ...]:
         """Return ECR regions in stable, primary-first order without duplicates."""
         return tuple(
@@ -104,7 +124,8 @@ class AwsAccount:
     def ecr_registries(self) -> list[str]:
         """Return registry hostnames for all configured ECR regions."""
         return [
-            f"{self.id}.dkr.ecr.{region}.amazonaws.com" for region in self.ecr_regions
+            f"{self.id}.dkr.ecr.{region}.{self.dns_suffix}"
+            for region in self.ecr_regions
         ]
 
     @classmethod

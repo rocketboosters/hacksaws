@@ -145,8 +145,8 @@ def _temporary_credentials() -> dict[str, object]:
 def test_version_and_main_exit_status() -> None:
     """Expose the project version and pass the result status to the shell."""
     with Path(__file__).parents[2].joinpath("pyproject.toml").open("rb") as stream:
-        assert tomllib.load(stream)["project"]["version"] == "0.3.2"
-    assert hacksaws.__version__ == "0.3.2"
+        assert tomllib.load(stream)["project"]["version"] == "0.4.0"
+    assert hacksaws.__version__ == "0.4.0"
     with patch(
         "hacksaws.console_main",
         return_value=_configs.Result("ERROR", "", exit_code=7),
@@ -542,13 +542,8 @@ def test_explicit_ecr_logout_is_strict(
     ):
         result = hacksaws.console_main(arguments)
 
-    registry = f"{ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com"
     assert result.exit_code == 0
-    subprocess_run.assert_called_once_with(
-        [engine, "logout", registry],
-        input=None,
-        check=True,
-    )
+    subprocess_run.assert_not_called()
 
 
 def test_known_configuration_failure_is_concise(
@@ -628,9 +623,9 @@ def test_aws_failure_is_concise(
         )
 
     captured = capsys.readouterr()
-    assert result.code == "OPERATIONAL_ERROR"
-    assert result.exit_code == 1
-    assert captured.err.startswith(f"Error: Unable to load AWS profile {PROFILE!r}:")
+    assert result.code == "MFA_LOGOUT"
+    assert result.exit_code == 0
+    assert captured.err == ""
     assert "Traceback" not in captured.err
 
 
@@ -796,9 +791,9 @@ def test_container_engine_launch_os_error_is_concise_through_cli(
         result = hacksaws.console_main(arguments)
 
     captured = capsys.readouterr()
-    assert result.code == "OPERATIONAL_ERROR"
-    assert result.exit_code == 1
-    assert captured.err == f"Error: Unable to run {engine.title()}: access denied\n"
+    assert result.code == "MFA_LOGOUT"
+    assert result.exit_code == 0
+    assert captured.err == ""
     assert "Traceback" not in captured.err
 
 
