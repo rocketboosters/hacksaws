@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,6 +120,74 @@ class PolicyService:
         return self.dependencies
 
 
+class SummaryRoleService:
+    def __init__(self, values: tuple[roles.RoleSnapshot, ...]) -> None:
+        self.values = {item.name: item for item in values}
+        self.list_calls: list[str] = []
+        self.summary_calls: list[str] = []
+        self.detail_calls: list[str] = []
+        self.failures: dict[str, list[BaseException]] = {}
+
+    def list_roles(self, *, path_prefix: str) -> tuple[roles.RoleSnapshot, ...]:
+        self.list_calls.append(path_prefix)
+        return tuple(
+            replace(item, tags={}) for item in reversed(tuple(self.values.values()))
+        )
+
+    def get_role_summary(self, name: str) -> roles.RoleSnapshot:
+        self.summary_calls.append(name)
+        failures = self.failures.get(name, [])
+        if failures:
+            raise failures.pop(0)
+        return self.values[name]
+
+    def get_role(self, name: str) -> roles.RoleSnapshot:
+        self.detail_calls.append(name)
+        return self.values[name]
+
+
+class SummaryPolicyService:
+    def __init__(
+        self,
+        values: tuple[managed.ManagedPolicyRecord, ...],
+        dependencies: managed.PolicyDependencies | None = None,
+    ) -> None:
+        self.values = {item.arn.value: item for item in values}
+        self.dependencies = dependencies or managed.PolicyDependencies()
+        self.list_calls: list[tuple[managed.PolicyScope, str | None, bool]] = []
+        self.summary_calls: list[str] = []
+        self.detail_calls: list[str] = []
+        self.dependency_calls: list[str] = []
+
+    def list_policies(
+        self,
+        *,
+        scope: managed.PolicyScope,
+        path_prefix: str | None,
+        include_tags: bool,
+    ) -> tuple[managed.ManagedPolicyRecord, ...]:
+        self.list_calls.append((scope, path_prefix, include_tags))
+        return tuple(
+            replace(item, tags=()) for item in reversed(tuple(self.values.values()))
+        )
+
+    def get_policy_summary(
+        self, record: managed.ManagedPolicyRecord
+    ) -> managed.ManagedPolicyRecord:
+        self.summary_calls.append(record.arn.value)
+        return self.values[record.arn.value]
+
+    def get_policy(
+        self, reference: str, **_kwargs: object
+    ) -> managed.ManagedPolicyRecord:
+        self.detail_calls.append(reference)
+        return self.values[reference]
+
+    def policy_dependencies_for_arn(self, reference: str) -> managed.PolicyDependencies:
+        self.dependency_calls.append(reference)
+        return self.dependencies
+
+
 class Iam:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
@@ -199,6 +268,27 @@ def service(
     )
 
 
+def summary_service(
+    role_values: tuple[roles.RoleSnapshot, ...] = (),
+    policy_values: tuple[managed.ManagedPolicyRecord, ...] = (),
+    *,
+    role_service: SummaryRoleService | None = None,
+    policy_service: SummaryPolicyService | None = None,
+    sleeps: list[float] | None = None,
+) -> tuple[cleanup.CleanupService, SummaryRoleService, SummaryPolicyService]:
+    selected_roles = role_service or SummaryRoleService(role_values)
+    selected_policies = policy_service or SummaryPolicyService(policy_values)
+    delays = sleeps if sleeps is not None else []
+    selected = cleanup.CleanupService(
+        context(),
+        role_service=selected_roles,  # type: ignore[arg-type]
+        policy_service=selected_policies,  # type: ignore[arg-type]
+        sleeper=delays.append,
+        jitter=lambda _lower, upper: upper,
+    )
+    return selected, selected_roles, selected_policies
+
+
 def test_inventory_classifies_origins_groups_smoke_and_filters() -> None:
     created = policy()
     group = policy(
@@ -231,6 +321,334 @@ def test_inventory_classifies_origins_groups_smoke_and_filters() -> None:
     )
     assert selected == (inventory.items[2],)
     assert inventory.as_dict()["count"] == 3
+
+
+def test_summary_inventory_has_bounded_call_budget_and_stable_output() -> None:
+    role_values = (role("Zulu"), role("Alpha"))
+    policy_values = (policy("ZuluPolicy"), policy("AlphaPolicy"))
+    selected, role_reads, policy_reads = summary_service(role_values, policy_values)
+    events: list[cleanup.InventoryProgress] = []
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(), progress=events.append
+    )
+
+    assert role_reads.list_calls == [roles.DEFAULT_ROLE_PATH]
+    assert sorted(role_reads.summary_calls) == ["Alpha", "Zulu"]
+    assert policy_reads.list_calls == [
+        (managed.PolicyScope.LOCAL, managed.DEFAULT_PATH, False)
+    ]
+    assert sorted(policy_reads.summary_calls) == sorted(
+        item.arn.value for item in policy_values
+    )
+    assert role_reads.detail_calls == []
+    assert policy_reads.detail_calls == []
+    assert policy_reads.dependency_calls == []
+    assert [item.name for item in inventory.items] == [
+        "AlphaPolicy",
+        "ZuluPolicy",
+        "Alpha",
+        "Zulu",
+    ]
+    assert inventory.details_complete is False
+    assert "dependencies" not in inventory.as_dict()["items"][0]  # type: ignore[index]
+    assert [event.phase for event in events] == [
+        cleanup.InventoryPhase.DISCOVERY,
+        cleanup.InventoryPhase.DISCOVERY,
+        cleanup.InventoryPhase.OWNERSHIP,
+        cleanup.InventoryPhase.OWNERSHIP,
+        cleanup.InventoryPhase.FILTER,
+    ]
+    assert events[0].message == "Discovering canonical IAM roles and policies."
+    assert events[1].candidates == 4
+    assert (events[2].completed, events[2].total) == (0, 4)
+    assert (events[3].inspected, events[3].owned) == (4, 4)
+    assert events[4].matches == 4
+
+
+def test_summary_inventory_skips_branches_and_prefilters_before_ownership() -> None:
+    selected, role_reads, policy_reads = summary_service(
+        (role("Keep"), role("Ignore")), (policy(),)
+    )
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(
+            patterns=("keep",),
+            resource_types=frozenset({cleanup.ResourceType.ROLE}),
+        )
+    )
+
+    assert [item.name for item in inventory.items] == ["Keep"]
+    assert role_reads.summary_calls == ["Keep"]
+    assert policy_reads.list_calls == []
+    assert policy_reads.summary_calls == []
+
+
+def test_all_account_summary_uses_global_paths_and_includes_unowned() -> None:
+    unowned = replace(role("External"), tags={})
+    selected, role_reads, policy_reads = summary_service((unowned,), (policy(),))
+    events: list[cleanup.InventoryProgress] = []
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(
+            resource_types=frozenset({cleanup.ResourceType.ROLE}),
+            origins=frozenset(),
+            all_account=True,
+        ),
+        progress=events.append,
+    )
+
+    assert role_reads.list_calls == ["/"]
+    assert policy_reads.list_calls == []
+    assert len(inventory.items) == 1
+    assert inventory.items[0].owned is False
+    assert inventory.items[0].origin is cleanup.OwnershipOrigin.UNKNOWN
+    assert inventory.as_dict()["scope"] == "all-account"
+    ownership_complete = next(
+        event for event in events if event.message == "Ownership complete:"
+    )
+    assert (ownership_complete.inspected, ownership_complete.owned) == (1, 0)
+
+
+def test_summary_filters_before_details_and_revalidates_identity() -> None:
+    smoke = replace(
+        role("Smoke"),
+        tags={
+            **role("Smoke").tags,
+            cleanup.SMOKE_TAG: "true",
+            cleanup.SMOKE_RUN_TAG: "run-1",
+        },
+        attached_policies=("arn:policy/read",),
+    )
+    selected, role_reads, _policy_reads = summary_service((smoke, role("Ordinary")))
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(
+            resource_types=frozenset({cleanup.ResourceType.ROLE}),
+            smoke_only=True,
+            smoke_run_id="run-1",
+            details=True,
+        )
+    )
+
+    assert role_reads.detail_calls == ["Smoke"]
+    assert [item.name for item in inventory.items] == ["Smoke"]
+    assert inventory.details_complete
+    assert inventory.items[0].dependencies["attachedPolicies"] == ("arn:policy/read",)
+    assert inventory.as_dict()["detailsComplete"] is True
+
+
+def test_policy_details_hydrate_only_selected_dependencies() -> None:
+    selected_policy = policy("Selected")
+    ignored_policy = policy("Ignored")
+    dependencies = managed.PolicyDependencies(
+        permission_users=(managed.EntityReference("user", "Reader", "AIDA1"),),
+        permission_groups=(managed.EntityReference("group", "Agents", "AGPA1"),),
+        permission_roles=(managed.EntityReference("role", "Worker", "AROA1"),),
+        boundary_users=(managed.EntityReference("user", "Bounded", "AIDA2"),),
+        boundary_roles=(managed.EntityReference("role", "Boundary", "AROA2"),),
+    )
+    policy_reads = SummaryPolicyService((selected_policy, ignored_policy), dependencies)
+    selected, role_reads, _ = summary_service(policy_service=policy_reads)
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(
+            patterns=("selected",),
+            resource_types=frozenset({cleanup.ResourceType.POLICY}),
+            details=True,
+        )
+    )
+
+    assert role_reads.list_calls == []
+    assert policy_reads.summary_calls == [selected_policy.arn.value]
+    assert policy_reads.detail_calls == [selected_policy.arn.value]
+    assert policy_reads.dependency_calls == [selected_policy.arn.value]
+    assert inventory.items[0].dependencies == {
+        "permissionUsers": ("Reader",),
+        "permissionGroups": ("Agents",),
+        "permissionRoles": ("Worker",),
+        "boundaryUsers": ("Bounded",),
+        "boundaryRoles": ("Boundary",),
+    }
+    assert inventory.items[0].snapshot == (selected_policy, dependencies)
+
+
+def test_summary_retries_only_transient_reads_and_omits_failed_validation() -> None:
+    transient = role("Transient")
+    denied = role("Denied")
+    role_reads = SummaryRoleService((transient, denied))
+    role_reads.failures = {
+        "Transient": [
+            ClientError(
+                {"Error": {"Code": "Throttling", "Message": "wait"}},
+                "GetRole",
+            )
+        ],
+        "Denied": [
+            ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                "GetRole",
+            )
+        ],
+    }
+    sleeps: list[float] = []
+    selected, _, _ = summary_service(role_service=role_reads, sleeps=sleeps)
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(resource_types=frozenset({cleanup.ResourceType.ROLE}))
+    )
+
+    assert role_reads.summary_calls.count("Transient") == 2
+    assert role_reads.summary_calls.count("Denied") == 1
+    assert sleeps == [0.1]
+    assert [item.name for item in inventory.items] == ["Transient"]
+    assert len(inventory.warnings) == 1
+    assert "Denied" in inventory.warnings[0]
+    assert inventory.inventory_complete is False
+    assert inventory.as_dict()["inventoryComplete"] is False
+
+
+def test_summary_omits_role_outside_verified_account_or_partition() -> None:
+    wrong_account = replace(
+        role("WrongAccount"),
+        arn="arn:aws:iam::999999999999:role/hacksaws/WrongAccount",
+    )
+    wrong_partition = replace(
+        role("WrongPartition"),
+        arn=f"arn:aws-cn:iam::{ACCOUNT}:role/hacksaws/WrongPartition",
+    )
+    selected, _, _ = summary_service((wrong_account, wrong_partition))
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(resource_types=frozenset({cleanup.ResourceType.ROLE}))
+    )
+
+    assert inventory.items == ()
+    assert len(inventory.warnings) == 2
+    assert all("account and partition" in warning for warning in inventory.warnings)
+
+
+def test_summary_omits_candidate_when_live_immutable_identity_changes() -> None:
+    current = role("Changed")
+
+    class ChangedIdentityRoles(SummaryRoleService):
+        def list_roles(self, *, path_prefix: str) -> tuple[roles.RoleSnapshot, ...]:
+            self.list_calls.append(path_prefix)
+            return (replace(current, role_id="AROA-old"),)
+
+    selected, _, _ = summary_service(role_service=ChangedIdentityRoles((current,)))
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(resource_types=frozenset({cleanup.ResourceType.ROLE}))
+    )
+
+    assert inventory.items == ()
+    assert inventory.inventory_complete is False
+    assert "identity changed" in inventory.warnings[0]
+
+
+def test_summary_omits_policy_recreated_at_same_arn_with_new_policy_id() -> None:
+    listed = policy("Recreated")
+    live = replace(listed, policy_id="ANPA-new-immutable-id")
+
+    class RecreatedPolicy(SummaryPolicyService):
+        def list_policies(
+            self,
+            *,
+            scope: managed.PolicyScope,
+            path_prefix: str | None,
+            include_tags: bool,
+        ) -> tuple[managed.ManagedPolicyRecord, ...]:
+            self.list_calls.append((scope, path_prefix, include_tags))
+            return (listed,)
+
+        def get_policy_summary(
+            self, record: managed.ManagedPolicyRecord
+        ) -> managed.ManagedPolicyRecord:
+            self.summary_calls.append(record.arn.value)
+            return live
+
+    policy_reads = RecreatedPolicy((live,))
+    selected, _, _ = summary_service(policy_service=policy_reads)
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(resource_types=frozenset({cleanup.ResourceType.POLICY}))
+    )
+
+    assert policy_reads.summary_calls == [listed.arn.value]
+    assert policy_reads.detail_calls == []
+    assert policy_reads.dependency_calls == []
+    assert inventory.items == ()
+    assert inventory.inventory_complete is False
+    assert "identity changed" in inventory.warnings[0]
+
+
+def test_details_empty_selection_reports_completed_semantic_phase() -> None:
+    selected, _, _ = summary_service((role("Other"),))
+    events: list[cleanup.InventoryProgress] = []
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(
+            patterns=("missing",),
+            resource_types=frozenset({cleanup.ResourceType.ROLE}),
+            details=True,
+        ),
+        progress=events.append,
+    )
+
+    assert inventory.items == ()
+    assert inventory.details_complete is True
+    assert events[-1] == cleanup.InventoryProgress(
+        cleanup.InventoryPhase.DETAILS,
+        "No selected IAM resources require dependency details.",
+        completed=0,
+        total=0,
+    )
+
+
+def test_summary_ownership_hydration_is_bounded_to_four_workers() -> None:
+    class ConcurrentRoles(SummaryRoleService):
+        def __init__(self, values: tuple[roles.RoleSnapshot, ...]) -> None:
+            super().__init__(values)
+            self.barrier = threading.Barrier(4)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.maximum = 0
+
+        def get_role_summary(self, name: str) -> roles.RoleSnapshot:
+            with self.lock:
+                self.active += 1
+                self.maximum = max(self.maximum, self.active)
+            try:
+                self.barrier.wait(timeout=2)
+                return super().get_role_summary(name)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    role_reads = ConcurrentRoles(tuple(role(f"Role{index}") for index in range(4)))
+    selected, _, _ = summary_service(role_service=role_reads)
+
+    inventory = selected.inventory_summary(
+        cleanup.InventoryQuery(resource_types=frozenset({cleanup.ResourceType.ROLE}))
+    )
+
+    assert len(inventory.items) == 4
+    assert role_reads.maximum == 4
+
+
+def test_cleanup_plan_never_uses_summary_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = service((role(),))
+
+    def forbidden(*_args: object, **_kwargs: object) -> cleanup.InventorySummary:
+        raise AssertionError
+
+    monkeypatch.setattr(selected, "inventory_summary", forbidden)
+    plan = selected.plan(cleanup.CleanupOptions(all_resources=True))
+
+    assert [item.name for item in plan.resources] == ["AgentRole"]
 
 
 def test_plan_requires_explicit_scope_and_reports_dependency_opt_ins() -> None:

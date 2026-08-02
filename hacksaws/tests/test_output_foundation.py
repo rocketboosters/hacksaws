@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +27,11 @@ class _NotATerminal:
 class _Terminal:
     @staticmethod
     def isatty() -> bool:
+        return True
+
+
+class _TerminalStream(io.StringIO):
+    def isatty(self) -> bool:
         return True
 
 
@@ -51,6 +58,132 @@ def test_color_policy_handles_windows_style_non_tty_no_color_and_json() -> None:
     with patch("builtins.input", return_value="yes"):
         assert _output.confirm("Continue?", stdin=_Terminal())
     assert not _output.confirm("Continue?", stdin=_NotATerminal())
+
+
+def test_progress_is_stderr_only_and_json_always_suppresses_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with _output.ProgressReporter(
+        _output.OutputOptions(), mode="always", delay=0
+    ) as progress:
+        progress.start("Discovering roles…")
+        time.sleep(0.02)
+        progress.update("Inspecting roles… 2 found")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Discovering roles" in captured.err
+    assert "Inspecting roles" in captured.err
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with _output.ProgressReporter(
+        _output.OutputOptions(json=True),
+        mode="always",
+        stream=stderr,
+        delay=0,
+    ) as progress:
+        progress.start("must not render")
+        progress.update("still hidden")
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == ""
+
+
+def test_plain_progress_sanitizes_terminal_controls_and_honors_delay() -> None:
+    stream = io.StringIO()
+    progress = _output.ProgressReporter(
+        _output.OutputOptions(color="never"),
+        mode="always",
+        stream=stream,
+        delay=0.05,
+    )
+    progress.start("Inspecting\x1b[31m roles\r\n")
+    progress.close()
+    assert stream.getvalue() == ""
+
+    with _output.ProgressReporter(
+        _output.OutputOptions(color="never"),
+        mode="always",
+        stream=stream,
+        delay=0,
+    ) as visible:
+        visible.start("Inspecting\x1b[31m roles\r\n")
+        time.sleep(0.02)
+    rendered = stream.getvalue()
+    assert "Inspecting roles" in rendered
+    assert "\x1b" not in rendered
+    assert "\r" not in rendered
+
+
+def test_progress_auto_mode_respects_terminal_and_plain_output_policies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirected = io.StringIO()
+    with _output.ProgressReporter(
+        _output.OutputOptions(), mode="auto", stream=redirected, delay=0
+    ) as quiet:
+        quiet.start("must remain quiet")
+        time.sleep(0.02)
+    assert redirected.getvalue() == ""
+
+    for environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.delenv("TERM", raising=False)
+        for key, value in environment.items():
+            monkeypatch.setenv(key, value)
+        terminal = _TerminalStream()
+        with _output.ProgressReporter(
+            _output.OutputOptions(), mode="auto", stream=terminal, delay=0
+        ) as plain:
+            plain.start("Validating ownership…")
+            time.sleep(0.02)
+        assert "Validating ownership" in terminal.getvalue()
+        assert "\x1b" not in terminal.getvalue()
+
+    terminal = _TerminalStream()
+    with _output.ProgressReporter(
+        _output.OutputOptions(color="never"),
+        mode="auto",
+        stream=terminal,
+        delay=0,
+    ) as no_color:
+        no_color.start("Applying filters…")
+        time.sleep(0.02)
+    assert "Applying filters" in terminal.getvalue()
+    assert "\x1b" not in terminal.getvalue()
+
+
+def test_rich_progress_lifecycle_updates_elapsed_status_and_clears() -> None:
+    terminal = _TerminalStream()
+    reporter = _output.ProgressReporter(
+        _output.OutputOptions(color="always"),
+        mode="auto",
+        stream=terminal,
+        delay=0,
+    )
+    assert reporter.enabled is True
+    with reporter:
+        assert reporter.start("Discovering roles…") is reporter
+        time.sleep(0.03)
+        reporter.update("Validating ownership… 1/2")
+        assert reporter.message == "Validating ownership… 1/2"
+        time.sleep(0.52)
+    assert "Validating ownership" in terminal.getvalue()
+
+
+def test_plain_progress_deduplicates_milestones_and_confirmation_shortcut() -> None:
+    stream = io.StringIO()
+    reporter = _output.ProgressReporter(
+        _output.OutputOptions(color="never"),
+        mode="always",
+        stream=stream,
+        delay=0,
+    )
+    with reporter:
+        reporter.start("Applying filters…")
+        time.sleep(0.02)
+        reporter.update("Applying filters…")
+    assert stream.getvalue().count("Applying filters") == 1
+    assert _output.confirm("Continue?", assume_yes=True) is True
 
 
 def test_global_output_flags_work_anywhere_and_emit_a_stable_envelope(

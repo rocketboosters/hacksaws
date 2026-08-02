@@ -5,6 +5,22 @@ whose Hacksaws ownership is established. It never deletes IAM users, groups,
 instance-profile containers, service-linked roles, AWS-managed policies, or
 local configuration.
 
+Inspect the same account before planning cleanup:
+
+```shell
+hacksaws iam list --profile admin
+hacksaws iam list "*ServiceBuzz*" --all-account --details --profile admin
+```
+
+The default fast inventory verifies live ownership tags only within canonical
+`/hacksaws/` paths. It can miss adopted resources elsewhere, custom or changed
+paths, and untagged legacy resources. `--all-account` performs the comprehensive
+supported-resource scan and includes unowned resources; untagged resources still
+cannot honestly be classified as Hacksaws-owned. `--details` adds dependency
+lookups. Explicit `--created` or `--adopted` filters still narrow an all-account
+scan. `--wide` changes only the table presentation. Human progress is sent to
+stderr after a short delay, while JSON remains one quiet final envelope.
+
 ```shell
 hacksaws cleanup "*ServiceBuzz*" --policies --profile admin --dry-run
 hacksaws iam cleanup --all --profile admin --dry-run

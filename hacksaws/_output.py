@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+import threading
+import time
+import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Literal
+from typing import Self
+from typing import TextIO
 
 from rich.console import Console
+from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
@@ -16,7 +23,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 ColorMode = Literal["auto", "always", "never"]
+ProgressMode = Literal["auto", "always", "never"]
 SCHEMA_VERSION = 1
+
+_TERMINAL_STRING_CONTROL = re.compile(
+    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)|"
+    r"(?:\x1b[P_^X]|[\x90\x98\x9e\x9f]).*?(?:\x1b\\|\x9c|$)",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,141 @@ def console_for(options: OutputOptions, *, stream: object) -> Console:
         no_color=not enabled,
         highlight=False,
     )
+
+
+def safe_terminal_text(value: object) -> str:
+    """Return printable single-line text with terminal controls removed."""
+    decoded = Text.from_ansi(_TERMINAL_STRING_CONTROL.sub("", str(value))).plain
+    safe = []
+    for character in decoded:
+        if character in "\r\n\t":
+            safe.append(" ")
+        elif unicodedata.category(character) not in {"Cc", "Cf", "Cs"}:
+            safe.append(character)
+    return "".join(safe)
+
+
+class ProgressReporter:
+    """Render delayed human progress without contaminating command stdout."""
+
+    def __init__(
+        self,
+        options: OutputOptions,
+        *,
+        mode: ProgressMode = "auto",
+        stream: TextIO | None = None,
+        delay: float = 0.4,
+    ) -> None:
+        self.options = options
+        self.mode = mode
+        self.stream = sys.stderr if stream is None else stream
+        self.delay = delay
+        self._tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._enabled = (
+            not options.json and mode != "never" and (mode == "always" or self._tty)
+        )
+        self._rich = (
+            self._enabled and self._tty and color_enabled(options, stream=self.stream)
+        )
+        self._message = "Working…"
+        self._last_plain_message: str | None = None
+        self._started_at = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._status: Status | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether this invocation may emit progress."""
+        return self._enabled
+
+    @property
+    def message(self) -> str:
+        """Return the latest sanitized phase for cancellation diagnostics."""
+        with self._lock:
+            return self._message
+
+    def start(self, message: object) -> ProgressReporter:
+        """Start delayed progress rendering and retain the latest semantic phase."""
+        self._message = safe_terminal_text(message)
+        if not self._enabled or self._thread is not None:
+            return self
+        self._started_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hacksaws-progress",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def update(self, message: object) -> None:
+        """Replace the current semantic phase and emit one plain milestone."""
+        rendered = safe_terminal_text(message)
+        with self._lock:
+            self._message = rendered
+            visible = self._stop.wait(0) is False and (
+                time.monotonic() - self._started_at >= self.delay
+            )
+            status = self._status
+        if not self._enabled or not visible:
+            return
+        if self._rich and status is not None:
+            status.update(self._rich_message())
+        elif not self._rich:
+            self._print_plain(rendered)
+
+    def _rich_message(self) -> Text:
+        with self._lock:
+            message = self._message
+        elapsed = max(0.0, time.monotonic() - self._started_at)
+        return Text(f"{message}  {elapsed:.0f}s", style="cyan")
+
+    def _print_plain(self, message: str) -> None:
+        with self._lock:
+            if message == self._last_plain_message:
+                return
+            self._last_plain_message = message
+        print(message, file=self.stream, flush=True)
+
+    def _run(self) -> None:
+        if self._stop.wait(self.delay):
+            return
+        if self._rich:
+            status = Status(
+                self._rich_message(),
+                console=console_for(self.options, stream=self.stream),
+                spinner="dots",
+            )
+            with self._lock:
+                self._status = status
+            status.start()
+            try:
+                while not self._stop.wait(0.5):
+                    status.update(self._rich_message())
+            finally:
+                status.stop()
+                with self._lock:
+                    self._status = None
+            return
+        with self._lock:
+            message = self._message
+        self._print_plain(message)
+        self._stop.wait()
+
+    def close(self) -> None:
+        """Stop rendering and clear any live terminal status."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.delay + 0.1))
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.close()
 
 
 def print_message(

@@ -1,7 +1,7 @@
 """Account-scoped inventory and Leave No Trace cleanup planning for IAM."""
 
 # Cleanup deliberately exposes complete operator-facing diagnostics.
-# ruff: noqa: ANN401, BLE001, C901, PLR0913, TRY003
+# ruff: noqa: ANN401, BLE001, C901, PLR0913, PLR0915, TRY003, TRY300
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from enum import StrEnum
@@ -34,6 +35,8 @@ ROLE_ID_TAG = "hacksaws:resource-id"
 _RECOVERY_SERVICE = "iam-cleanup"
 _HANDLER = "aws-operation"
 _LNT_ATTEMPTS = 3
+_INVENTORY_ATTEMPTS = 4
+_INVENTORY_WORKERS = 4
 _TRANSIENT_CODES = frozenset(
     {
         "ConcurrentModification",
@@ -45,6 +48,15 @@ _TRANSIENT_CODES = frozenset(
         "Throttling",
         "ThrottlingException",
         "TooManyRequestsException",
+    }
+)
+_TRANSIENT_BOTO_ERRORS = frozenset(
+    {
+        "ConnectionClosedError",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
+        "HTTPClientError",
+        "ReadTimeoutError",
     }
 )
 
@@ -64,6 +76,15 @@ class OwnershipOrigin(StrEnum):
     ADOPTED = "adopted"
     LEGACY = "legacy"
     UNKNOWN = "unknown"
+
+
+class InventoryPhase(StrEnum):
+    """Stable semantic phases for optional inventory progress reporting."""
+
+    DISCOVERY = "discovery"
+    OWNERSHIP = "ownership"
+    FILTER = "filter"
+    DETAILS = "details"
 
 
 class PlanClassification(StrEnum):
@@ -119,6 +140,68 @@ class InventoryItem:
             "dependencies": {
                 key: list(value) for key, value in self.dependencies.items()
             },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryQuery:
+    """Selection and hydration controls for fast, non-destructive inventory."""
+
+    patterns: tuple[str, ...] = ()
+    resource_types: frozenset[ResourceType] = frozenset()
+    origins: frozenset[OwnershipOrigin] = frozenset(
+        {OwnershipOrigin.CREATED, OwnershipOrigin.ADOPTED}
+    )
+    owned_only: bool = True
+    smoke_only: bool = False
+    smoke_run_id: str | None = None
+    all_account: bool = False
+    details: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryProgress:
+    """One credential-free semantic inventory progress event."""
+
+    phase: InventoryPhase
+    message: str
+    completed: int | None = None
+    total: int | None = None
+    candidates: int | None = None
+    inspected: int | None = None
+    owned: int | None = None
+    matches: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySummary:
+    """Account-bound display inventory, never accepted by cleanup planning."""
+
+    account_id: str
+    partition: str
+    caller_arn: str
+    items: tuple[InventoryItem, ...]
+    warnings: tuple[str, ...] = ()
+    details_complete: bool = False
+    inventory_complete: bool = True
+    scope: str = "canonical"
+
+    def as_dict(self) -> dict[str, object]:
+        """Return structured output without implying absent dependency details."""
+        serialized = [item.as_dict() for item in self.items]
+        if not self.details_complete:
+            for item in serialized:
+                item.pop("dependencies", None)
+        return {
+            "accountId": self.account_id,
+            "partition": self.partition,
+            "callerArn": self.caller_arn,
+            "count": len(self.items),
+            "detailsComplete": self.details_complete,
+            "inventoryComplete": self.inventory_complete,
+            "scope": self.scope,
+            "items": serialized,
+            "warnings": list(self.warnings),
         }
 
 
@@ -353,6 +436,434 @@ class CleanupService:
         )
         self._sleep = sleeper
         self._jitter = jitter
+
+    @staticmethod
+    def _emit_progress(
+        callback: Callable[[InventoryProgress], None] | None,
+        phase: InventoryPhase,
+        message: str,
+        *,
+        completed: int | None = None,
+        total: int | None = None,
+        candidates: int | None = None,
+        inspected: int | None = None,
+        owned: int | None = None,
+        matches: int | None = None,
+    ) -> None:
+        if callback is not None:
+            callback(
+                InventoryProgress(
+                    phase,
+                    message,
+                    completed,
+                    total,
+                    candidates,
+                    inspected,
+                    owned,
+                    matches,
+                )
+            )
+
+    def _inventory_read(self, operation: Callable[[], Any]) -> Any:
+        """Retry only transient inventory reads with exponential full jitter."""
+        for attempt in range(_INVENTORY_ATTEMPTS):
+            try:
+                return operation()
+            except (BotoCoreError, ClientError) as error:
+                transient = (
+                    isinstance(error, ClientError)
+                    and _error_code(error) in _TRANSIENT_CODES
+                ) or (
+                    isinstance(error, BotoCoreError)
+                    and type(error).__name__ in _TRANSIENT_BOTO_ERRORS
+                )
+                if not transient or attempt + 1 == _INVENTORY_ATTEMPTS:
+                    raise
+                ceiling = 0.1 * (2**attempt)
+                self._sleep(self._jitter(0.0, ceiling))
+        raise AssertionError("inventory retry loop did not execute")  # pragma: no cover
+
+    @staticmethod
+    def _summary_matches(name: str, arn: str, patterns: tuple[str, ...]) -> bool:
+        if not patterns:
+            return True
+        folded_name = name.casefold()
+        folded_arn = arn.casefold()
+        return any(
+            fnmatch.fnmatchcase(folded_name, pattern.casefold())
+            or fnmatch.fnmatchcase(folded_arn, pattern.casefold())
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _role_item(role: roles.RoleSnapshot, *, details: bool) -> InventoryItem:
+        tags = _tag_values(role.tags)
+        owned = tags.get(roles.MANAGED_TAG) == "true"
+        dependencies: Mapping[str, tuple[str, ...]] = {}
+        if details:
+            dependencies = {
+                "attachedPolicies": tuple(role.attached_policies),
+                "inlinePolicies": tuple(role.inline_policies),
+                "instanceProfiles": tuple(role.instance_profiles),
+                "permissionsBoundary": (
+                    (role.permissions_boundary,) if role.permissions_boundary else ()
+                ),
+            }
+        return InventoryItem(
+            ResourceType.ROLE,
+            role.name,
+            role.arn,
+            role.role_id,
+            ownership_origin(role.tags) if owned else OwnershipOrigin.UNKNOWN,
+            owned,
+            role.path,
+            tags.get(SMOKE_TAG) == "true",
+            tags.get(SMOKE_RUN_TAG),
+            dependencies,
+            role if details else None,
+        )
+
+    @staticmethod
+    def _policy_item(
+        policy: policies.ManagedPolicyRecord,
+        *,
+        details: bool,
+        dependencies: policies.PolicyDependencies | None = None,
+    ) -> InventoryItem:
+        tags = _tag_values(policy.tags)
+        resource_id = tags.get("hacksaws:resource-id", "")
+        group_name = resource_id.removeprefix("group-")
+        resource_type = (
+            ResourceType.GROUP_GRANT
+            if policy.owned
+            and resource_id.startswith("group-")
+            and group_name
+            and policy.name == f"hacksaws-{group_name}-assume-roles"
+            else ResourceType.POLICY
+        )
+        dependency_values: Mapping[str, tuple[str, ...]] = {}
+        if details and dependencies is not None:
+            dependency_values = {
+                "permissionUsers": tuple(
+                    item.name for item in dependencies.permission_users
+                ),
+                "permissionGroups": tuple(
+                    item.name for item in dependencies.permission_groups
+                ),
+                "permissionRoles": tuple(
+                    item.name for item in dependencies.permission_roles
+                ),
+                "boundaryUsers": tuple(
+                    item.name for item in dependencies.boundary_users
+                ),
+                "boundaryRoles": tuple(
+                    item.name for item in dependencies.boundary_roles
+                ),
+            }
+        snapshot: object | None = None
+        if details:
+            snapshot = (policy, dependencies or policies.PolicyDependencies())
+        return InventoryItem(
+            resource_type,
+            policy.name,
+            policy.arn.value,
+            policy.policy_id,
+            ownership_origin(policy.tags) if policy.owned else OwnershipOrigin.UNKNOWN,
+            policy.owned,
+            policy.path,
+            tags.get(SMOKE_TAG) == "true",
+            tags.get(SMOKE_RUN_TAG),
+            dependency_values,
+            snapshot,
+        )
+
+    @staticmethod
+    def _query_selects(item: InventoryItem, query: InventoryQuery) -> bool:
+        owned_only = query.owned_only and not query.all_account
+        return (
+            (not owned_only or item.owned)
+            and (not query.resource_types or item.resource_type in query.resource_types)
+            and (not query.origins or item.origin in query.origins)
+            and (not query.smoke_only or item.smoke)
+            and (query.smoke_run_id is None or item.smoke_run_id == query.smoke_run_id)
+            and CleanupService._summary_matches(item.name, item.arn, query.patterns)
+        )
+
+    def inventory_summary(
+        self,
+        query: InventoryQuery,
+        *,
+        progress: Callable[[InventoryProgress], None] | None = None,
+    ) -> InventorySummary:
+        """Build a bounded, ownership-validated display inventory."""
+        selected_types = query.resource_types
+        discover_roles = not selected_types or ResourceType.ROLE in selected_types
+        discover_policies = not selected_types or bool(
+            selected_types & {ResourceType.POLICY, ResourceType.GROUP_GRANT}
+        )
+        role_path = "/" if query.all_account else roles.DEFAULT_ROLE_PATH
+        policy_path = None if query.all_account else policies.DEFAULT_PATH
+        scope_label = "account-wide" if query.all_account else "canonical"
+        resource_label = (
+            "roles and policies"
+            if discover_roles and discover_policies
+            else "roles"
+            if discover_roles
+            else "policies"
+        )
+        self._emit_progress(
+            progress,
+            InventoryPhase.DISCOVERY,
+            f"Discovering {scope_label} IAM {resource_label}.",
+        )
+
+        role_summaries: tuple[roles.RoleSnapshot, ...] = ()
+        policy_summaries: tuple[policies.ManagedPolicyRecord, ...] = ()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            role_future = (
+                executor.submit(
+                    self._inventory_read,
+                    lambda: self.role_service.list_roles(path_prefix=role_path),
+                )
+                if discover_roles
+                else None
+            )
+            policy_future = (
+                executor.submit(
+                    self._inventory_read,
+                    lambda: self.policy_service.list_policies(
+                        scope=policies.PolicyScope.LOCAL,
+                        path_prefix=policy_path,
+                        include_tags=False,
+                    ),
+                )
+                if discover_policies
+                else None
+            )
+            if role_future is not None:
+                role_summaries = role_future.result()
+            if policy_future is not None:
+                policy_summaries = policy_future.result()
+
+        roles_to_validate = tuple(
+            item
+            for item in sorted(role_summaries, key=lambda item: item.arn.casefold())
+            if self._summary_matches(item.name, item.arn, query.patterns)
+        )
+        policies_to_validate = tuple(
+            item
+            for item in sorted(
+                policy_summaries, key=lambda item: item.arn.value.casefold()
+            )
+            if self._summary_matches(item.name, item.arn.value, query.patterns)
+        )
+        candidates: tuple[tuple[str, object], ...] = (
+            *(("role", item) for item in roles_to_validate),
+            *(("policy", item) for item in policies_to_validate),
+        )
+        self._emit_progress(
+            progress,
+            InventoryPhase.DISCOVERY,
+            "Discovery complete:",
+            candidates=len(candidates),
+        )
+        self._emit_progress(
+            progress,
+            InventoryPhase.OWNERSHIP,
+            "Validating ownership:",
+            completed=0,
+            total=len(candidates),
+        )
+
+        def validate(
+            candidate: tuple[str, object],
+        ) -> tuple[InventoryItem | None, str | None]:
+            kind, summary = candidate
+            try:
+                if kind == "role":
+                    role_summary = cast("roles.RoleSnapshot", summary)
+                    role = cast(
+                        "roles.RoleSnapshot",
+                        self._inventory_read(
+                            lambda: self.role_service.get_role_summary(
+                                role_summary.name
+                            )
+                        ),
+                    )
+                    if role.arn != role_summary.arn or (
+                        role_summary.role_id and role.role_id != role_summary.role_id
+                    ):
+                        return None, (
+                            f"Role identity changed while reading {role_summary.name}; "
+                            "the candidate was omitted."
+                        )
+                    expected_arn = (
+                        f"arn:{self.context.partition}:iam::"
+                        f"{self.context.account_id}:role/"
+                    )
+                    if not role.arn.startswith(expected_arn):
+                        return None, (
+                            f"Role {role_summary.name} does not match the verified "
+                            "AWS account and partition; the candidate was omitted."
+                        )
+                    return self._role_item(role, details=False), None
+                policy_summary = cast("policies.ManagedPolicyRecord", summary)
+                policy = cast(
+                    "policies.ManagedPolicyRecord",
+                    self._inventory_read(
+                        lambda: self.policy_service.get_policy_summary(policy_summary)
+                    ),
+                )
+                if (
+                    policy.arn.value != policy_summary.arn.value
+                    or policy.policy_id != policy_summary.policy_id
+                ):
+                    return None, (
+                        f"Policy identity changed while reading {policy_summary.name}; "
+                        "the candidate was omitted."
+                    )
+                return self._policy_item(policy, details=False), None
+            except (BotoCoreError, ClientError, policies.PolicyServiceError) as error:
+                name = getattr(summary, "name", "unknown")
+                return None, (
+                    f"Unable to validate {kind} ownership for {name}: {error}; "
+                    "the candidate was omitted."
+                )
+
+        # Botocore clients are shared only for concurrent read operations. The
+        # workers never mutate client/session configuration or service state.
+        with ThreadPoolExecutor(max_workers=_INVENTORY_WORKERS) as executor:
+            validated = tuple(executor.map(validate, candidates))
+        items = tuple(item for item, _warning in validated if item is not None)
+        warnings = [warning for _item, warning in validated if warning is not None]
+        self._emit_progress(
+            progress,
+            InventoryPhase.OWNERSHIP,
+            "Ownership complete:",
+            inspected=len(candidates),
+            owned=sum(item.owned for item in items),
+        )
+
+        selected = tuple(item for item in items if self._query_selects(item, query))
+        self._emit_progress(
+            progress,
+            InventoryPhase.FILTER,
+            "Filters applied:",
+            matches=len(selected),
+        )
+        if query.details and selected:
+            self._emit_progress(
+                progress,
+                InventoryPhase.DETAILS,
+                "Hydrating selected IAM dependency details.",
+                completed=0,
+                total=len(selected),
+            )
+
+            def hydrate(item: InventoryItem) -> tuple[InventoryItem | None, str | None]:
+                try:
+                    if item.resource_type is ResourceType.ROLE:
+                        role = cast(
+                            "roles.RoleSnapshot",
+                            self._inventory_read(
+                                lambda: self.role_service.get_role(item.name)
+                            ),
+                        )
+                        if role.arn != item.arn or role.role_id != item.resource_id:
+                            return None, (
+                                f"Role identity changed while hydrating {item.name}; "
+                                "the candidate was omitted."
+                            )
+                        hydrated = self._role_item(role, details=True)
+                    else:
+                        policy = cast(
+                            "policies.ManagedPolicyRecord",
+                            self._inventory_read(
+                                lambda: self.policy_service.get_policy(
+                                    item.arn,
+                                    include_document=True,
+                                    include_versions=True,
+                                    include_tags=True,
+                                )
+                            ),
+                        )
+                        if (
+                            policy.arn.value != item.arn
+                            or policy.policy_id != item.resource_id
+                        ):
+                            return None, (
+                                f"Policy identity changed while hydrating {item.name}; "
+                                "the candidate was omitted."
+                            )
+                        dependencies = cast(
+                            "policies.PolicyDependencies",
+                            self._inventory_read(
+                                lambda: self.policy_service.policy_dependencies_for_arn(
+                                    item.arn
+                                )
+                            ),
+                        )
+                        hydrated = self._policy_item(
+                            policy, details=True, dependencies=dependencies
+                        )
+                    if not self._query_selects(hydrated, query):
+                        return None, (
+                            f"IAM metadata changed while hydrating {item.name}; "
+                            "the candidate no longer matches and was omitted."
+                        )
+                    return hydrated, None
+                except (
+                    BotoCoreError,
+                    ClientError,
+                    policies.PolicyServiceError,
+                    roles.IamRoleError,
+                ) as error:
+                    return None, (
+                        f"Unable to hydrate details for {item.name}: {error}; "
+                        "the candidate was omitted."
+                    )
+
+            with ThreadPoolExecutor(max_workers=_INVENTORY_WORKERS) as executor:
+                detailed = tuple(executor.map(hydrate, selected))
+            selected = tuple(item for item, _warning in detailed if item is not None)
+            warnings.extend(
+                warning for _item, warning in detailed if warning is not None
+            )
+            self._emit_progress(
+                progress,
+                InventoryPhase.DETAILS,
+                "IAM dependency detail hydration complete.",
+                completed=len(detailed),
+                total=len(detailed),
+            )
+        elif query.details:
+            self._emit_progress(
+                progress,
+                InventoryPhase.DETAILS,
+                "No selected IAM resources require dependency details.",
+                completed=0,
+                total=0,
+            )
+
+        return InventorySummary(
+            self.context.account_id,
+            self.context.partition,
+            self.context.arn,
+            tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (
+                        item.resource_type,
+                        item.name.casefold(),
+                        item.arn,
+                    ),
+                )
+            ),
+            tuple(warnings),
+            query.details,
+            not warnings,
+            "all-account" if query.all_account else "canonical",
+        )
 
     def inventory(self) -> IamInventory:
         """Hydrate all roles and local policies into one account inventory."""

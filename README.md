@@ -127,6 +127,15 @@ hacksaws cache status
 hacksaws config show
 ```
 
+`iam list` verifies live ownership tags within the canonical `/hacksaws/` paths
+by default. That fast scope can miss adopted resources elsewhere, custom or
+changed paths, and untagged legacy resources; add `--all-account` for the
+comprehensive supported-resource scan. Add `--details` when dependency
+information is worth the additional AWS calls. Human terminals receive delayed
+progress on stderr while stdout remains safe to pipe; use `--progress` to force
+plain milestones or `--no-progress` to suppress them. JSON mode is always quiet
+until its single result envelope.
+
 Global output flags may appear anywhere before `--`:
 
 ```shell

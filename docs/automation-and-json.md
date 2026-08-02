@@ -5,6 +5,17 @@ envelope on stdout or stderr. Prompts are disabled in JSON mode. Mutations that
 would prompt require explicit `--yes`; create collisions additionally require
 `--replace` where supported.
 
+Progress is suppressed in JSON mode, even when `--progress` is present, so the
+selected stream still contains exactly one envelope. Human progress uses stderr
+and never contaminates a final table written to stdout. Inventory summary JSON
+uses `detailsComplete: false` and omits dependency fields unless `--details` was
+explicitly requested; progress timing and transient counts are never part of the
+stable envelope. `scope` is `canonical` or `all-account`;
+`inventoryComplete: false` means one or more candidates were omitted and the
+`warnings` array explains why. Explicit `--created` or `--adopted` filters still
+narrow an `--all-account` inventory; `detailsComplete` reports whether
+dependency-detail inclusion was requested, not whether warnings occurred.
+
 ```shell
 hacksaws --json iam policy create agent.yaml --profile admin --dry-run
 hacksaws iam list --profile admin --json

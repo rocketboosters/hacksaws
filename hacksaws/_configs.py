@@ -38,6 +38,11 @@ def configure_output(
     _output_options[0] = _output.OutputOptions(color=color, json=json_output)
 
 
+def output_options() -> _output.OutputOptions:
+    """Return the immutable presentation options for the current invocation."""
+    return _output_options[0]
+
+
 class OperationalError(Exception):
     """An expected operational failure that is safe to show without a traceback."""
 

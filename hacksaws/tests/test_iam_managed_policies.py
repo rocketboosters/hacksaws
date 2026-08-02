@@ -360,6 +360,91 @@ def make_service(
     )
 
 
+def test_summary_tags_use_one_metadata_read_without_documents_or_versions() -> None:
+    iam = StatefulIam()
+    service = make_service(iam)
+    summary = service.list_policies(
+        scope=managed.PolicyScope.LOCAL,
+        path_prefix=managed.DEFAULT_PATH,
+        include_tags=False,
+    )[0]
+
+    metadata_reads = 0
+    read_order: list[str] = []
+    original_get = iam.get_policy
+    original_tags = iam.list_policy_tags
+
+    def tracked_get(**kwargs: object) -> dict[str, object]:
+        nonlocal metadata_reads
+        metadata_reads += 1
+        read_order.append("metadata")
+        return original_get(**kwargs)
+
+    def tracked_tags(**kwargs: object) -> dict[str, object]:
+        read_order.append("tags")
+        return original_tags(**kwargs)
+
+    def unexpected_read(**_kwargs: object) -> dict[str, object]:
+        pytest.fail("summary reads must not hydrate policy details")
+
+    iam.get_policy = tracked_get  # type: ignore[method-assign]
+    iam.list_policy_tags = tracked_tags  # type: ignore[method-assign]
+    iam.get_policy_version = unexpected_read  # type: ignore[method-assign]
+    iam.list_policy_versions = unexpected_read  # type: ignore[method-assign]
+    hydrated = service.get_policy_summary(summary)
+
+    assert metadata_reads == 1
+    assert read_order == ["tags", "metadata"]
+    assert hydrated.owned
+    assert hydrated.document is None
+    assert hydrated.versions == ()
+
+
+def test_known_arn_dependencies_skip_policy_metadata_and_document_reads() -> None:
+    iam = StatefulIam()
+    service = make_service(iam)
+
+    def unexpected_read(**_kwargs: object) -> dict[str, object]:
+        pytest.fail("known-ARN dependency reads must not hydrate policy metadata")
+
+    iam.get_policy = unexpected_read  # type: ignore[method-assign]
+    iam.get_policy_version = unexpected_read  # type: ignore[method-assign]
+    iam.list_policy_versions = unexpected_read  # type: ignore[method-assign]
+
+    assert service.policy_dependencies_for_arn(ARN).empty
+
+
+def test_policy_summary_metadata_fence_detects_replacement_during_tag_read() -> None:
+    class ReplacedDuringTags(StatefulIam):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy_id = "ANPA-before-tag-read"
+
+        def _metadata(self) -> dict[str, object]:
+            metadata = super()._metadata()
+            metadata["PolicyId"] = self.policy_id
+            return metadata
+
+        def list_policy_tags(self, **kwargs: object) -> dict[str, object]:
+            response = super().list_policy_tags(**kwargs)
+            self.policy_id = "ANPA-after-tag-read"
+            return response
+
+    iam = ReplacedDuringTags()
+    service = make_service(iam)
+    listed = service.list_policies(
+        scope=managed.PolicyScope.LOCAL,
+        path_prefix=managed.DEFAULT_PATH,
+        include_tags=False,
+    )[0]
+
+    current = service.get_policy_summary(listed)
+
+    assert listed.policy_id == "ANPA-before-tag-read"
+    assert current.policy_id == "ANPA-after-tag-read"
+    assert current.owned
+
+
 def test_strict_policy_input_formats_metadata_and_canonicalization(
     tmp_path: Path,
 ) -> None:

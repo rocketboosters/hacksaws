@@ -24,6 +24,7 @@ from hacksaws import _iam_cleanup
 from hacksaws import _iam_policy_cli
 from hacksaws import _iam_recovery
 from hacksaws import _iam_role_cli
+from hacksaws import _output
 from hacksaws import _state
 
 if TYPE_CHECKING:
@@ -240,7 +241,9 @@ def register_parser(
         "list",
         help="List Hacksaws-owned IAM roles, policies, and group grants.",
         description=(
-            "Inventory Hacksaws-owned remote IAM resources in one verified AWS account."
+            "Inventory live-tag-verified IAM resources in one verified AWS account. "
+            "The default fast scan uses canonical /hacksaws/ paths; use "
+            "--all-account for a comprehensive supported-resource scan."
         ),
     )
     _selector_arguments(inventory)
@@ -325,6 +328,24 @@ def _resource_filters(parser: argparse.ArgumentParser) -> None:
 
 def _inventory_arguments(parser: argparse.ArgumentParser) -> None:
     _resource_filters(parser)
+    scope = parser.add_argument_group("inventory scope")
+    scope.add_argument(
+        "--all-account",
+        action="store_true",
+        help=(
+            "Expand the default canonical /hacksaws/ scan to matching roles and "
+            "customer-managed policies across the whole account, including "
+            "resources not managed by Hacksaws."
+        ),
+    )
+    scope.add_argument(
+        "--details",
+        action="store_true",
+        help=(
+            "Fetch dependency details for matching resources; this performs extra "
+            "IAM requests and may take longer."
+        ),
+    )
     output = parser.add_argument_group("output")
     width = output.add_mutually_exclusive_group()
     width.add_argument(
@@ -335,7 +356,24 @@ def _inventory_arguments(parser: argparse.ArgumentParser) -> None:
     width.add_argument(
         "--wide",
         action="store_true",
-        help="Include ARNs, paths, and dependency counts.",
+        help="Include ARNs and paths without changing which IAM details are fetched.",
+    )
+    progress = output.add_mutually_exclusive_group()
+    progress.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        default=None,
+        help=(
+            "Show progress on stderr; force plain milestones when stderr is not a "
+            "terminal."
+        ),
+    )
+    progress.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Suppress progress messages and terminal animation.",
     )
 
 
@@ -399,39 +437,94 @@ def _cleanup_origins(
     )
 
 
-def _inventory_text(items: list[dict[str, object]], *, wide: bool) -> str:
+def _inventory_text(
+    items: list[dict[str, object]],
+    *,
+    wide: bool,
+    query: _iam_cleanup.InventoryQuery | None = None,
+    summary: _iam_cleanup.InventorySummary | None = None,
+) -> str:
+    details = query.details if query else False
+    all_account = query.all_account if query else False
+    warnings = summary.warnings if summary else ()
     if not items:
-        return "No matching Hacksaws-owned IAM resources."
+        account = (
+            f"AWS account {summary.account_id} ({summary.partition})"
+            if summary
+            else "the selected AWS account"
+        )
+        if all_account:
+            message = (
+                f"No matching supported IAM resources were found in {account}. "
+                "Scope: all-account."
+            )
+        else:
+            message = (
+                f"No matching Hacksaws-owned IAM resources were found in {account}. "
+                "Scope: canonical /hacksaws/ paths with live-tag-verified ownership. "
+                "This fast scan can miss adopted resources outside the canonical "
+                "path, resources whose path changed, and untagged legacy resources. "
+                "Use --all-account for the comprehensive account scan; untagged "
+                "legacy resources cannot be classified as Hacksaws-owned."
+            )
+        return _inventory_warnings_text(message, warnings)
     headers: tuple[str, ...]
     rows: list[tuple[str, ...]]
     if wide:
-        headers = ("Type", "Name", "Origin", "Path", "Deps", "ARN")
+        headers = (
+            ("Type", "Name", "Origin", "Path", "Deps", "ARN")
+            if details
+            else ("Type", "Name", "Origin", "Path", "ARN")
+        )
         rows = [
-            (
-                str(item["type"]),
-                str(item["name"]),
-                str(item["origin"]),
-                str(item["path"]),
-                str(
-                    sum(
-                        len(value)
-                        for value in cast(
-                            "dict[str, list[object]]", item["dependencies"]
-                        ).values()
+            tuple(
+                _output.safe_terminal_text(value)
+                for value in (
+                    (
+                        item["type"],
+                        item["name"],
+                        item["origin"],
+                        item["path"],
+                        _dependency_count(item),
+                        item["arn"],
                     )
-                ),
-                str(item["arn"]),
+                    if details
+                    else (
+                        item["type"],
+                        item["name"],
+                        item["origin"],
+                        item["path"],
+                        item["arn"],
+                    )
+                )
             )
             for item in items
         ]
     else:
-        headers = ("Type", "Name", "Origin", "Smoke")
+        headers = (
+            ("Type", "Name", "Origin", "Deps", "Smoke")
+            if details
+            else ("Type", "Name", "Origin", "Smoke")
+        )
         rows = [
-            (
-                str(item["type"]),
-                str(item["name"]),
-                str(item["origin"]),
-                "🧪" if item["smoke"] else "",
+            tuple(
+                _output.safe_terminal_text(value)
+                for value in (
+                    (
+                        item["type"],
+                        item["name"],
+                        item["origin"],
+                        _dependency_count(item),
+                        "🧪" if item["smoke"] else "",
+                    )
+                    if details
+                    else (
+                        item["type"],
+                        item["name"],
+                        item["origin"],
+                        "🧪" if item["smoke"] else "",
+                    )
+                )
             )
             for item in items
         ]
@@ -439,7 +532,7 @@ def _inventory_text(items: list[dict[str, object]], *, wide: bool) -> str:
         max(len(headers[index]), *(len(row[index]) for row in rows))
         for index in range(len(headers))
     ]
-    return "\n".join(
+    table = "\n".join(
         [
             "  ".join(
                 value.ljust(widths[index]) for index, value in enumerate(headers)
@@ -451,25 +544,124 @@ def _inventory_text(items: list[dict[str, object]], *, wide: bool) -> str:
             ),
         ]
     )
+    return _inventory_warnings_text(table, warnings)
+
+
+def _dependency_count(item: dict[str, object]) -> int:
+    dependencies = cast("dict[str, list[object]]", item.get("dependencies", {}))
+    return sum(len(value) for value in dependencies.values())
+
+
+def _inventory_warnings_text(message: str, warnings: tuple[str, ...]) -> str:
+    if not warnings:
+        return message
+    rendered = "\n".join(
+        f"  - {_output.safe_terminal_text(warning)}" for warning in warnings
+    )
+    return f"{message}\n\nWarnings:\n{rendered}"
+
+
+def _inventory_progress_text(event: _iam_cleanup.InventoryProgress) -> str:
+    message = event.message
+    if event.candidates is not None:
+        noun = "candidate" if event.candidates == 1 else "candidates"
+        return f"{message} {event.candidates} {noun}"
+    if event.inspected is not None and event.owned is not None:
+        return f"{message} {event.inspected} inspected, {event.owned} owned"
+    if event.matches is not None:
+        noun = "match" if event.matches == 1 else "matches"
+        return f"{message} {event.matches} {noun}"
+    if event.completed is not None and event.total is not None:
+        message = f"{message} {event.completed}/{event.total}"
+    return message
+
+
+def _inventory_query(args: argparse.Namespace) -> _iam_cleanup.InventoryQuery:
+    origins = (
+        frozenset()
+        if args.all_account and not (args.created or args.adopted)
+        else _cleanup_origins(args)
+    )
+    return _iam_cleanup.InventoryQuery(
+        patterns=tuple(args.patterns),
+        resource_types=_cleanup_types(args),
+        origins=origins,
+        owned_only=not args.all_account,
+        smoke_only=args.smoke,
+        smoke_run_id=args.smoke_run,
+        all_account=args.all_account,
+        details=args.details,
+    )
 
 
 def inventory_result(
-    args: argparse.Namespace, context: IamCommandContext
+    args: argparse.Namespace,
+    context: IamCommandContext,
+    *,
+    progress: Callable[[_iam_cleanup.InventoryProgress], None] | None = None,
 ) -> _configs.Result:
-    inventory = _iam_cleanup.CleanupService(context).inventory()
-    selected = inventory.filter(
-        patterns=args.patterns,
-        resource_types=_cleanup_types(args),
-        origins=_cleanup_origins(args),
-        owned_only=True,
-        smoke_only=args.smoke,
-        smoke_run_id=args.smoke_run,
+    query = _inventory_query(args)
+    summary = _iam_cleanup.CleanupService(context).inventory_summary(
+        query, progress=progress
     )
-    items = [item.as_dict() for item in selected]
-    data = {**inventory.as_dict(), "count": len(items), "items": items}
+    data = summary.as_dict()
+    items = cast("list[dict[str, object]]", data["items"])
     return _configs.Result(
-        "IAM_INVENTORY", _inventory_text(items, wide=args.wide), data=data
+        "IAM_INVENTORY",
+        _inventory_text(
+            items,
+            wide=args.wide,
+            query=query,
+            summary=summary,
+        ),
+        data=data,
+        kind="warning" if summary.warnings else "info",
     )
+
+
+def _inventory_command_result(args: argparse.Namespace) -> _configs.Result:
+    selected = getattr(args, "progress", None)
+    mode: _output.ProgressMode = (
+        "always" if selected is True else "never" if selected is False else "auto"
+    )
+    with _output.ProgressReporter(_configs.output_options(), mode=mode) as reporter:
+        reporter.start("Verifying AWS identity…")
+        try:
+            context = IamCommandContext.create(args)
+            result = inventory_result(
+                args,
+                context,
+                progress=lambda event: reporter.update(_inventory_progress_text(event)),
+            )
+        except KeyboardInterrupt:
+            return _configs.Result(
+                "IAM_INVENTORY_INTERRUPTED",
+                f"IAM inventory cancelled during: {reporter.message} No AWS "
+                "resources were changed.",
+                _configs.EXIT_INTERRUPTED,
+                "stderr",
+                kind="warning",
+            )
+        except (
+            BotoCoreError,
+            ClientError,
+            _iam_cleanup.policies.PolicyServiceError,
+            _iam_cleanup.roles.IamRoleError,
+        ) as error:
+            raise _configs.OperationalError(
+                "Unable to inspect IAM resources during "
+                f"{reporter.message}: {_output.safe_terminal_text(error)}",
+                repairs=[
+                    (
+                        "Verify the selected profile can list IAM roles and policies, "
+                        "then retry."
+                    )
+                ],
+            ) from error
+        else:
+            data = cast("dict[str, object]", result.data)
+            reporter.update(f"Rendering {data['count']} resources…")
+            return result
 
 
 def cleanup_result(
@@ -743,7 +935,7 @@ def dispatch(args: argparse.Namespace) -> _configs.Result:  # noqa: PLR0911
     if args.iam_action in {"list", "cleanup"}:
         if args.iam_action == "cleanup":
             return _dispatch_cleanup(args)
-        return inventory_result(args, IamCommandContext.create(args))
+        return _inventory_command_result(args)
     if args.iam_action not in {"policy", "policies", "role", "roles"}:
         return _configs.Result(
             "IAM_HELP", "Choose an IAM command.", _configs.EXIT_USAGE, "stderr"

@@ -8,9 +8,11 @@ import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 from hacksaws import _configs
 from hacksaws import _iam_cleanup
@@ -262,8 +264,20 @@ def test_iam_inventory_and_cleanup_cli_results(monkeypatch: pytest.MonkeyPatch) 
         def __init__(self, _context: object) -> None:
             pass
 
-        def inventory(self) -> _iam_cleanup.IamInventory:
-            return inventory
+        def inventory_summary(
+            self,
+            query: _iam_cleanup.InventoryQuery,
+            *,
+            progress: object = None,
+        ) -> _iam_cleanup.InventorySummary:
+            del progress
+            return _iam_cleanup.InventorySummary(
+                inventory.account_id,
+                inventory.partition,
+                inventory.caller_arn,
+                inventory.items,
+                details_complete=query.details,
+            )
 
         def plan(
             self, _options: _iam_cleanup.CleanupOptions
@@ -288,12 +302,16 @@ def test_iam_inventory_and_cleanup_cli_results(monkeypatch: pytest.MonkeyPatch) 
             smoke=False,
             smoke_run=None,
             wide=True,
+            all_account=False,
+            details=True,
         ),
         context,
     )
     assert listed.code == "IAM_INVENTORY"
     assert "ANPA" not in listed.message
     assert "AgentRead" in listed.message
+    assert isinstance(listed.data, dict)
+    assert listed.data["detailsComplete"] is True
 
     dry_run = _iam_cli.cleanup_result(
         argparse.Namespace(
@@ -447,17 +465,307 @@ def test_inventory_rendering_and_central_dispatch_branches(
     monkeypatch.setattr(
         _iam_cli,
         "inventory_result",
-        lambda _args, _context: _configs.Result("LISTED", "listed"),
+        lambda _args, _context, **_options: _configs.Result(
+            "LISTED", "listed", data={"count": 1}
+        ),
     )
     monkeypatch.setattr(
         _iam_cli,
         "cleanup_result",
         lambda _args, _context: _configs.Result("CLEANED", "cleaned"),
     )
-    assert _iam_cli.dispatch(argparse.Namespace(iam_action="list")).code == "LISTED"
+    assert (
+        _iam_cli.dispatch(argparse.Namespace(iam_action="list", progress=False)).code
+        == "LISTED"
+    )
     cleanup_args = argparse.Namespace(iam_action="cleanup")
     assert _iam_cli.dispatch(cleanup_args).code == "CLEANED"
     assert _iam_cli.dispatch_root_cleanup(cleanup_args).code == "CLEANED"
+
+
+def test_inventory_empty_scope_warnings_and_details_rendering() -> None:
+    owned_query = _iam_cleanup.InventoryQuery()
+    empty = _iam_cleanup.InventorySummary(
+        "123456789012",
+        "aws",
+        "arn:aws:iam::123456789012:user/test",
+        (),
+        ("Unable to validate role bad\x1b[31m.\nOmitted.",),
+    )
+    rendered = _iam_cli._inventory_text(
+        [], wide=False, query=owned_query, summary=empty
+    )
+    assert "AWS account 123456789012 (aws)" in rendered
+    assert "--all-account" in rendered
+    assert "untagged legacy" in rendered
+    assert "Warnings:" in rendered
+    assert "\x1b" not in rendered
+    assert "\nOmitted" not in rendered
+
+    all_account = replace(owned_query, all_account=True, owned_only=False)
+    rendered = _iam_cli._inventory_text(
+        [], wide=False, query=all_account, summary=replace(empty, warnings=())
+    )
+    assert "Scope: all-account" in rendered
+    assert "cannot be classified" not in rendered
+
+    item = _inventory_item().as_dict()
+    detailed = _iam_cli._inventory_text(
+        [item],
+        wide=False,
+        query=replace(owned_query, details=True),
+        summary=replace(empty, items=(_inventory_item(),), details_complete=True),
+    )
+    assert "Deps" in detailed
+
+
+def test_inventory_cli_json_query_flags_and_progress_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hacksaws import _cli
+    from hacksaws import _sessions
+
+    queries: list[_iam_cleanup.InventoryQuery] = []
+    item = _inventory_item()
+
+    class Service:
+        def __init__(self, _context: object) -> None:
+            pass
+
+        def inventory_summary(
+            self,
+            query: _iam_cleanup.InventoryQuery,
+            *,
+            progress: object = None,
+        ) -> _iam_cleanup.InventorySummary:
+            queries.append(query)
+            if callable(progress):
+                progress(
+                    _iam_cleanup.InventoryProgress(
+                        _iam_cleanup.InventoryPhase.FILTER,
+                        "Filters applied:",
+                        matches=1,
+                    )
+                )
+            return _iam_cleanup.InventorySummary(
+                "123456789012",
+                "aws",
+                "arn:aws:iam::123456789012:user/test",
+                (item,),
+                details_complete=query.details,
+                scope="all-account" if query.all_account else "canonical",
+            )
+
+    monkeypatch.setattr(_iam_cli._iam_cleanup, "CleanupService", Service)
+    monkeypatch.setattr(
+        _iam_cli.IamCommandContext,
+        "create",
+        lambda _args: SimpleNamespace(),
+    )
+    monkeypatch.setattr(_sessions, "recover_journal", lambda: None)
+    result = _cli.console_main(
+        [
+            "iam",
+            "list",
+            "*Agent*",
+            "--roles",
+            "--all-account",
+            "--progress",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    envelope = json.loads(captured.out)
+    assert result.code == "IAM_INVENTORY"
+    assert envelope["data"]["detailsComplete"] is False
+    assert envelope["data"]["inventoryComplete"] is True
+    assert envelope["data"]["scope"] == "all-account"
+    assert "dependencies" not in envelope["data"]["items"][0]
+    assert queries[0].patterns == ("*Agent*",)
+    assert queries[0].resource_types == frozenset({_iam_cleanup.ResourceType.ROLE})
+    assert queries[0].all_account is True
+    assert queries[0].origins == frozenset()
+    explicit_origin = _cli._create_parser().parse_args(
+        ["iam", "list", "--all-account", "--created"]
+    )
+    assert _iam_cli._inventory_query(explicit_origin).origins == frozenset(
+        {_iam_cleanup.OwnershipOrigin.CREATED}
+    )
+
+
+def test_inventory_progress_modes_help_and_interruption(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hacksaws import _cli
+
+    help_result = _cli.console_main(["iam", "list", "--help"])
+    help_text = capsys.readouterr().out
+    assert help_result.exit_code == 0
+    assert "--all-account" in help_text
+    assert "--details" in help_text
+    assert "--progress" in help_text
+    assert "--no-progress" in help_text
+    with pytest.raises(SystemExit):
+        _cli._create_parser().parse_args(["iam", "list", "--progress", "--no-progress"])
+
+    monkeypatch.setattr(
+        _iam_cli.IamCommandContext,
+        "create",
+        lambda _args: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    interrupted = _iam_cli._inventory_command_result(argparse.Namespace(progress=False))
+    assert interrupted.code == "IAM_INVENTORY_INTERRUPTED"
+    assert interrupted.exit_code == _configs.EXIT_INTERRUPTED
+    assert "No AWS resources were changed" in interrupted.message
+    assert "Verifying AWS identity" in interrupted.message
+
+    monkeypatch.setattr(
+        _iam_cli.IamCommandContext,
+        "create",
+        lambda _args: SimpleNamespace(),
+    )
+
+    def fail_inventory(*_args: object, **_kwargs: object) -> _configs.Result:
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+            "ListRoles",
+        )
+
+    monkeypatch.setattr(_iam_cli, "inventory_result", fail_inventory)
+    with pytest.raises(_configs.OperationalError, match="Unable to inspect"):
+        _iam_cli._inventory_command_result(argparse.Namespace(progress=False))
+
+
+def test_inventory_reporter_lifecycle_maps_modes_and_semantic_phases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modes: list[str] = []
+    messages: list[str] = []
+    exits: list[bool] = []
+
+    class Reporter:
+        message = "Working…"
+
+        def __init__(self, _options: object, *, mode: str) -> None:
+            modes.append(mode)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            exits.append(True)
+
+        def start(self, message: str) -> Reporter:
+            self.message = message
+            messages.append(message)
+            return self
+
+        def update(self, message: str) -> None:
+            self.message = message
+            messages.append(message)
+
+    def result(
+        _args: argparse.Namespace,
+        _context: object,
+        *,
+        progress: object,
+    ) -> _configs.Result:
+        assert callable(progress)
+        progress(
+            _iam_cleanup.InventoryProgress(
+                _iam_cleanup.InventoryPhase.OWNERSHIP,
+                "Ownership complete:",
+                inspected=2,
+                owned=1,
+            )
+        )
+        return _configs.Result("IAM_INVENTORY", "done", data={"count": 1})
+
+    monkeypatch.setattr(_iam_cli._output, "ProgressReporter", Reporter)
+    monkeypatch.setattr(
+        _iam_cli.IamCommandContext, "create", lambda _args: SimpleNamespace()
+    )
+    monkeypatch.setattr(_iam_cli, "inventory_result", result)
+    for selected in (True, False, None):
+        assert (
+            _iam_cli._inventory_command_result(
+                argparse.Namespace(progress=selected)
+            ).code
+            == "IAM_INVENTORY"
+        )
+    assert modes == ["always", "never", "auto"]
+    assert len(exits) == 3
+    assert messages.count("Verifying AWS identity…") == 3
+    assert messages.count("Ownership complete: 2 inspected, 1 owned") == 3
+    assert messages.count("Rendering 1 resources…") == 3
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            _iam_cleanup.InventoryProgress(
+                _iam_cleanup.InventoryPhase.DISCOVERY,
+                "Discovery complete:",
+                candidates=1,
+            ),
+            "Discovery complete: 1 candidate",
+        ),
+        (
+            _iam_cleanup.InventoryProgress(
+                _iam_cleanup.InventoryPhase.OWNERSHIP,
+                "Validating ownership:",
+                completed=0,
+                total=1,
+            ),
+            "Validating ownership: 0/1",
+        ),
+        (
+            _iam_cleanup.InventoryProgress(
+                _iam_cleanup.InventoryPhase.OWNERSHIP,
+                "Ownership complete:",
+                inspected=1,
+                owned=0,
+            ),
+            "Ownership complete: 1 inspected, 0 owned",
+        ),
+        (
+            _iam_cleanup.InventoryProgress(
+                _iam_cleanup.InventoryPhase.FILTER,
+                "Filters applied:",
+                matches=0,
+            ),
+            "Filters applied: 0 matches",
+        ),
+    ],
+)
+def test_inventory_progress_text_uses_phase_specific_counts(
+    event: _iam_cleanup.InventoryProgress, expected: str
+) -> None:
+    assert _iam_cli._inventory_progress_text(event) == expected
+
+
+def test_iam_adapter_registration_rejects_duplicate_names() -> None:
+    class Adapter:
+        name = "test-adapter"
+
+        def register(self, _parser: argparse.ArgumentParser) -> None:
+            pass
+
+        def dispatch(
+            self, _args: argparse.Namespace, _context: _iam_cli.IamCommandContext
+        ) -> _configs.Result | None:
+            return None
+
+    adapter = Adapter()
+    _iam_cli.clear_adapters()
+    try:
+        _iam_cli.register_adapter(adapter)
+        with pytest.raises(ValueError, match="test-adapter"):
+            _iam_cli.register_adapter(adapter)
+    finally:
+        _iam_cli.clear_adapters()
 
 
 def test_recovery_get_and_empty_environment(

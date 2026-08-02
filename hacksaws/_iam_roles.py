@@ -1316,6 +1316,21 @@ class IamRoleService:
             str(response.get("RoleId", "")),
         )
 
+    def get_role_summary(self, name: str) -> RoleSnapshot:
+        """Read identity, ownership, and trust metadata without dependencies."""
+        response = self.client.get_role(RoleName=name)["Role"]
+        return RoleSnapshot(
+            name,
+            response["Arn"],
+            response.get("Path", "/"),
+            decode_document(response["AssumeRolePolicyDocument"]),
+            response.get("Description"),
+            response.get("MaxSessionDuration", 3600),
+            response.get("PermissionsBoundary", {}).get("PermissionsBoundaryArn"),
+            {item["Key"]: item["Value"] for item in response.get("Tags", [])},
+            role_id=str(response.get("RoleId", "")),
+        )
+
     def list_roles(
         self, *, path_prefix: str = DEFAULT_ROLE_PATH
     ) -> tuple[RoleSnapshot, ...]:

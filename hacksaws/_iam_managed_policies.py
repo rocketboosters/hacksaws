@@ -1202,6 +1202,15 @@ class IamManagedPolicyService:
             marker = _string(response.get("Marker"), label="Marker")
         return replace(record, tags=tuple(tags))
 
+    def get_policy_summary(self, record: ManagedPolicyRecord) -> ManagedPolicyRecord:
+        """Revalidate live identity and tags without documents or dependencies."""
+        self._assert_arn_target(record.arn)
+        if record.arn.kind is not PolicyKind.CUSTOMER_MANAGED:
+            return record
+        tagged = self._with_tags(record)
+        current = self._read_policy(record.arn)
+        return replace(current, tags=tagged.tags)
+
     def _list_versions(
         self,
         arn: ManagedPolicyArn,
@@ -1254,22 +1263,32 @@ class IamManagedPolicyService:
         include_versions: bool,
         include_tags: bool,
     ) -> ManagedPolicyRecord:
+        # Re-read live metadata before using DefaultVersionId or mutation-relevant
+        # counts. Callers may pass a list result that changed after discovery.
         current = self._read_policy(record.arn)
         tags = (
             self._with_tags(current).tags
             if include_tags and current.arn.kind is PolicyKind.CUSTOMER_MANAGED
             else ()
         )
-        document = (
-            self._get_version_document(current.arn, current.default_version_id)
-            if include_document
-            else None
-        )
         versions = (
             self._list_versions(current.arn, include_documents=include_versions)
             if include_versions
             else ()
         )
+        document = None
+        if include_document:
+            matching = next(
+                (
+                    version.document
+                    for version in versions
+                    if version.version_id == current.default_version_id
+                ),
+                None,
+            )
+            document = matching or self._get_version_document(
+                current.arn, current.default_version_id
+            )
         return replace(current, tags=tags, document=document, versions=versions)
 
     def plan_create(
@@ -1969,6 +1988,24 @@ class IamManagedPolicyService:
         boundary_users, _, boundary_roles = self._list_entities(
             policy.arn,
             "PermissionsBoundary",
+        )
+        return PolicyDependencies(
+            permission_users,
+            permission_groups,
+            permission_roles,
+            boundary_users,
+            boundary_roles,
+        )
+
+    def policy_dependencies_for_arn(self, reference: str) -> PolicyDependencies:
+        """List dependencies for a previously validated customer-policy ARN."""
+        arn = ManagedPolicyArn.parse(reference)
+        self._assert_arn_target(arn)
+        permission_users, permission_groups, permission_roles = self._list_entities(
+            arn, "PermissionsPolicy"
+        )
+        boundary_users, _, boundary_roles = self._list_entities(
+            arn, "PermissionsBoundary"
         )
         return PolicyDependencies(
             permission_users,

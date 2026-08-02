@@ -285,7 +285,8 @@ Selector abbreviations and duplicates are rejected. `--location` conflicts with
 
 ```shell
 hacksaws iam list [PATTERN]... [--roles] [--policies] [--group-grants] \
-  [--created] [--adopted] [--smoke] [--smoke-run RUN_ID] [--compact|--wide]
+  [--created] [--adopted] [--smoke] [--smoke-run RUN_ID] [--compact|--wide] \
+  [--all-account] [--details] [--progress|--no-progress]
 
 hacksaws cleanup PATTERN... [--roles] [--policies] [--group-grants] \
   [--created] [--adopted] [--cascade] [--remove-boundaries] \
@@ -300,6 +301,20 @@ conflicts with patterns. No type flags means all supported types. No origin
 flags means created and adopted resources. Smoke selectors further narrow
 matches. Cleanup orders group grants, roles, then policies; blocked/transient
 work does not prevent independent resources from being attempted.
+
+Inventory verifies live ownership tags within the canonical `/hacksaws/` paths
+by default. That fast scope can miss adopted resources elsewhere, custom or
+changed paths, and untagged legacy resources. `--all-account` performs the
+comprehensive supported-resource scan and includes resources Hacksaws does not
+own; untagged legacy resources still cannot be classified as Hacksaws-owned.
+Explicit `--created` or `--adopted` filters still narrow an all-account scan.
+`--details` performs the additional dependency lookups; `--wide` only changes
+presentation. Progress is delayed and written to stderr for human terminals.
+`--progress` forces plain stderr milestones, `--no-progress` suppresses them,
+and JSON mode always remains quiet until its single envelope. Summary JSON
+reports `detailsComplete: false` and omits dependency fields unless `--details`
+is selected. `scope` identifies `canonical` or `all-account`, while
+`inventoryComplete: false` means warnings describe candidates that were omitted.
 
 Cleanup exit codes: `0` complete/executable plan, `1` input/auth/planning
 failure, `2` partial or dependency-blocked, `3` safety refusal.
