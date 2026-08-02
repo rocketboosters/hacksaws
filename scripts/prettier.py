@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,7 +39,12 @@ def _candidates(paths: Sequence[str]) -> tuple[int, list[str]]:
     )
     if completed.returncode:
         return completed.returncode, []
-    candidates = [os.fsdecode(item) for item in completed.stdout.split(b"\0") if item]
+    candidates = [
+        candidate
+        for item in completed.stdout.split(b"\0")
+        if item
+        if Path(candidate := os.fsdecode(item)).is_file()
+    ]
     return 0, candidates
 
 

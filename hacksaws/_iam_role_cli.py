@@ -25,12 +25,15 @@ import yaml
 from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
+from hacksaws import _audit
 from hacksaws import _duration as duration_parser
 from hacksaws import _iam_managed_policies as managed
 from hacksaws import _iam_policy_cli as policy_cli
 from hacksaws import _iam_policy_documents as documents
 from hacksaws import _iam_recovery as recovery
 from hacksaws import _iam_roles as roles
+from hacksaws import _mutation_view
+from hacksaws import _resource_input
 from hacksaws import _state
 from hacksaws._configs import EXIT_CANCELLED
 from hacksaws._configs import EXIT_USAGE
@@ -48,6 +51,7 @@ _editor_runner = subprocess.run
 _ROLE_NAME = re.compile(r"^[\w+=,.@-]{1,64}$", re.ASCII)
 _PATHLIKE = re.compile(r"^(?:[A-Za-z]:[\\/]|[.~][\\/]|.*[\\/])")
 _POLICY_EXTENSIONS = {".json", ".yaml", ".yml", ".toml"}
+_ARN_PART_COUNT = 6
 _RECOVERY_SERVICE = "iam-role"
 _CREATE_ROLE_HANDLER = "create-role-with-receipt"
 
@@ -121,13 +125,16 @@ def _add_selector_arguments(
             "--dry-run",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="Validate and show the plan without changing AWS or local state.",
+            help=(
+                "Show credential-free identity, before/after, actions, dependencies, "
+                "warnings, and confirmation without changing AWS or local state."
+            ),
         )
         safety.add_argument(
             "--yes",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="Approve the displayed plan without prompting.",
+            help="Approve the exact displayed plan without prompting.",
         )
 
 
@@ -145,17 +152,34 @@ def _leaf(
 
 
 def _duration_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--duration", "--ttl")
-    parser.add_argument("--htl")
-    parser.add_argument("--mtl")
-    parser.add_argument("--stl")
+    parser.add_argument(
+        "--duration",
+        "--ttl",
+        help="Session lifetime, such as 15m, 1hour, or 600seconds.",
+    )
+    parser.add_argument(
+        "--htl", help="Session lifetime in hours; decimals are allowed."
+    )
+    parser.add_argument(
+        "--mtl", help="Session lifetime in minutes; decimals are allowed."
+    )
+    parser.add_argument(
+        "--stl", help="Session lifetime in seconds; decimals are rounded to a second."
+    )
 
 
 def _metadata_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--metadata", choices=("nested", "sidecar", "none"), default="none"
+        "--metadata",
+        choices=("nested", "sidecar", "none"),
+        default="none",
+        help="Document metadata layout: embedded, separate sidecar, or omitted.",
     )
-    parser.add_argument("--sidecar", type=Path)
+    parser.add_argument(
+        "--sidecar",
+        type=Path,
+        help="Metadata sidecar path when --metadata=sidecar is selected.",
+    )
 
 
 def _export_arguments(parser: argparse.ArgumentParser) -> None:
@@ -261,27 +285,56 @@ def register(parser: argparse.ArgumentParser) -> None:
     attach = _leaf(
         actions, "attach", help_text="Attach or publish a role policy.", mutation=True
     )
-    attach.add_argument("role")
-    attach.add_argument("policy")
-    attach.add_argument("--inline", action="store_true")
-    attach.add_argument("--policy-name")
-    attach.add_argument("--path")
+    attach.add_argument("role", help="IAM role name or same-account role ARN.")
+    attach.add_argument(
+        "policy_input",
+        nargs="?",
+        help="Managed policy name/ARN or a local JSON/YAML/TOML policy file.",
+    )
+    attach_input = attach.add_mutually_exclusive_group()
+    attach_input.add_argument(
+        "--policy",
+        dest="policy_reference",
+        metavar="NAME_OR_ARN",
+        help="Explicit managed policy name or ARN to attach.",
+    )
+    attach_input.add_argument(
+        "--file",
+        dest="policy_file",
+        type=Path,
+        help="Explicit local policy file to publish and attach.",
+    )
+    attach.add_argument(
+        "--inline",
+        action="store_true",
+        help="Store a local policy file inline on the role instead of publishing it.",
+    )
+    attach.add_argument(
+        "--policy-name",
+        metavar="NAME",
+        help="Name derived from a local file when publishing or storing it inline.",
+    )
+    attach.add_argument(
+        "--path", help="IAM path used when publishing a local managed policy."
+    )
     _metadata_arguments(attach)
 
     detach = _leaf(
         actions, "detach", help_text="Detach a managed role policy.", mutation=True
     )
-    detach.add_argument("role")
-    detach.add_argument("policy")
+    detach.add_argument("role", help="IAM role name or same-account role ARN.")
+    detach.add_argument("policy", help="Managed policy name or ARN to detach.")
 
     adopt = _leaf(actions, "adopt", help_text="Adopt an existing role.", mutation=True)
-    adopt.add_argument("role")
-    adopt.add_argument("--owner")
-    adopt.add_argument("--audit-id")
+    adopt.add_argument("role", help="Existing IAM role name or same-account ARN.")
+    adopt.add_argument("--owner", help="Hacksaws ownership label recorded as a tag.")
+    adopt.add_argument(
+        "--audit-id", help="External audit identifier recorded as a tag."
+    )
     release = _leaf(
         actions, "release", help_text="Release a managed role.", mutation=True
     )
-    release.add_argument("role")
+    release.add_argument("role", help="Managed IAM role name or same-account ARN.")
 
     tag = _leaf(actions, "tag", help_text="Manage role tags.")
     tag_actions = tag.add_subparsers(dest="role_tag_action")
@@ -312,9 +365,21 @@ def register(parser: argparse.ArgumentParser) -> None:
     _export_arguments(inline_export)
     inline_put = inline_actions.add_parser("put")
     _add_selector_arguments(inline_put, mutation=True)
-    inline_put.add_argument("role")
-    inline_put.add_argument("policy")
-    inline_put.add_argument("file", type=Path)
+    inline_put.add_argument("role", help="IAM role name or same-account role ARN.")
+    inline_put.add_argument(
+        "policy_inputs",
+        nargs="*",
+        metavar="NAME_OR_FILE",
+        help="Inline policy name and document path, in either unambiguous order.",
+    )
+    inline_put.add_argument(
+        "--policy-name",
+        dest="explicit_policy_name",
+        help="Explicit inline policy name; use with --file to resolve ambiguity.",
+    )
+    inline_put.add_argument(
+        "--file", dest="explicit_file", type=Path, help="Explicit policy document."
+    )
     _metadata_arguments(inline_put)
     inline_edit = inline_actions.add_parser("edit")
     _add_selector_arguments(inline_edit, mutation=True)
@@ -330,10 +395,27 @@ def register(parser: argparse.ArgumentParser) -> None:
     for action in ("get", "set", "edit", "check"):
         item = trust_actions.add_parser(action)
         _add_selector_arguments(item, mutation=action in {"set", "edit"})
-        item.add_argument("role")
         if action == "set":
-            item.add_argument("file", type=Path)
+            item.add_argument(
+                "trust_inputs",
+                nargs="*",
+                metavar="ROLE_OR_FILE",
+                help="Role name/ARN and trust document, in either unambiguous order.",
+            )
+            item.add_argument(
+                "--role",
+                dest="explicit_role",
+                help="Explicit role name or ARN; use with --file to resolve ambiguity.",
+            )
+            item.add_argument(
+                "--file",
+                dest="explicit_file",
+                type=Path,
+                help="Explicit JSON/YAML/TOML trust-policy document.",
+            )
             _metadata_arguments(item)
+        else:
+            item.add_argument("role")
         if action == "check":
             item.add_argument("--probe", action="store_true")
     trust_export = trust_actions.add_parser("export")
@@ -375,6 +457,61 @@ def register(parser: argparse.ArgumentParser) -> None:
         _add_selector_arguments(group, mutation=True)
         group.add_argument("target_role")
         group.add_argument("group")
+
+
+def normalize_arguments(args: argparse.Namespace) -> None:
+    """Resolve ambiguous role mutation inputs before creating any AWS client."""
+    command = getattr(args, "role_command", None)
+    if command == "attach" and hasattr(args, "policy_input"):
+        positional = (args.policy_input,) if getattr(args, "policy_input", None) else ()
+        reference_input = _resource_input.resolve_reference_or_file(
+            positional,
+            explicit_reference=getattr(args, "policy_reference", None),
+            explicit_file=getattr(args, "policy_file", None),
+        )
+        args.policy = (
+            str(reference_input.file)
+            if reference_input.file is not None
+            else reference_input.reference
+        )
+        if reference_input.file is not None:
+            _require_local_file(reference_input.file, label="Policy")
+    elif (
+        command == "inline-policy"
+        and getattr(args, "role_inline_action", None) == "put"
+        and hasattr(args, "policy_inputs")
+    ):
+        name_file_input = _resource_input.resolve_name_file(
+            args.policy_inputs,
+            explicit_name=getattr(args, "explicit_policy_name", None),
+            explicit_file=getattr(args, "explicit_file", None),
+            name_label="POLICY_NAME",
+            name_option="--policy-name",
+        )
+        args.policy = name_file_input.name
+        args.file = name_file_input.file
+        _require_local_file(name_file_input.file, label="Inline policy")
+    elif (
+        command == "trust"
+        and getattr(args, "role_trust_action", None) == "set"
+        and hasattr(args, "trust_inputs")
+    ):
+        trust_input = _resource_input.resolve_name_file(
+            args.trust_inputs,
+            explicit_name=getattr(args, "explicit_role", None),
+            explicit_file=getattr(args, "explicit_file", None),
+            name_label="ROLE",
+            name_option="--role",
+        )
+        args.role = trust_input.name
+        args.file = trust_input.file
+        _require_local_file(trust_input.file, label="Trust policy")
+
+
+def _require_local_file(path: Path | None, *, label: str) -> None:
+    if path is None or not path.is_file():
+        message = f"{label} file {path!s} does not exist or is not a file."
+        raise OperationalError(message)
 
 
 def _service(context: IamCommandContext) -> roles.IamRoleService:
@@ -820,37 +957,274 @@ def ensure_role_recovery_handlers() -> None:
 
 
 def _preview(plan: roles.MutationPlan) -> str:
-    lines = [f"Plan: {plan.kind}", "Resources:"]
-    lines.extend(f"  - {resource}" for resource in plan.resources)
-    lines.append("AWS mutations:")
-    lines.extend(
-        f"  - {operation.client}:{operation.action}" for operation in plan.operations
+    return _mutation_view.change_text(_role_plan_view(plan))
+
+
+def _role_plan_view(plan: roles.MutationPlan) -> _mutation_view.ChangeView:
+    """Adapt an executable role plan into the shared credential-free review view."""
+    before = plan.before
+    after = plan.after
+    identity = after or before
+    resource = plan.resources[0] if plan.resources else "unknown"
+    arn = before.arn if before is not None else None
+    name = identity.name if identity is not None else resource.rsplit("/", 1)[-1]
+    if arn is None and resource.startswith("arn:") and ":role/" in resource:
+        arn = resource
+    account_id: str | None = None
+    partition: str | None = None
+    if arn is not None:
+        arn_parts = arn.split(":", 5)
+        if len(arn_parts) == _ARN_PART_COUNT:
+            partition = arn_parts[1]
+            account_id = arn_parts[4]
+    ownership: str | None = None
+    origin: str | None = None
+    if isinstance(after, roles.RoleSpec):
+        ownership = "managed"
+        origin = after.ownership_origin
+    elif isinstance(after, roles.RoleSnapshot):
+        ownership = after.ownership_status.value
+        origin = after.tags.get(roles.ORIGIN_TAG, "legacy" if after.owned else None)
+    elif before is not None:
+        ownership = before.ownership_status.value
+        origin = before.tags.get(roles.ORIGIN_TAG, "legacy" if before.owned else None)
+
+    changes = list(_state_changes(before, after))
+    changes.extend(_operation_changes(plan))
+    changes = list(dict.fromkeys(changes))
+    actions = tuple(
+        _mutation_view.ActionView(
+            operation.client,
+            operation.action,
+            _action_summary(operation, name),
+            operation.action.startswith(("delete_", "detach_", "untag_", "remove_")),
+        )
+        for operation in plan.operations
     )
-    lines.extend(f"Warning: {warning}" for warning in plan.warnings)
-    return "\n".join(lines)
+    dependencies = _role_dependencies(plan)
+    confirmation = "not required"
+    if plan.operations:
+        confirmation = (
+            f"type role name {name!r}"
+            if plan.kind == "role-delete"
+            else "type exactly 'yes'"
+        )
+    return _mutation_view.ChangeView(
+        operation=plan.kind,
+        resource_type="IAM role",
+        name=name,
+        arn=arn,
+        account_id=account_id,
+        partition=partition,
+        path=identity.path if identity is not None else None,
+        ownership=ownership,
+        origin=origin,
+        classification="planned" if plan.operations else "no-change",
+        before_exists=before is not None or plan.kind != "role-create",
+        after_exists=plan.kind != "role-delete",
+        changes=tuple(changes),
+        actions=actions,
+        dependencies=dependencies,
+        warnings=plan.warnings,
+        confirmation=confirmation,
+    )
+
+
+def _state_changes(
+    before: roles.RoleSnapshot | None,
+    after: roles.RoleSpec | roles.RoleSnapshot | None,
+) -> tuple[_mutation_view.FieldChange, ...]:
+    if before is None and after is None:
+        return ()
+    before_values = _role_state_values(before)
+    after_values = _role_state_values(after)
+    fields = tuple(dict.fromkeys((*before_values, *after_values)))
+    return tuple(
+        _mutation_view.FieldChange(
+            field, before_values.get(field), after_values.get(field)
+        )
+        for field in fields
+        if before_values.get(field) != after_values.get(field)
+    )
+
+
+def _role_state_values(
+    state: roles.RoleSpec | roles.RoleSnapshot | None,
+) -> dict[str, _mutation_view.Scalar]:
+    if state is None:
+        return {}
+    tags = dict(state.tags)
+    if isinstance(state, roles.RoleSpec):
+        tags.update(roles.ownership_tags(state))
+    values: dict[str, _mutation_view.Scalar] = {
+        "path": state.path,
+        "description": state.description,
+        "maximum session seconds": state.max_session_duration,
+        "permissions boundary": state.permissions_boundary,
+        "trust document SHA-256": roles.document_hash(state.trust),
+        "tags": ", ".join(
+            f"{key}=sha256:{_state.digest(tags[key].encode('utf-8'))}"
+            for key in sorted(tags)
+        ),
+    }
+    if isinstance(state, roles.RoleSnapshot):
+        values.update(
+            {
+                "attached policies": ", ".join(sorted(state.attached_policies)),
+                "inline policies": ", ".join(sorted(state.inline_policies)),
+                "instance profiles": ", ".join(sorted(state.instance_profiles)),
+            }
+        )
+    return values
+
+
+def _operation_changes(
+    plan: roles.MutationPlan,
+) -> tuple[_mutation_view.FieldChange, ...]:
+    """Expose exact scalar operation effects when a plan has no typed snapshots."""
+    changes: list[_mutation_view.FieldChange] = []
+    for operation in plan.operations:
+        params = operation.params
+        action = operation.action
+        if action in {"attach_role_policy", "detach_role_policy"}:
+            policy = str(params.get("PolicyArn", "unknown"))
+            changes.append(
+                _mutation_view.FieldChange(
+                    f"attached policy {policy}",
+                    action == "detach_role_policy",
+                    action == "attach_role_policy",
+                )
+            )
+        elif action in {"put_role_policy", "delete_role_policy"}:
+            policy = str(params.get("PolicyName", "unknown"))
+            changes.append(
+                _mutation_view.FieldChange(
+                    f"inline policy {policy}",
+                    action == "delete_role_policy",
+                    action == "put_role_policy",
+                )
+            )
+        elif action == "update_assume_role_policy":
+            document = params.get("PolicyDocument")
+            digest = (
+                roles.document_hash(json.loads(document))
+                if isinstance(document, str)
+                else "updated"
+            )
+            changes.append(
+                _mutation_view.FieldChange(
+                    "trust document SHA-256", plan.expected.get("trust"), digest
+                )
+            )
+        elif action == "tag_role":
+            for item in params.get("Tags", []):
+                if isinstance(item, Mapping):
+                    key = str(item.get("Key", "unknown"))
+                    changes.append(
+                        _mutation_view.FieldChange(
+                            f"tag {key} value SHA-256",
+                            None,
+                            _state.digest(str(item.get("Value", "")).encode("utf-8")),
+                        )
+                    )
+        elif action == "untag_role":
+            changes.extend(
+                _mutation_view.FieldChange(f"tag {key}", "set", None)
+                for key in params.get("TagKeys", [])
+            )
+    return tuple(changes)
+
+
+def _action_summary(operation: roles.Operation, role_name: str) -> str:
+    label = operation.action.replace("_", " ")
+    params = operation.params
+    target = next(
+        (
+            str(params[key])
+            for key in (
+                "PolicyArn",
+                "PolicyName",
+                "GroupName",
+                "UserName",
+                "InstanceProfileName",
+            )
+            if params.get(key)
+        ),
+        role_name,
+    )
+    return f"{label} for {target}"
+
+
+def _role_dependencies(
+    plan: roles.MutationPlan,
+) -> tuple[_mutation_view.DependencyView, ...]:
+    dependencies: list[_mutation_view.DependencyView] = []
+    before = plan.before
+    if before is not None:
+        treatment = (
+            "removed before role deletion"
+            if plan.kind == "role-delete"
+            else "preserved"
+        )
+        dependencies.extend(
+            _mutation_view.DependencyView("attached policy", item, treatment)
+            for item in before.attached_policies
+        )
+        dependencies.extend(
+            _mutation_view.DependencyView("inline policy", item, treatment)
+            for item in before.inline_policies
+        )
+        dependencies.extend(
+            _mutation_view.DependencyView("instance profile", item, treatment)
+            for item in before.instance_profiles
+        )
+        if before.permissions_boundary:
+            dependencies.append(
+                _mutation_view.DependencyView(
+                    "permissions boundary", before.permissions_boundary, treatment
+                )
+            )
+    dependencies.extend(
+        _mutation_view.DependencyView("related resource", item, "used by this plan")
+        for item in plan.resources[1:]
+    )
+    return tuple(dependencies)
 
 
 ensure_role_recovery_handlers()
 
 
 def _confirm_plan(args: argparse.Namespace, plan: roles.MutationPlan) -> bool:
-    if not plan.operations or bool(getattr(args, "yes", False)):
+    if not plan.operations:
+        return True
+    if bool(getattr(args, "yes", False)):
+        _audit.note_confirmation("yes-flag", "bypassed")
         return True
     if bool(getattr(args, "json", False)) or not sys.stdin.isatty():
+        if plan.kind == "role-delete":
+            _audit.note_confirmation("resource-name", "unavailable")
+        else:
+            _audit.note_confirmation("exact-yes", "unavailable")
         return False
     if plan.kind == "role-delete":
         role_name = plan.resources[0].rsplit("/", maxsplit=1)[-1]
-        return (
+        accepted = (
             _input(
                 f"{_preview(plan)}\nType the role name {role_name!r} to confirm the "
                 "irreversible delete commit: "
             ).strip()
             == role_name
         )
-    return (
+        _audit.note_confirmation(
+            "resource-name", "accepted" if accepted else "declined"
+        )
+        return accepted
+    accepted = (
         _input(f"{_preview(plan)}\nType 'yes' to apply this exact plan: ").strip()
         == "yes"
     )
+    _audit.note_confirmation("exact-yes", "accepted" if accepted else "declined")
+    return accepted
 
 
 def _assert_preconditions(plan: roles.MutationPlan, context: IamCommandContext) -> None:
@@ -907,6 +1281,7 @@ def _execute(
     args: argparse.Namespace,
 ) -> recovery.IamJournal | None:
     plan = _materialize_managed_operations(plan, context)
+    args._mutation_plan = plan  # noqa: SLF001
     if bool(getattr(args, "dry_run", False)):
         raise _DryRunCompletedError(plan)
     if not _confirm_plan(args, plan):
@@ -944,6 +1319,7 @@ def _execute(
         plan.kind,
         partition=context.partition,
     )
+    args._mutation_journal_id = journal.id  # noqa: SLF001
     for handler, forward, compensation in prepared:
         journal.record_before_mutation(
             handler, forward=forward, compensation=compensation
@@ -1996,8 +2372,46 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
         if current is None:
             plan = roles.plan_create_role(spec)
         else:
+            if current.ownership_status is roles.OwnershipStatus.UNOWNED:
+                warning = (
+                    "The existing role is not Hacksaws-owned; adopt it before "
+                    "requesting managed changes."
+                )
+                args._mutation_plan = roles.MutationPlan(  # noqa: SLF001
+                    "role-create",
+                    (current.arn,),
+                    (),
+                    before=current,
+                    after=spec,
+                    warnings=(warning,),
+                )
+                return Result(
+                    "IAM_ROLE_COLLISION",
+                    f"CONFLICT — IAM role {role_name} already exists but is not "
+                    "Hacksaws-owned. Review it and run 'iam role adopt' first; "
+                    "--replace never adopts or rewrites ownership identity.",
+                    EXIT_USAGE,
+                    "stderr",
+                    {
+                        "classification": "conflict",
+                        "role": role_name,
+                        "arn": current.arn,
+                    },
+                )
+            if current.ownership_status is roles.OwnershipStatus.UNSAFE:
+                raise OperationalError(
+                    f"Role {role_name!r} has conflicting or partial Hacksaws "
+                    "ownership tags; repair or release them explicitly."
+                )
+            spec = replace(
+                spec,
+                owner=current.tags[roles.OWNER_TAG],
+                audit_id=current.tags.get(roles.AUDIT_TAG),
+                ownership_origin=current.tags.get(roles.ORIGIN_TAG, "legacy"),
+            )
             plan = roles.plan_update_role(current, spec)
             if not plan.operations:
+                args._mutation_plan = plan  # noqa: SLF001
                 return Result(
                     "IAM_ROLE_NO_CHANGE",
                     f"NO CHANGE — IAM role {role_name} already matches {current.arn}.",
@@ -2008,7 +2422,10 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
                         "roleId": current.role_id,
                     },
                 )
-            if not args.replace:
+            tag_actions = {"tag_role", "untag_role"}
+            tag_only = all(item.action in tag_actions for item in plan.operations)
+            if not args.replace and not tag_only:
+                args._mutation_plan = plan  # noqa: SLF001
                 return Result(
                     "IAM_ROLE_COLLISION",
                     f"CONFLICT — IAM role {role_name} already exists and differs. "
@@ -2062,9 +2479,14 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
         )
     if command == "update":
         current = service.get_role(_role_name(args.role, context))
-        if current.tags.get(roles.MANAGED_TAG) != "true":
+        if current.ownership_status is roles.OwnershipStatus.UNOWNED:
             raise OperationalError(
                 "Role is not Hacksaws-owned; adopt it before updating managed fields."
+            )
+        if current.ownership_status is roles.OwnershipStatus.UNSAFE:
+            raise OperationalError(
+                "Role has conflicting or partial Hacksaws ownership tags; repair or "
+                "release them before updating managed fields."
             )
         description = (
             None
@@ -2095,11 +2517,17 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
             tags={
                 key: value
                 for key, value in current.tags.items()
-                if key not in {roles.MANAGED_TAG, roles.OWNER_TAG, roles.AUDIT_TAG}
+                if key
+                not in {
+                    roles.MANAGED_TAG,
+                    roles.OWNER_TAG,
+                    roles.AUDIT_TAG,
+                    roles.ORIGIN_TAG,
+                }
             },
             owner=current.tags.get(roles.OWNER_TAG, "hacksaws"),
             audit_id=current.tags.get(roles.AUDIT_TAG),
-            ownership_origin=current.tags.get(roles.ORIGIN_TAG, "created"),
+            ownership_origin=current.tags.get(roles.ORIGIN_TAG, "legacy"),
         )
         plan = roles.plan_update_role(current, desired)
         _execute(plan, context, args)
@@ -2123,6 +2551,7 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
             remove_from_instance_profiles=args.remove_from_instance_profiles,
             allow_unmanaged=args.unmanaged,
         )
+        plan = replace(plan, before=current)
         _execute(plan, context, args)
         return Result(
             "IAM_ROLE_DELETED",
@@ -2173,6 +2602,23 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
                 else roles.plan_detach_policy(role_name, arn, current=current_role)
             )
             reference = arn
+        attached = set(current_role.attached_policies)
+        inline_names = set(current_role.inline_policies)
+        if command == "attach" and getattr(args, "inline", False):
+            inline_names.add(str(args.policy_name or Path(args.policy).stem))
+        elif command == "attach":
+            attached.add(reference)
+        else:
+            attached.discard(reference)
+        plan = replace(
+            plan,
+            before=current_role,
+            after=replace(
+                current_role,
+                attached_policies=tuple(sorted(attached)),
+                inline_policies=tuple(sorted(inline_names)),
+            ),
+        )
         _execute(plan, context, args)
         return Result(
             f"IAM_ROLE_POLICY_{command.upper()}",
@@ -2189,6 +2635,7 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
                 "IAM_ROLE_TAG_LIST", _mapping_text(values), data={"tags": values}
             )
         if action == "set":
+            desired_tags = {**current_role.tags, **_parse_tags(args.tags)}
             plan = roles.plan_put_tags(
                 role_name,
                 _parse_tags(args.tags),
@@ -2206,6 +2653,16 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
                 current=current_role.tags,
                 expected_role=current_role,
             )
+            desired_tags = {
+                key: value
+                for key, value in current_role.tags.items()
+                if key not in args.keys
+            }
+        plan = replace(
+            plan,
+            before=current_role,
+            after=replace(current_role, tags=desired_tags),
+        )
         _execute(plan, context, args)
         return Result(
             "IAM_ROLE_TAG_MUTATED",
@@ -2223,6 +2680,25 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
             if command == "adopt"
             else roles.plan_release_role(current)
         )
+        if command == "release":
+            protected = {
+                roles.MANAGED_TAG,
+                roles.OWNER_TAG,
+                roles.AUDIT_TAG,
+                roles.ORIGIN_TAG,
+            }
+            plan = replace(
+                plan,
+                before=current,
+                after=replace(
+                    current,
+                    tags={
+                        key: value
+                        for key, value in current.tags.items()
+                        if key not in protected
+                    },
+                ),
+            )
         _execute(plan, context, args)
         return Result(
             "IAM_ROLE_OWNERSHIP",
@@ -2250,12 +2726,18 @@ def _dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | 
 def dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | None:
     """Dispatch a parsed role leaf and normalize expected operational failures."""
     try:
-        return _dispatch(args, context)
+        normalize_arguments(args)
+        result = _dispatch(args, context)
+        if result is None:
+            return None
+        plan = getattr(args, "_mutation_plan", None)
+        return _present_role_result(result, plan, args, context)
     except _DryRunCompletedError as completed:
         plan = completed.plan
+        view = _role_plan_view(plan)
         data = {
             "dryRun": True,
-            "classification": "planned" if plan.operations else "no-change",
+            "classification": view.classification,
             "kind": plan.kind,
             "resources": list(plan.resources),
             "operations": [
@@ -2263,23 +2745,111 @@ def dispatch(args: argparse.Namespace, context: IamCommandContext) -> Result | N
                 for item in plan.operations
             ],
             "warnings": list(plan.warnings),
+            "plan": _mutation_view.change_data(view),
         }
         return Result(
             "IAM_ROLE_DRY_RUN",
-            f"DRY RUN — {_preview(plan)}\nNo AWS or local state was changed.",
+            f"DRY RUN\n\n{_mutation_view.change_text(view)}\n\n"
+            "No AWS or local state changed.",
             data=data,
         )
     except _MutationCancelledError as error:
-        return Result(
+        result = Result(
             "IAM_ROLE_MUTATION_CANCELLED",
             f"Mutation cancelled; no AWS changes were made.\n{error}",
             EXIT_CANCELLED,
             "stderr",
             {"preview": str(error)},
         )
+        plan = getattr(args, "_mutation_plan", None)
+        return _present_role_result(result, plan, args, context)
     except OperationalError:
         raise
     except (roles.IamRoleError, documents.PolicyInputError) as error:
         raise OperationalError(str(error)) from error
     except (BotoCoreError, ClientError) as error:
         raise OperationalError(f"AWS IAM role operation failed: {error}") from error
+
+
+def _present_role_result(
+    result: Result,
+    plan: roles.MutationPlan | None,
+    args: argparse.Namespace,
+    context: IamCommandContext,
+) -> Result:
+    """Render every mutating role result through the shared stable contract."""
+    if plan is None:
+        return result
+    plan_view = _role_plan_view(plan)
+    classification = _result_classification(result, plan)
+    old_data = result.data if isinstance(result.data, Mapping) else {}
+    arn_value = old_data.get("arn") or old_data.get("role") or plan_view.arn
+    arn = (
+        str(arn_value)
+        if isinstance(arn_value, str) and arn_value.startswith("arn:")
+        else plan_view.arn
+    )
+    role_id_value = old_data.get("roleId")
+    resource_id = str(role_id_value) if role_id_value else None
+    console_value = old_data.get("consoleUrl")
+    console_url = (
+        str(console_value)
+        if isinstance(console_value, str)
+        else _console_url(context, plan_view.name)
+    )
+    warning_value = old_data.get("warning")
+    warnings = tuple(
+        (*plan.warnings, str(warning_value)) if warning_value else plan.warnings
+    )
+    view = _mutation_view.MutationResultView(
+        classification=classification,
+        resource_type=plan_view.resource_type,
+        name=plan_view.name,
+        arn=arn,
+        resource_id=resource_id,
+        console_url=console_url,
+        journal_id=getattr(args, "_mutation_journal_id", None),
+        applied_actions=(
+            ()
+            if classification in {"cancelled", "conflict", "no-change"}
+            else tuple(
+                f"{operation.client}:{operation.action}"
+                for operation in plan.operations
+            )
+        ),
+        warnings=warnings,
+        plan=plan_view,
+        details={"resultCode": result.code},
+    )
+    return Result(
+        result.code,
+        _mutation_view.result_text(view),
+        result.exit_code,
+        result.stream,
+        _mutation_view.result_data(view),
+        result.details,
+        result.repairs,
+        result.kind,
+    )
+
+
+def _result_classification(
+    result: Result, plan: roles.MutationPlan
+) -> _mutation_view.Classification:
+    code = result.code
+    if "COLLISION" in code:
+        return "conflict"
+    if "CANCELLED" in code:
+        return "cancelled"
+    if not plan.operations or "NO_CHANGE" in code:
+        return "no-change"
+    if "CREATED" in code:
+        return "created"
+    if "DELETED" in code:
+        return "deleted"
+    if any(
+        token in code
+        for token in ("UPDATED", "REPLACED", "MUTATED", "POLICY_", "OWNERSHIP")
+    ):
+        return "updated"
+    return "applied"

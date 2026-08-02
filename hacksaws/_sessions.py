@@ -121,45 +121,14 @@ def _restore(snapshot: dict[str, Any]) -> None:
         path.unlink(missing_ok=True)
 
 
-def _begin(
-    paths: list[Path], *, cache_roots: list[Path] | None = None
-) -> dict[str, Any]:
-    cache_snapshots = []
-    for cache_root in cache_roots or []:
-        root_exists = cache_root.exists()
-        existing = (
-            [
-                _snapshot(path.absolute())
-                for path in cache_root.rglob("*")
-                if path.is_file()
-            ]
-            if cache_root.exists()
-            else []
-        )
-        directories = (
-            [
-                str(path.absolute())
-                for path in [cache_root, *cache_root.rglob("*")]
-                if path.is_dir()
-            ]
-            if root_exists
-            else []
-        )
-        cache_snapshots.append(
-            {
-                "root": str(cache_root.absolute()),
-                "root_exists": root_exists,
-                "directories": directories,
-                "files": existing,
-            }
-        )
+def _begin(paths: list[Path]) -> dict[str, Any]:
     journal = {
         "schema_version": 1,
         "started_at": _state.iso_now(),
         "files": [_snapshot(path) for path in paths],
         "safe_to_rollback": True,
         "ecr_created": [],
-        "cache_snapshots": cache_snapshots,
+        "browser_cache_claims": [],
     }
     _state.atomic_write(
         _journal_path(), (json.dumps(journal, indent=2) + "\n").encode()
@@ -187,39 +156,11 @@ def _rollback(journal: dict[str, Any]) -> None:
                 )
             except _configs.OperationalError as error:
                 failures.append(f"ECR {registry}: {error}")
-    for snapshot in journal.get("cache_snapshots", []):
-        cache_root = Path(snapshot["root"]).absolute()
-        before = {item["path"] for item in snapshot.get("files", [])}
-        if cache_root.exists():
-            for cache_file in cache_root.rglob("*"):
-                if cache_file.is_file() and str(cache_file.absolute()) not in before:
-                    try:
-                        cache_file.unlink()
-                    except OSError as error:
-                        failures.append(f"cache {cache_file}: {error}")
-        for cache_file_snapshot in snapshot.get("files", []):
-            try:
-                _restore(cache_file_snapshot)
-            except OSError as error:
-                failures.append(f"cache {cache_file_snapshot['path']}: {error}")
-        before_directories = {
-            str(Path(value).absolute()) for value in snapshot.get("directories", [])
-        }
-        if "directories" in snapshot and cache_root.exists():
-            current_directories = sorted(
-                (path for path in cache_root.rglob("*") if path.is_dir()),
-                key=lambda path: len(path.parts),
-                reverse=True,
-            )
-            if not snapshot.get("root_exists", True):
-                current_directories.append(cache_root)
-            for directory in current_directories:
-                if str(directory.absolute()) in before_directories:
-                    continue
-                try:
-                    directory.rmdir()
-                except OSError as error:
-                    failures.append(f"cache directory {directory}: {error}")
+    for claim in journal.get("browser_cache_claims", []):
+        try:
+            _remove_browser_cache_claim(claim, strict=True)
+        except _configs.OperationalError as error:
+            failures.append(str(error))
     for snapshot in reversed(journal["files"]):
         try:
             _restore(snapshot)
@@ -260,31 +201,199 @@ def _commit() -> None:
     _journal_path().unlink(missing_ok=True)
 
 
-def _changed_cache_files(snapshot: dict[str, Any]) -> list[str]:
-    """Return cache files created or changed by the current transaction."""
-    cache_root = Path(snapshot["root"]).absolute()
-    before = {
-        item["path"]: base64.b64decode(item["data"])
-        for item in snapshot.get("files", [])
-    }
-    if not cache_root.exists():
-        return []
-    changed = []
-    for path in cache_root.rglob("*"):
-        if not path.is_file():
-            continue
-        absolute = str(path.absolute())
-        if absolute not in before or path.read_bytes() != before[absolute]:
-            changed.append(absolute)
-    return sorted(changed)
+def _canonical_path(path: Path) -> Path:
+    """Return one stable absolute path without requiring the target to exist."""
+    return path.expanduser().resolve(strict=False)
 
 
-def _cache_fingerprints(paths: list[str]) -> dict[str, str]:
-    """Fingerprint tracked cache content so logout cannot remove replacements."""
+def _lineage_hash(value: str) -> str:
+    """Hash a normalized, high-entropy lineage component without retaining it."""
+    return _state.digest(value.strip().encode("utf-8"))
+
+
+def _dpop_generation_hash(value: str) -> str:
+    """Hash the DER payload so PEM whitespace cannot create a false generation."""
+    payload = "".join(
+        line.strip()
+        for line in value.splitlines()
+        if not line.strip().startswith("-----BEGIN")
+        and not line.strip().startswith("-----END")
+    )
+    return _lineage_hash(payload)
+
+
+def _login_session_value(config: Path, profile: str) -> str:
+    parser = _read_ini(config)
+    section = _section(profile, config=True)
+    value = parser.get(section, "login_session", fallback="").strip()
+    if not value:
+        raise _configs.OperationalError(
+            f"Browser profile {profile!r} has no login_session after AWS login."
+        )
+    return value
+
+
+def _browser_cache_lineage(
+    config: Path,
+    profile: str,
+    root: Path,
+    *,
+    identity: tuple[str, str, str] | None = None,
+) -> dict[str, Any]:
+    """Describe one AWS login cache generation without retaining token material."""
+    canonical_root = _canonical_path(root)
+    login_session = _login_session_value(config, profile)
+    cache_key = _state.digest(login_session.encode("utf-8"))
+    path = _canonical_path(canonical_root / f"{cache_key}.json")
+    if path.parent != canonical_root:
+        raise _configs.OperationalError("Derived browser cache path escaped its root.")
+    content = _browser_cache_content_lineage(path, identity=identity)
     return {
-        str(Path(value).absolute()): _state.digest(Path(value).read_bytes())
-        for value in paths
+        "schema_version": 1,
+        "root": str(canonical_root),
+        "path": str(path),
+        "cache_key": cache_key,
+        "login_session_hash": _lineage_hash(login_session),
+        **content,
     }
+
+
+def _browser_cache_content_lineage(
+    path: Path, *, identity: tuple[str, str, str] | None = None
+) -> dict[str, Any]:
+    """Read stable generation fields from one already-derived cache path."""
+    try:
+        raw = path.read_bytes()
+        token = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise _configs.OperationalError(
+            f"Unable to read the derived AWS browser login cache {path}: {error}"
+        ) from error
+    if not isinstance(token, dict):
+        raise _configs.OperationalError("AWS browser login cache is not a JSON object.")
+    client_id = token.get("clientId")
+    dpop_key = token.get("dpopKey")
+    access_token = token.get("accessToken")
+    if (
+        not isinstance(client_id, str)
+        or not isinstance(dpop_key, str)
+        or not isinstance(access_token, dict)
+    ):
+        raise _configs.OperationalError(
+            "AWS browser login cache is missing stable lineage fields."
+        )
+    token_account = str(access_token.get("accountId", "")).strip()
+    if identity is None:
+        account = token_account
+        partition = ""
+        principal = ""
+    else:
+        account, partition, principal = identity
+        if token_account and token_account != account:
+            raise _configs.OperationalError(
+                "AWS browser cache account does not match GetCallerIdentity."
+            )
+    return {
+        "client_id_hash": _lineage_hash(client_id),
+        "dpop_generation_hash": _dpop_generation_hash(dpop_key),
+        "account": account,
+        "partition": partition,
+        "principal": principal,
+        "whole_digest": _state.digest(raw),
+    }
+
+
+_BROWSER_STABLE_LINEAGE = (
+    "root",
+    "path",
+    "cache_key",
+    "login_session_hash",
+    "client_id_hash",
+    "dpop_generation_hash",
+)
+
+
+def _same_browser_lineage(expected: dict[str, Any], current: dict[str, Any]) -> bool:
+    return all(expected.get(key) == current.get(key) for key in _BROWSER_STABLE_LINEAGE)
+
+
+def _record_browser_cache_claim(
+    journal: dict[str, Any], lineage: dict[str, Any], config: Path, profile: str
+) -> None:
+    claim = {
+        **lineage,
+        "config": str(_canonical_path(config)),
+        "profile": profile,
+    }
+    journal.setdefault("browser_cache_claims", []).append(claim)
+    _state.atomic_write(
+        _journal_path(), (json.dumps(journal, indent=2) + "\n").encode()
+    )
+
+
+def _current_browser_cache_claim(claim: dict[str, Any]) -> dict[str, Any]:
+    identity = None
+    if all(claim.get(key) for key in ("account", "partition", "principal")):
+        identity = (
+            str(claim["account"]),
+            str(claim["partition"]),
+            str(claim["principal"]),
+        )
+    return _browser_cache_lineage(
+        Path(str(claim["config"])),
+        str(claim["profile"]),
+        Path(str(claim["root"])),
+        identity=identity,
+    )
+
+
+def _current_browser_cache_content(claim: dict[str, Any]) -> dict[str, Any]:
+    """Re-read a claimed file after its profile config may have been removed."""
+    path = _canonical_path(Path(str(claim["path"])))
+    identity = None
+    if all(claim.get(key) for key in ("account", "partition", "principal")):
+        identity = (
+            str(claim["account"]),
+            str(claim["partition"]),
+            str(claim["principal"]),
+        )
+    return {
+        **{key: claim.get(key) for key in _BROWSER_STABLE_LINEAGE[:4]},
+        **_browser_cache_content_lineage(path, identity=identity),
+    }
+
+
+def _remove_browser_cache_claim(
+    claim: dict[str, Any], *, strict: bool
+) -> dict[str, str] | None:
+    path = _canonical_path(Path(str(claim["path"])))
+    if not path.exists():
+        return None
+    try:
+        current = _current_browser_cache_claim(claim)
+    except _configs.OperationalError as error:
+        if strict:
+            raise
+        return {"path": str(path), "reason": str(error)}
+    if not _same_browser_lineage(claim, current):
+        reason = "browser cache belongs to a different login generation"
+        if strict:
+            raise _configs.OperationalError(f"{reason}: {path}")
+        return {"path": str(path), "reason": reason}
+    expected_digest = current.get("whole_digest")
+    try:
+        if _state.digest(path.read_bytes()) != expected_digest:
+            raise _configs.OperationalError(
+                f"Browser cache changed during compare-and-delete: {path}"
+            )
+        path.unlink()
+    except OSError as error:
+        if strict:
+            raise _configs.OperationalError(
+                f"Unable to remove browser cache {path}: {error}"
+            ) from error
+        return {"path": str(path), "reason": f"remove failed: {error}"}
+    return None
 
 
 def _read_ini(path: Path) -> configparser.ConfigParser:
@@ -788,37 +897,38 @@ def _record(
     else:
         original_backup = destination_backup if retain_file_backup else []
     previous_ecr = previous.get("ecr", []) if previous and inherit_runtime_state else []
-    previous_cache = (
-        previous.get("login_cache_files", [])
-        if previous and inherit_runtime_state
-        else []
-    )
-    current_cache = metadata.get("login_cache_files", [])
-    if previous_cache or current_cache:
-        metadata["login_cache_files"] = list(
-            dict.fromkeys([*previous_cache, *current_cache])
+    if "login_cache_lineage" not in metadata:
+        previous_cache = (
+            previous.get("login_cache_files", [])
+            if previous and inherit_runtime_state
+            else []
         )
-    previous_cache_directories = (
-        previous.get("login_cache_directories", [])
-        if previous and inherit_runtime_state
-        else []
-    )
-    current_cache_directories = metadata.get("login_cache_directories", [])
-    if previous_cache_directories or current_cache_directories:
-        metadata["login_cache_directories"] = list(
-            dict.fromkeys([*previous_cache_directories, *current_cache_directories])
+        current_cache = metadata.get("login_cache_files", [])
+        if previous_cache or current_cache:
+            metadata["login_cache_files"] = list(
+                dict.fromkeys([*previous_cache, *current_cache])
+            )
+        previous_cache_directories = (
+            previous.get("login_cache_directories", [])
+            if previous and inherit_runtime_state
+            else []
         )
-    previous_fingerprints = (
-        previous.get("login_cache_fingerprints", {})
-        if previous and inherit_runtime_state
-        else {}
-    )
-    current_fingerprints = metadata.get("login_cache_fingerprints", {})
-    if previous_fingerprints or current_fingerprints:
-        metadata["login_cache_fingerprints"] = {
-            **previous_fingerprints,
-            **current_fingerprints,
-        }
+        current_cache_directories = metadata.get("login_cache_directories", [])
+        if previous_cache_directories or current_cache_directories:
+            metadata["login_cache_directories"] = list(
+                dict.fromkeys([*previous_cache_directories, *current_cache_directories])
+            )
+        previous_fingerprints = (
+            previous.get("login_cache_fingerprints", {})
+            if previous and inherit_runtime_state
+            else {}
+        )
+        current_fingerprints = metadata.get("login_cache_fingerprints", {})
+        if previous_fingerprints or current_fingerprints:
+            metadata["login_cache_fingerprints"] = {
+                **previous_fingerprints,
+                **current_fingerprints,
+            }
     sessions[key] = {
         **metadata,
         "destination": str(destination.absolute()),
@@ -1168,8 +1278,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 destination_dir / "config",
                 destination_dir / "credentials",
                 _state.sessions_path(),
-            ],
-            cache_roots=[native_cache],
+            ]
         )
         ecr_registries: list[str] = []
         login_completed = False
@@ -1182,13 +1291,34 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 login_cache=native_cache,
             )
             login_completed = True
+            initial_lineage = _browser_cache_lineage(
+                destination_dir / "config",
+                destination_profile,
+                native_cache,
+            )
+            _record_browser_cache_claim(
+                journal,
+                initial_lineage,
+                destination_dir / "config",
+                destination_profile,
+            )
             with _aws_environment(
                 destination_dir / "config",
                 destination_dir / "credentials",
                 native_cache,
             ):
                 native = boto3.Session(profile_name=destination_profile)
-                account, partition, _ = _identity(native, label="browser login")
+                account, partition, principal = _identity(native, label="browser login")
+            lineage = _browser_cache_lineage(
+                destination_dir / "config",
+                destination_profile,
+                native_cache,
+                identity=(account, partition, principal),
+            )
+            journal["browser_cache_claims"][-1].update(lineage)
+            _state.atomic_write(
+                _journal_path(), (json.dumps(journal, indent=2) + "\n").encode()
+            )
             target = _target_details(args, account, partition)
             if args.ecr:
                 aws_account = _configs.AwsAccount(
@@ -1207,7 +1337,6 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                         journal, context.container_engine, registry
                     ),
                 )
-            changed_cache = _changed_cache_files(journal["cache_snapshots"][0])
             _record(
                 destination_dir,
                 destination_profile,
@@ -1222,9 +1351,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                     "policy": None,
                     "policy_provenance": "AWS-native login_session",
                     "expires_at": None,
-                    "login_cache_files": changed_cache,
-                    "login_cache_directories": [str(native_cache.absolute())],
-                    "login_cache_fingerprints": _cache_fingerprints(changed_cache),
+                    "login_cache_lineage": lineage,
                 },
                 journal,
                 method="browser-native",
@@ -1254,8 +1381,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             destination_dir / "config",
             destination_dir / "credentials",
             _state.sessions_path(),
-        ],
-        cache_roots=[staging],
+        ]
     )
     ecr_registries = []
     login_completed = False
@@ -1268,10 +1394,26 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             login_cache=staging_cache,
         )
         login_completed = True
+        initial_lineage = _browser_cache_lineage(
+            staging_config, source_profile, staging_cache
+        )
+        _record_browser_cache_claim(
+            journal, initial_lineage, staging_config, source_profile
+        )
         with _aws_environment(staging_config, staging_credentials, staging_cache):
             intermediate = boto3.Session(profile_name=source_profile)
-            source_account, partition, _ = _identity(
+            source_account, partition, source_principal = _identity(
                 intermediate, label="browser staging login"
+            )
+            lineage = _browser_cache_lineage(
+                staging_config,
+                source_profile,
+                staging_cache,
+                identity=(source_account, partition, source_principal),
+            )
+            journal["browser_cache_claims"][-1].update(lineage)
+            _state.atomic_write(
+                _journal_path(), (json.dumps(journal, indent=2) + "\n").encode()
             )
             target = _target_details(args, source_account, partition)
             role, policy, external_id, boundary_name = _role_details(
@@ -1334,6 +1476,8 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             ecr=ecr_registries,
             ecr_engine=context.container_engine if ecr_registries else None,
         )
+        _remove_browser_cache_claim(journal["browser_cache_claims"][-1], strict=True)
+        journal["browser_cache_claims"] = []
         _commit()
     except Exception as error:
         _rollback(journal)
@@ -1478,25 +1622,40 @@ def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
         )
     force = bool(getattr(args, "force", False))
     source_plans: list[tuple[Path, str, dict[str, Any]]] = []
-    source_cache: tuple[list[Path], list[Path], list[dict[str, str]]] = ([], [], [])
-    if source_record and not keep_source:
-        source_plans = _profile_section_plans(
+    source_cache: tuple[
+        list[Path], list[dict[str, Any]], list[dict[str, str]], dict[str, Any] | None
+    ] = ([], [], [], None)
+    if source_record:
+        if not keep_source:
+            source_plans = _profile_section_plans(
+                source_record, source, source_profile, force=force
+            )
+        source_cache = _tracked_login_cache_plan(
             source_record, source, source_profile, force=force
         )
-        source_cache = _tracked_login_cache_plan(source_record, source, force=force)
+        if keep_source:
+            source_cache = (
+                source_cache[0],
+                [],
+                source_cache[2],
+                source_cache[3],
+            )
 
     destination_record = sessions.get(destination_key)
-    destination_cache: tuple[list[Path], list[Path], list[dict[str, str]]] = (
+    destination_cache: tuple[
+        list[Path], list[dict[str, Any]], list[dict[str, str]], dict[str, Any] | None
+    ] = (
         [],
         [],
         [],
+        None,
     )
     if destination_record and not same_key:
         _profile_section_plans(
             destination_record, destination, destination_profile, force=False
         )
         destination_cache = _tracked_login_cache_plan(
-            destination_record, destination, force=False
+            destination_record, destination, destination_profile, force=False
         )
     destination_exists = _profile_exists(destination, destination_profile)
     if (
@@ -1511,7 +1670,12 @@ def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
         )
 
     if source_record:
-        configured = source_record.get("login_cache_directories", [])
+        stored_lineage = source_record.get("login_cache_lineage")
+        configured = (
+            [stored_lineage["root"]]
+            if isinstance(stored_lineage, dict) and stored_lineage.get("root")
+            else source_record.get("login_cache_directories", [])
+        )
         source_login_cache = (
             Path(str(configured[0])).absolute() if configured else _native_login_cache()
         )
@@ -1652,13 +1816,11 @@ def _assume_arguments_fingerprint(args: Any) -> str:
 
 
 def _owned_cache_state(plan: dict[str, Any]) -> dict[str, str | None]:
-    paths = [*plan["source_cache"][1], *plan["destination_cache"][1]]
+    claims = [*plan["source_cache"][1], *plan["destination_cache"][1]]
     result: dict[str, str | None] = {}
-    for path in paths:
-        absolute = path.absolute()
-        result[str(absolute)] = (
-            _state.digest(absolute.read_bytes()) if absolute.exists() else None
-        )
+    for claim in claims:
+        path = _canonical_path(Path(str(claim["path"])))
+        result[str(path)] = _state.digest(path.read_bytes()) if path.exists() else None
     return result
 
 
@@ -1866,7 +2028,32 @@ def _revalidate_assume_plan(
             ),
         }
         changed = changed or current != data[f"{prefix}_expected"]
-    changed = changed or _owned_cache_state(data) != data["cache_expected"]
+    if _owned_cache_state(data) != data["cache_expected"]:
+        source_record = data.get("source_record")
+        if source_record:
+            source_cache = _tracked_login_cache_plan(
+                source_record,
+                data["source"],
+                data["source_profile"],
+                force=False,
+            )
+            if data["keep_source"]:
+                source_cache = (
+                    source_cache[0],
+                    [],
+                    source_cache[2],
+                    source_cache[3],
+                )
+            data["source_cache"] = source_cache
+        destination_record = data.get("destination_record")
+        if destination_record and not data["same_key"]:
+            data["destination_cache"] = _tracked_login_cache_plan(
+                destination_record,
+                data["destination"],
+                data["destination_profile"],
+                force=False,
+            )
+        data["cache_expected"] = _owned_cache_state(data)
     changed = (
         changed
         or _file_fingerprint(_state.root() / "config.json")
@@ -1988,8 +2175,12 @@ def _build_assume_journal(
         "ecr_engine": inherited_engine if inherited_ecr else None,
     }
     cache = [
-        {"path": path, "fingerprint": fingerprint}
-        for path, fingerprint in data["cache_expected"].items()
+        {**copy.deepcopy(claim), "owner": owner}
+        for owner, claims in (
+            ("source", data["source_cache"][1]),
+            ("destination", data["destination_cache"][1]),
+        )
+        for claim in claims
     ]
     source_record = data["source_record"] or {}
     source_runtime = {
@@ -2000,7 +2191,19 @@ def _build_assume_journal(
     if data["same_key"]:
         source_session_final = _session_final_state(destination_session)
     elif data["keep_source"]:
-        source_session_final = copy.deepcopy(data["source_session_expected"])
+        upgraded_source = copy.deepcopy(data["source_record"])
+        upgraded_lineage = data["source_cache"][3]
+        if upgraded_source and upgraded_lineage:
+            upgraded_source["login_cache_lineage"] = copy.deepcopy(upgraded_lineage)
+            for legacy_name in (
+                "login_cache_files",
+                "login_cache_directories",
+                "login_cache_fingerprints",
+            ):
+                upgraded_source.pop(legacy_name, None)
+            source_session_final = _session_final_state(upgraded_source)
+        else:
+            source_session_final = copy.deepcopy(data["source_session_expected"])
     elif source_runtime["ecr"]:
         source_session_final = _session_final_state(
             {
@@ -2093,11 +2296,32 @@ def _validate_assume_cache(journal: dict[str, Any], *, allow_missing: bool) -> N
             if allow_missing:
                 continue
             _assume_recovery_error(f"browser login cache {path}")
+        if item.get("legacy_cas_only") or (
+            "fingerprint" in item and "schema_version" not in item
+        ):
+            expected_digest = item.get("whole_digest", item.get("fingerprint"))
+            try:
+                current_digest = _state.digest(path.read_bytes())
+            except OSError:
+                _assume_recovery_error(f"browser login cache {path}")
+            if current_digest != expected_digest:
+                if allow_missing:
+                    item["residue_reason"] = "legacy cache fingerprint changed"
+                    continue
+                _assume_recovery_error(f"browser login cache {path}")
+            continue
         try:
-            current = _state.digest(path.read_bytes())
-        except OSError:
+            current = _current_browser_cache_content(item)
+        except _configs.OperationalError:
             _assume_recovery_error(f"browser login cache {path}")
-        if current != item.get("fingerprint"):
+        if not _same_browser_lineage(item, current):
+            if allow_missing:
+                item["residue_reason"] = "different browser login generation"
+                continue
+            _assume_recovery_error(f"browser login cache {path}")
+        if allow_missing:
+            item["whole_digest"] = current["whole_digest"]
+        elif current["whole_digest"] != item.get("whole_digest"):
             _assume_recovery_error(f"browser login cache {path}")
 
 
@@ -2199,17 +2423,69 @@ def _remove_assume_cache(
         path = Path(str(item["path"])).absolute()
         if not path.exists():
             continue
+        if item.get("residue_reason"):
+            residue.append({"path": str(path), "reason": str(item["residue_reason"])})
+            continue
+        if item.get("legacy_cas_only") or (
+            "fingerprint" in item and "schema_version" not in item
+        ):
+            expected_digest = item.get("whole_digest", item.get("fingerprint"))
+            try:
+                current_digest = _state.digest(path.read_bytes())
+            except OSError as error:
+                if strict:
+                    _assume_recovery_error(f"browser login cache {path}")
+                residue.append({"path": str(path), "reason": f"unreadable: {error}"})
+                continue
+            if current_digest != expected_digest:
+                if strict:
+                    _assume_recovery_error(f"browser login cache {path}")
+                residue.append(
+                    {"path": str(path), "reason": "legacy cache fingerprint changed"}
+                )
+                continue
+            try:
+                path.unlink()
+            except OSError as error:
+                if strict:
+                    raise _configs.OperationalError(
+                        f"Unable to remove owned browser login cache {path}; the "
+                        f"AssumeRole recovery journal was retained: {error}"
+                    ) from error
+                residue.append({"path": str(path), "reason": f"remove failed: {error}"})
+            continue
         try:
-            current = _state.digest(path.read_bytes())
-        except OSError as error:
+            current = _current_browser_cache_content(item)
+        except _configs.OperationalError as error:
             if strict:
                 _assume_recovery_error(f"browser login cache {path}")
             residue.append({"path": str(path), "reason": f"unreadable: {error}"})
             continue
-        if current != item.get("fingerprint"):
+        if not _same_browser_lineage(item, current):
             if strict:
                 _assume_recovery_error(f"browser login cache {path}")
-            residue.append({"path": str(path), "reason": "fingerprint changed"})
+            residue.append(
+                {"path": str(path), "reason": "different browser login generation"}
+            )
+            continue
+        try:
+            unchanged = _state.digest(path.read_bytes()) == current["whole_digest"]
+        except OSError as error:
+            if strict:
+                raise _configs.OperationalError(
+                    f"Unable to read owned browser login cache {path}: {error}"
+                ) from error
+            residue.append({"path": str(path), "reason": f"unreadable: {error}"})
+            continue
+        if not unchanged:
+            if strict:
+                _assume_recovery_error(f"browser login cache {path}")
+            residue.append(
+                {
+                    "path": str(path),
+                    "reason": "cache changed during compare-and-delete",
+                }
+            )
             continue
         try:
             path.unlink()
@@ -2294,7 +2570,7 @@ def _install_assume_destination(journal: dict[str, Any]) -> None:
     )
 
 
-def _finish_assume_source(journal: dict[str, Any]) -> None:
+def _finish_assume_source(journal: dict[str, Any]) -> list[dict[str, str]]:
     _validate_assume_recovery(journal, roll_forward=True)
     source = journal["source"]
     same_key = bool(source["same_key"])
@@ -2318,7 +2594,53 @@ def _finish_assume_source(journal: dict[str, Any]) -> None:
             if _file_fingerprint(path) != legacy.get("fingerprint"):
                 _assume_recovery_error(f"legacy credential backup {path}")
             path.unlink()
-    _remove_assume_cache(journal, strict=True)
+    cache_residue = _remove_assume_cache(journal, strict=False)
+    residue_paths = {item["path"] for item in cache_residue}
+    source_residue = [
+        item
+        for item in cache_residue
+        if any(
+            str(claim.get("path")) == item["path"] and claim.get("owner") == "source"
+            for claim in journal.get("cache", [])
+        )
+    ]
+    destination_residue = [
+        item
+        for item in cache_residue
+        if item["path"] not in {value["path"] for value in source_residue}
+    ]
+    if source_residue and not same_key and not source["keep"]:
+        runtime = source.get("runtime", {})
+        source_claim = next(
+            (
+                claim
+                for claim in journal.get("cache", [])
+                if str(claim.get("path")) in residue_paths
+                and claim.get("owner") == "source"
+            ),
+            None,
+        )
+        residual = {
+            "destination": source["directory"],
+            "profile": source["profile"],
+            "auth_method": (
+                "logout-residue" if runtime.get("ecr") else "browser-cache-residue"
+            ),
+            "started_at": runtime.get("started_at"),
+            "backup": [],
+            "section_backup": {},
+            "ecr": list(runtime.get("ecr", [])),
+            "ecr_engine": runtime.get("ecr_engine"),
+            "login_cache_residue": source_residue,
+        }
+        if source_claim:
+            residual["login_cache_lineage"] = {
+                key: value
+                for key, value in source_claim.items()
+                if key not in {"owner", "residue_reason", "config", "profile"}
+            }
+        source["session_final"] = _session_final_state(residual)
+        _write_assume_journal(journal)
     if not same_key:
         _write_session_cas(
             source["key"],
@@ -2326,6 +2648,23 @@ def _finish_assume_source(journal: dict[str, Any]) -> None:
             final=source["session_final"],
             label="source session metadata",
         )
+    if destination_residue:
+        destination = journal["destination"]
+        current_final = copy.deepcopy(destination["session_final"])
+        values = current_final.get("values")
+        if isinstance(values, dict):
+            values["login_cache_residue"] = destination_residue
+            updated = _session_final_state(values)
+            _write_session_cas(
+                destination["key"],
+                expected=destination["session_final"],
+                final=updated,
+                label="destination session metadata residue",
+            )
+            destination["session"] = values
+            destination["session_final"] = updated
+            _write_assume_journal(journal)
+    return cache_residue
 
 
 def _recover_assume_journal(journal: dict[str, Any]) -> None:
@@ -2345,8 +2684,16 @@ def _recover_assume_journal(journal: dict[str, Any]) -> None:
     _validate_assume_recovery(journal, roll_forward=installed)
     if installed:
         _install_assume_destination(journal)
-        _finish_assume_source(journal)
+        residue = _finish_assume_source(journal)
+    else:
+        residue = []
     _commit()
+    if residue:
+        raise _configs.OperationalError(
+            "AssumeRole recovery installed the restricted destination and removed "
+            "the broad source credentials, but preserved an unowned browser cache "
+            "generation as browser-cache-residue."
+        )
 
 
 def assume_role(
@@ -2386,6 +2733,7 @@ def assume_role(
     _write_assume_journal(journal)
     try:
         destination = cast("Path", data["destination"])
+        _validate_assume_recovery(journal, roll_forward=False)
         credential_values = {
             "aws_access_key_id": credentials["AccessKeyId"],
             "aws_secret_access_key": credentials["SecretAccessKey"],
@@ -2402,7 +2750,7 @@ def assume_role(
         _install_assume_destination(journal)
         journal["phase"] = "destination-installed"
         _write_assume_journal(journal)
-        _finish_assume_source(journal)
+        cache_residue = _finish_assume_source(journal)
         journal["phase"] = "source-removed"
         _write_assume_journal(journal)
         _commit()
@@ -2434,6 +2782,17 @@ def assume_role(
         policyProvenance=metadata.get("policy_provenance"),
         ecrResidue=failures,
     )
+    if cache_residue:
+        public["browserCacheResidue"] = cache_residue
+        return _configs.Result(
+            "ASSUME_ROLE_BROWSER_CACHE_RESIDUE",
+            "Role credentials were installed and the broad source credentials were "
+            "removed, but a browser cache with unknown ownership was preserved.",
+            1,
+            "stderr",
+            public,
+            kind="warning",
+        )
     if failures:
         return _configs.Result(
             "ASSUME_ROLE_ECR_RESIDUE",
@@ -3161,73 +3520,294 @@ def _apply_profile_section_plans(
         _write_ini(path, parser)
 
 
-def _tracked_login_cache_plan(
-    session: dict[str, Any], destination: Path, *, force: bool
-) -> tuple[list[Path], list[Path], list[dict[str, str]]]:
+def _upgrade_legacy_browser_lineage(
+    destination: Path,
+    profile: str,
+    root: Path,
+    removals: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Bind an exact legacy cache claim to stable lineage when AWS can verify it."""
+    config = destination / "config"
+    try:
+        candidate = _browser_cache_lineage(config, profile, root)
+    except _configs.OperationalError:
+        return None
+    owned = next(
+        (
+            claim
+            for claim in removals
+            if _canonical_path(Path(str(claim.get("path", ""))))
+            == _canonical_path(Path(str(candidate["path"])))
+            and claim.get("whole_digest") == candidate.get("whole_digest")
+        ),
+        None,
+    )
+    if owned is None:
+        return None
+    try:
+        with _aws_environment(
+            destination / "config", destination / "credentials", root
+        ):
+            active = boto3.Session(profile_name=profile)
+            identity = _identity(active, label="legacy browser login cache ownership")
+        current = _browser_cache_lineage(config, profile, root, identity=identity)
+    except _configs.OperationalError:
+        return None
+    if not _same_browser_lineage(candidate, current) or current.get(
+        "whole_digest"
+    ) != owned.get("whole_digest"):
+        return None
+    return current
+
+
+def _tracked_login_cache_plan(  # noqa: PLR0911
+    session: dict[str, Any],
+    destination: Path,
+    profile: str = "default",
+    *,
+    force: bool,
+) -> tuple[
+    list[Path], list[dict[str, Any]], list[dict[str, str]], dict[str, Any] | None
+]:
     if session.get("auth_method") not in {
         "browser-native",
         "browser-cache-residue",
         "logout-residue",
     }:
-        return [], [], []
-    configured_roots = session.get("login_cache_directories") or [
-        str((destination / "login" / "cache").absolute())
-    ]
-    allowed_roots = [Path(str(value)).absolute() for value in configured_roots]
-    fingerprints = session.get("login_cache_fingerprints", {})
-    removals: list[Path] = []
-    residue: list[dict[str, str]] = []
-    for value in session.get("login_cache_files", []):
-        cache_file = Path(str(value)).absolute()
-        expected = fingerprints.get(str(cache_file))
-        in_scope = any(
-            root == cache_file.parent or root in cache_file.parents
-            for root in allowed_roots
-        )
-        if not in_scope:
-            residue.append(
-                {"path": str(cache_file), "reason": "outside tracked cache roots"}
-            )
-            continue
-        if not cache_file.exists():
-            continue
+        return [], [], [], None
+    stored = session.get("login_cache_lineage")
+    if isinstance(stored, dict) and stored.get("legacy_cas_only"):
+        path = _canonical_path(Path(str(stored.get("path", ""))))
+        roots = [_canonical_path(Path(str(stored.get("root", path.parent))))]
+        if not path.exists():
+            return roots, [], [], None
         try:
-            current = _state.digest(cache_file.read_bytes())
+            current_digest = _state.digest(path.read_bytes())
         except OSError as error:
-            if force:
-                removals.append(cache_file)
-                continue
-            residue.append({"path": str(cache_file), "reason": f"unreadable: {error}"})
-            continue
-        if not isinstance(expected, str) or current != expected:
-            if force:
-                removals.append(cache_file)
-                continue
-            residue.append(
-                {"path": str(cache_file), "reason": "fingerprint changed after login"}
+            legacy_residue = [{"path": str(path), "reason": f"unreadable: {error}"}]
+        else:
+            if current_digest == stored.get("whole_digest"):
+                return roots, [copy.deepcopy(stored)], [], None
+            legacy_residue = [
+                {
+                    "path": str(path),
+                    "reason": "legacy cache fingerprint changed after login",
+                }
+            ]
+        if not force:
+            raise _configs.OperationalError(
+                "Tracked browser login cache changed after login; no logout changes "
+                "were made. Review the cache or retry with --force: "
+                f"{legacy_residue[0]['reason']}"
             )
-            continue
-        removals.append(cache_file)
+        return roots, [], legacy_residue, None
+    if isinstance(stored, dict) and stored.get("schema_version") == 1:
+        allowed_roots = [_canonical_path(Path(str(stored.get("root", ""))))]
+    else:
+        configured_roots = session.get("login_cache_directories") or [
+            str((destination / "login" / "cache").absolute())
+        ]
+        allowed_roots = [
+            _canonical_path(Path(str(value))) for value in configured_roots
+        ]
+    removals: list[dict[str, Any]] = []
+    residue: list[dict[str, str]] = []
+    legacy_files = session.get("login_cache_files", [])
+    legacy_fingerprints = session.get("login_cache_fingerprints", {})
+    if not isinstance(stored, dict) and isinstance(legacy_files, list):
+        for value in legacy_files:
+            path = _canonical_path(Path(str(value)))
+            in_scope = any(
+                root == path.parent or root in path.parents for root in allowed_roots
+            )
+            expected = (
+                legacy_fingerprints.get(str(path))
+                if isinstance(legacy_fingerprints, dict)
+                else None
+            )
+            if not in_scope:
+                residue.append(
+                    {"path": str(path), "reason": "outside tracked cache roots"}
+                )
+                continue
+            if not path.exists():
+                continue
+            try:
+                current_digest = _state.digest(path.read_bytes())
+            except OSError as error:
+                residue.append({"path": str(path), "reason": f"unreadable: {error}"})
+                continue
+            if not isinstance(expected, str) or current_digest != expected:
+                residue.append(
+                    {
+                        "path": str(path),
+                        "reason": "legacy cache fingerprint changed after login",
+                    }
+                )
+                continue
+            removals.append(
+                {
+                    "schema_version": 0,
+                    "legacy_cas_only": True,
+                    "root": str(path.parent),
+                    "path": str(path),
+                    "whole_digest": current_digest,
+                }
+            )
+        if residue and not force:
+            details = "; ".join(f"{item['path']}: {item['reason']}" for item in residue)
+            raise _configs.OperationalError(
+                "Tracked browser login cache changed after login; no logout changes "
+                f"were made. Review the cache or retry with --force: {details}"
+            )
+        if legacy_files:
+            upgraded = _upgrade_legacy_browser_lineage(
+                destination, profile, allowed_roots[0], removals
+            )
+            if upgraded is None:
+                return allowed_roots, removals, residue, None
+            upgraded_path = _canonical_path(Path(str(upgraded["path"])))
+            removals = [
+                claim
+                for claim in removals
+                if _canonical_path(Path(str(claim["path"]))) != upgraded_path
+            ]
+            removals.append(upgraded)
+            return allowed_roots, removals, residue, upgraded
+    config = destination / "config"
+    try:
+        root = allowed_roots[0]
+        current = _browser_cache_lineage(config, profile, root)
+    except _configs.OperationalError as error:
+        if isinstance(stored, dict):
+            try:
+                current = _current_browser_cache_content(stored)
+            except _configs.OperationalError:
+                residue.append({"path": str(allowed_roots[0]), "reason": str(error)})
+                current = None
+            else:
+                if current.get("whole_digest") != stored.get("whole_digest"):
+                    residue.append(
+                        {
+                            "path": str(current["path"]),
+                            "reason": (
+                                "browser cache rotated after its profile was removed; "
+                                "ownership cannot be reverified"
+                            ),
+                        }
+                    )
+                    current = None
+        else:
+            residue.append({"path": str(allowed_roots[0]), "reason": str(error)})
+            current = None
+    if current is not None:
+        if isinstance(stored, dict) and not _same_browser_lineage(stored, current):
+            residue.append(
+                {
+                    "path": str(current["path"]),
+                    "reason": "browser cache belongs to a different login generation",
+                }
+            )
+        else:
+            # A whole-file digest change is expected during refresh. Establish the
+            # current caller before accepting the rotated bytes as the same owner.
+            needs_identity = not isinstance(stored, dict) or (
+                current.get("whole_digest") != stored.get("whole_digest")
+            )
+            identity: tuple[str, str, str] | None = None
+            if needs_identity:
+                try:
+                    with _aws_environment(
+                        destination / "config",
+                        destination / "credentials",
+                        root,
+                    ):
+                        active = boto3.Session(profile_name=profile)
+                        identity = _identity(
+                            active, label="browser login cache ownership"
+                        )
+                    current = _browser_cache_lineage(
+                        config, profile, root, identity=identity
+                    )
+                except _configs.OperationalError as error:
+                    residue.append({"path": str(current["path"]), "reason": str(error)})
+                    current = None
+            if current is not None:
+                account = str(
+                    (stored or {}).get("account")
+                    or session.get("source_account")
+                    or session.get("target_account")
+                    or ""
+                )
+                partition = str(
+                    (stored or {}).get("partition")
+                    or session.get("source_partition")
+                    or session.get("target_partition")
+                    or ""
+                )
+                principal = str((stored or {}).get("principal") or "")
+                if identity is not None and (
+                    (account and identity[0] != account)
+                    or (partition and identity[1] != partition)
+                    or (principal and identity[2] != principal)
+                ):
+                    residue.append(
+                        {
+                            "path": str(current["path"]),
+                            "reason": "GetCallerIdentity does not match tracked browser lineage",
+                        }
+                    )
+                    current = None
+                elif isinstance(stored, dict) and not _same_browser_lineage(
+                    stored, current
+                ):
+                    residue.append(
+                        {
+                            "path": str(current["path"]),
+                            "reason": "browser cache changed generation during verification",
+                        }
+                    )
+                    current = None
+            if current is not None:
+                if identity is not None:
+                    current.update(
+                        account=identity[0],
+                        partition=identity[1],
+                        principal=identity[2],
+                    )
+                elif isinstance(stored, dict):
+                    current.update(
+                        account=stored.get("account", ""),
+                        partition=stored.get("partition", ""),
+                        principal=stored.get("principal", ""),
+                    )
+                removals.append(current)
     if residue and not force:
         details = "; ".join(f"{item['path']}: {item['reason']}" for item in residue)
         raise _configs.OperationalError(
             "Tracked browser login cache changed after login; no logout changes were "
             f"made. Review the cache or retry with --force: {details}"
         )
-    return allowed_roots, removals, residue
+    return allowed_roots, removals, residue, current
 
 
 def _remove_tracked_login_cache(
-    removals: list[Path], residue: list[dict[str, str]], *, force: bool
+    removals: list[dict[str, Any]], residue: list[dict[str, str]], *, force: bool
 ) -> list[dict[str, str]]:
-    for cache_file in removals:
+    del force  # Force never authorizes deleting an unknown or different generation.
+    for claim in removals:
+        cache_file = Path(str(claim["path"]))
         try:
+            if _state.digest(cache_file.read_bytes()) != claim.get("whole_digest"):
+                residue.append(
+                    {
+                        "path": str(cache_file),
+                        "reason": "browser cache changed during compare-and-delete",
+                    }
+                )
+                continue
             cache_file.unlink()
         except OSError as error:
-            if not force:
-                raise _configs.OperationalError(
-                    f"Unable to remove tracked browser login cache {cache_file}: {error}"
-                ) from error
             residue.append(
                 {"path": str(cache_file), "reason": f"remove failed: {error}"}
             )
@@ -3297,12 +3877,11 @@ def _logout_key(key: str, args: Any) -> dict[str, Any]:
     force = bool(getattr(args, "force", False))
     registries = list(session.get("ecr", []))
     plans = _profile_section_plans(session, destination, profile, force=force)
-    cache_roots, cache_removals, cache_residue = _tracked_login_cache_plan(
-        session, destination, force=force
+    _cache_roots, cache_removals, cache_residue, _ = _tracked_login_cache_plan(
+        session, destination, profile, force=force
     )
     journal = _begin(
-        [destination / "credentials", destination / "config", _state.sessions_path()],
-        cache_roots=cache_roots,
+        [destination / "credentials", destination / "config", _state.sessions_path()]
     )
     residual: dict[str, Any] = {
         "destination": str(destination),
@@ -3314,20 +3893,27 @@ def _logout_key(key: str, args: Any) -> dict[str, Any]:
         "ecr": registries,
         "ecr_engine": session.get("ecr_engine"),
     }
+    lineage = session.get("login_cache_lineage")
+    pending_cache = [
+        *cache_residue,
+        *(
+            {
+                "path": str(claim["path"]),
+                "reason": "browser cache cleanup pending",
+            }
+            for claim in cache_removals
+        ),
+    ]
+    if pending_cache:
+        residual.update(
+            auth_method="logout-residue" if registries else "browser-cache-residue",
+            login_cache_residue=pending_cache,
+        )
+        if isinstance(lineage, dict):
+            residual["login_cache_lineage"] = copy.deepcopy(lineage)
     try:
         _apply_profile_section_plans(plans)
-        cache_residue = _remove_tracked_login_cache(
-            cache_removals, cache_residue, force=force
-        )
-        if cache_residue:
-            residual.update(
-                auth_method="logout-residue" if registries else "browser-cache-residue",
-                login_cache_residue=cache_residue,
-                login_cache_directories=[str(path) for path in cache_roots],
-                login_cache_files=[item["path"] for item in cache_residue],
-                login_cache_fingerprints={},
-            )
-        if registries or cache_residue:
+        if registries or pending_cache:
             sessions[key] = residual
         else:
             del sessions[key]
@@ -3336,6 +3922,26 @@ def _logout_key(key: str, args: Any) -> dict[str, Any]:
     except Exception:
         _rollback(journal)
         raise
+    cache_residue = _remove_tracked_login_cache(
+        cache_removals, cache_residue, force=force
+    )
+    sessions = _state.load_sessions()
+    if cache_residue:
+        residual.update(
+            auth_method="logout-residue" if registries else "browser-cache-residue",
+            login_cache_residue=cache_residue,
+        )
+        if isinstance(lineage, dict):
+            residual["login_cache_lineage"] = copy.deepcopy(lineage)
+        sessions[key] = residual
+    elif registries:
+        residual.pop("login_cache_residue", None)
+        residual.pop("login_cache_lineage", None)
+        residual["auth_method"] = "ecr-only"
+        sessions[key] = residual
+    else:
+        sessions.pop(key, None)
+    _state.save_sessions(sessions)
     if registries and not keep_ecr:
         engine = cast(
             "_configs.ContainerEngine",

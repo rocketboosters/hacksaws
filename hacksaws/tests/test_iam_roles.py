@@ -33,7 +33,11 @@ def snapshot(**overrides: Any) -> roles.RoleSnapshot:
         "arn": ROLE_ARN,
         "path": "/hacksaws/",
         "trust": TRUST,
-        "tags": {roles.MANAGED_TAG: "true", "old": "x"},
+        "tags": {
+            roles.MANAGED_TAG: "true",
+            roles.OWNER_TAG: "scott",
+            "old": "x",
+        },
     }
     values.update(overrides)
     return roles.RoleSnapshot(**values)
@@ -266,17 +270,56 @@ def test_role_create_update_ownership_and_tag_plans() -> None:
 
     adopted = roles.plan_adopt_role(current, "scott", "audit")
     assert adopted.kind == "role-adopt"
-    with pytest.raises(roles.ConflictError, match="already managed"):
-        roles.plan_adopt_role(
-            snapshot(tags={roles.MANAGED_TAG: "true", roles.OWNER_TAG: "other"}),
-            "scott",
-        )
+    legacy = roles.plan_adopt_role(
+        snapshot(tags={roles.MANAGED_TAG: "true", roles.OWNER_TAG: "other"}),
+        "scott",
+    )
+    assert legacy.operations[0].params["Tags"] == [
+        {"Key": roles.ORIGIN_TAG, "Value": "legacy"}
+    ]
     released = roles.plan_release_role(
         snapshot(tags={roles.MANAGED_TAG: "true", roles.OWNER_TAG: "x"})
     )
     assert released.operations[0].action == "untag_role"
     assert not roles.plan_put_tags("Agent", {}).operations
     assert not roles.plan_remove_tags("Agent", []).operations
+
+
+def test_role_adoption_identity_origin_and_idempotence() -> None:
+    unowned = snapshot(tags={"team": "platform"}, role_id="AROA-STABLE")
+    adopted = roles.plan_adopt_role(unowned, "scott", "identity-1")
+    additions = {
+        item["Key"]: item["Value"]
+        for operation in adopted.operations
+        for item in operation.params["Tags"]
+    }
+    assert additions == {
+        roles.MANAGED_TAG: "true",
+        roles.OWNER_TAG: "scott",
+        roles.AUDIT_TAG: "identity-1",
+        roles.ORIGIN_TAG: "adopted",
+    }
+    assert isinstance(adopted.after, roles.RoleSnapshot)
+    repeated = roles.plan_adopt_role(adopted.after, "scott", "identity-1")
+    assert repeated.operations == ()
+
+    legacy = snapshot(
+        tags={
+            roles.MANAGED_TAG: "true",
+            roles.OWNER_TAG: "original-owner",
+            roles.AUDIT_TAG: "original-id",
+        }
+    )
+    migration = roles.plan_adopt_role(legacy, "different-caller")
+    assert migration.operations[0].params["Tags"] == [
+        {"Key": roles.ORIGIN_TAG, "Value": "legacy"}
+    ]
+    assert isinstance(migration.after, roles.RoleSnapshot)
+    assert migration.after.tags[roles.OWNER_TAG] == "original-owner"
+    assert migration.after.tags[roles.AUDIT_TAG] == "original-id"
+
+    with pytest.raises(roles.ConflictError, match="partial"):
+        roles.plan_adopt_role(snapshot(tags={roles.OWNER_TAG: "orphan"}), "scott")
 
 
 def test_trust_set_add_remove_and_complex_ambiguity() -> None:

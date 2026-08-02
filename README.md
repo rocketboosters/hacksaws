@@ -52,6 +52,10 @@ MFA login starts from persistent source credentials:
 hacksaws mfa in admin --name horizon 123456
 ```
 
+Omit the code in an interactive terminal for a hidden prompt, or use
+`--mfa-code-stdin` to read one line from standard input. JSON and other
+non-interactive use never prompts.
+
 The source above is profile `admin` in `~/.aws-horizon`. To write temporary
 credentials somewhere else, use `--to LOCATION:PROFILE`:
 
@@ -108,6 +112,10 @@ hacksaws assume admin --name horizon \
   --to default:agent
 ```
 
+For a destination profile in the same AWS location,
+`hacksaws assume SOURCE DEST --role ...` is the short form of
+`--to-profile DEST`.
+
 The destination is always explicit. The source is removed after a successful
 handoff unless `--keep-source` is deliberate; use `--self` for an intentional
 in-place replacement. See [Assume a role](docs/assume-role.md) for destination,
@@ -125,6 +133,7 @@ hacksaws profile list --verify
 hacksaws iam list --profile admin --wide
 hacksaws cache status
 hacksaws config show
+hacksaws history list --since 24h
 ```
 
 `iam list` verifies live ownership tags within the canonical `/hacksaws/` paths
@@ -135,6 +144,12 @@ information is worth the additional AWS calls. Human terminals receive delayed
 progress on stderr while stdout remains safe to pipe; use `--progress` to force
 plain milestones or `--no-progress` to suppress them. JSON mode is always quiet
 until its single result envelope.
+
+Local history records redacted command families, outcomes, timings, and
+validated identifiers—not raw arguments, output, prompts, paths, policy
+documents, or credentials. Use `hacksaws history status` to inspect retention
+and health. See [Local command history](docs/history.md) for the full security
+contract, filters, exports, and clearing behavior.
 
 Global output flags may appear anywhere before `--`:
 
@@ -162,6 +177,12 @@ Normal remote IAM mutations accept `--dry-run`. A dry run performs discovery,
 validation, collision checks, and planning, but creates no recovery journal and
 changes neither AWS nor local state. Recovery `continue` and `rollback` commands
 resume an already-journaled operation and therefore do not accept `--dry-run`.
+
+Mutation previews and results use one credential-free contract: exact resource
+identity and ownership, scalar before/after changes, ordered AWS actions,
+dependencies, warnings, confirmation, applied actions, resource IDs/ARNs,
+console links, and recovery journal IDs. Policy documents and tag values are
+represented only by non-reversible summaries.
 
 ## Leave No Trace cleanup
 
@@ -252,6 +273,7 @@ models.
 - [Cleanup and Leave No Trace](docs/cleanup.md)
 - [Configuration](docs/configuration.md)
 - [Policy cache](docs/cache.md)
+- [Local command history](docs/history.md)
 - [Security model](docs/security-model.md)
 - [Automation and JSON](docs/automation-and-json.md)
 - [Troubleshooting](docs/troubleshooting.md)

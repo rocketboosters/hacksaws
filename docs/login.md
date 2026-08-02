@@ -14,6 +14,12 @@ hacksaws pk in default --name default
 
 `web` and `pk` are equivalent. `in` aliases `login`; `out` aliases `logout`.
 
+Hacksaws tracks the browser cache by stable, hashed login lineage rather than
+storing its tokens. Normal AWS access/refresh-token rotation is accepted only
+after STS verifies the same account, partition, and principal. A different
+client/DPoP login generation is preserved as residue for review—even with
+`--force`—and compare-and-delete preserves a cache that refreshes concurrently.
+
 ## MFA login
 
 MFA requires persistent source credentials. `PROFILE --name LOCATION` selects
@@ -23,6 +29,12 @@ the source profile and `~/.aws-LOCATION` directory.
 hacksaws mfa in admin --name horizon 123456
 hacksaws mfa in admin --name horizon --to default:debug 123456
 ```
+
+In an interactive terminal, omit `123456` for a hidden MFA prompt. Use
+`--mfa-code-stdin` to read exactly one line from standard input. Supplying both
+forms is an error; JSON and non-TTY use require a positional or stdin code and
+never prompt. History records only that a code was provided and whether its
+source was argument, stdin, or prompt.
 
 The source credentials should have only bootstrap permissions. See
 [Security model](security-model.md).

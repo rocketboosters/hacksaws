@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
+import getpass
 import io
 import json
 import os
@@ -27,6 +28,7 @@ from hacksaws import _aws
 from hacksaws import _configs
 from hacksaws import _duration
 from hacksaws import _ecr
+from hacksaws import _history
 from hacksaws import _iam_cli
 from hacksaws import _output
 from hacksaws import _policies
@@ -74,6 +76,56 @@ def _ecr_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _history_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add structured, secret-free history filters to one leaf command."""
+    parser.add_argument(
+        "--since",
+        help=(
+            "Include records at or after an ISO timestamp or duration ago using "
+            "seconds, minutes, hours, days, or weeks (for example 24h or 2weeks)."
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        help=(
+            "Include records at or before an ISO timestamp or duration ago using "
+            "seconds, minutes, hours, days, or weeks."
+        ),
+    )
+    parser.add_argument(
+        "--command",
+        help="Include this canonical command family, such as iam.policy.",
+    )
+    parser.add_argument(
+        "--outcome",
+        choices=(
+            "success",
+            "usage-error",
+            "policy-refusal",
+            "cancelled",
+            "operational-error",
+            "interrupted",
+            "crashed",
+        ),
+        help="Include only this command outcome.",
+    )
+    parser.add_argument("--account", help="Include only this recorded AWS account.")
+    parser.add_argument(
+        "--resource", help="Match a recorded resource name or ARN fragment."
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum records to return (default: 50; maximum: 10000).",
+    )
+    parser.add_argument(
+        "--include-running",
+        action="store_true",
+        help="Also include commands whose final outcome has not been recorded.",
+    )
+
+
 def _login_arguments(parser: argparse.ArgumentParser, *, browser: bool = False) -> None:
     parser.add_argument(
         "profile",
@@ -85,7 +137,17 @@ def _login_arguments(parser: argparse.ArgumentParser, *, browser: bool = False) 
     )
     if not browser:
         parser.add_argument(
-            "mfa_code", nargs="?", help="Current six-digit MFA token code."
+            "mfa_code",
+            nargs="?",
+            help=(
+                "Current six-digit MFA token; omit for a hidden interactive prompt, "
+                "or use --mfa-code-stdin for noninteractive input."
+            ),
+        )
+        parser.add_argument(
+            "--mfa-code-stdin",
+            action="store_true",
+            help="Read the MFA token code from standard input instead of the command line.",
         )
         parser.add_argument(
             "-l",
@@ -204,6 +266,12 @@ def _assume_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "destination",
+        nargs="?",
+        metavar="DEST",
+        help="Destination profile in the source AWS location (equivalent to --to-profile).",
+    )
+    parser.add_argument(
         "-n",
         "--name",
         "--account-name",
@@ -288,6 +356,7 @@ def _assume_arguments(parser: argparse.ArgumentParser) -> None:
         ecr_region=[],
         remote=False,
         mfa_code=None,
+        mfa_code_stdin=False,
     )
 
 
@@ -668,6 +737,104 @@ def _create_parser() -> argparse.ArgumentParser:
     option_set.add_argument("key")
     option_set.add_argument("value")
     option_set.add_argument("--json", action="store_true")
+
+    history = types.add_parser(
+        "history",
+        help="Inspect redacted local command outcomes without exposing credentials.",
+        description=(
+            "Inspect the credential-free local audit trail. Hacksaws records command "
+            "families, validated identifiers, outcomes, and timings; it never records "
+            "raw arguments, command output, prompt input, credential values, or paths."
+        ),
+    )
+    history_actions = history.add_subparsers(dest="history_action")
+    history_list = history_actions.add_parser(
+        "list", help="List recent completed command outcomes in a compact table."
+    )
+    history_list.add_argument(
+        "patterns",
+        nargs="*",
+        help="Case-insensitive fnmatch patterns matched across safe record fields.",
+    )
+    history_list.add_argument(
+        "--wide",
+        action="store_true",
+        help="Show account, resource, and result details.",
+    )
+    _history_filter_arguments(history_list)
+    history_search = history_actions.add_parser(
+        "search", help="Search safe history fields using one or more ORed patterns."
+    )
+    history_search.add_argument(
+        "patterns",
+        nargs="+",
+        help="Case-insensitive fnmatch patterns; plain text is treated as *TEXT*.",
+    )
+    history_search.add_argument(
+        "--wide",
+        action="store_true",
+        help="Show account, resource, and result details.",
+    )
+    _history_filter_arguments(history_search)
+    history_show = history_actions.add_parser(
+        "show", help="Show one safe record by full or unique-prefix history ID."
+    )
+    history_show.add_argument("history_id", help="Full or unique ID prefix (4+ hex).")
+    history_report = history_actions.add_parser(
+        "report", help="Summarize outcomes and command families for a time window."
+    )
+    _history_filter_arguments(history_report)
+    history_export = history_actions.add_parser(
+        "export", help="Export selected safe records as deterministic JSONL or JSON."
+    )
+    history_export.add_argument(
+        "patterns",
+        nargs="*",
+        help="Optional case-insensitive fnmatch patterns for safe record fields.",
+    )
+    _history_filter_arguments(history_export)
+    history_export.add_argument(
+        "--format",
+        choices=("jsonl", "json"),
+        default="jsonl",
+        help="Export encoding (default: jsonl).",
+    )
+    history_export.add_argument(
+        "--output",
+        "-o",
+        help="Write to this file instead of standard output.",
+    )
+    history_actions.add_parser(
+        "status", help="Show database health, size, and retention settings."
+    )
+    history_actions.add_parser(
+        "check", help="Validate the history schema, database, and safe payloads."
+    )
+    history_clear = history_actions.add_parser(
+        "clear",
+        help="Remove resolved history while preserving active recovery records.",
+    )
+    history_clear_scope = history_clear.add_mutually_exclusive_group(required=True)
+    history_clear_scope.add_argument(
+        "--before",
+        help=(
+            "Remove records before an ISO timestamp or duration ago, such as 30d "
+            "or 2weeks."
+        ),
+    )
+    history_clear_scope.add_argument(
+        "--all", action="store_true", help="Remove every eligible resolved record."
+    )
+    history_clear.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan the clear without changing history.",
+    )
+    history_clear.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply without prompting; intended for deliberate automation.",
+    )
     _register_extension_commands(types)
     return parser
 
@@ -847,6 +1014,24 @@ def _validate_login(namespace: argparse.Namespace) -> None:
 
 def _validate_assume(namespace: argparse.Namespace) -> None:
     """Validate assume-only grammar before AWS discovery or confirmation."""
+    positional_destination = getattr(namespace, "destination", None)
+    if positional_destination:
+        if (
+            namespace.target
+            or namespace.self_destination
+            or namespace.to
+            or namespace.to_directory
+            or namespace.to_profile
+        ):
+            raise _configs.OperationalError(
+                "Positional DEST is mutually exclusive with saved targets, --self, "
+                "--to, --to-directory, and --to-profile."
+            )
+        namespace.to_profile = (
+            "default"
+            if positional_destination in {".", "default"}
+            else positional_destination
+        )
     profile = getattr(namespace, "profile", None)
     if profile in {".", "default"}:
         namespace.profile = "default"
@@ -1067,8 +1252,28 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
         raise _configs.OperationalError(
             "MFA login requires a source profile unless a saved target supplies it."
         )
-    if context.args.mfa_code is None:
-        raise _configs.OperationalError("MFA login requires a token code.")
+    if context.args.mfa_code is not None and bool(
+        getattr(context.args, "mfa_code_stdin", False)
+    ):
+        raise _configs.OperationalError(
+            "Specify the MFA token either positionally or with --mfa-code-stdin, not both."
+        )
+    if bool(getattr(context.args, "mfa_code_stdin", False)):
+        context.args.mfa_code = sys.stdin.readline().strip()
+        context.args.mfa_code_source = "stdin"
+    elif context.args.mfa_code is None:
+        if bool(getattr(context.args, "json", False)) or not sys.stdin.isatty():
+            raise _configs.OperationalError(
+                "MFA login requires a token code; provide it positionally or use "
+                "--mfa-code-stdin."
+            )
+        context.args.mfa_code = getpass.getpass("MFA token code: ").strip()
+        context.args.mfa_code_source = "prompt"
+    else:
+        context.args.mfa_code_source = "argument"
+    if not context.args.mfa_code:
+        raise _configs.OperationalError("MFA token code cannot be empty.")
+    _history.note_mfa_code(source=context.args.mfa_code_source)
     if _sessions.is_expanded_login(context.args):
         return _sessions.mfa_login(context)
 
@@ -2298,7 +2503,299 @@ def _run_config(args: argparse.Namespace) -> _configs.Result:
     return _configs.Result("CONFIG_HELP", "Choose a config action.", 2, "stderr")
 
 
-def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs.Result:
+_HISTORY_OUTCOMES = {
+    "success": ("✓", "success"),
+    "usage-error": ("?", "usage error"),
+    "policy-refusal": ("⊘", "policy refusal"),
+    "cancelled": ("○", "cancelled"),
+    "operational-error": ("!", "operational error"),
+    "interrupted": ("↯", "interrupted"),
+    "crashed": ("X", "crashed/abandoned"),
+}
+
+
+def _history_records(args: argparse.Namespace) -> list[dict[str, object]]:
+    return _history.list_records(
+        patterns=tuple(getattr(args, "patterns", ()) or ()),
+        since=_history.parse_time(args.since) if getattr(args, "since", None) else None,
+        until=(
+            _history.parse_time(args.until) if getattr(args, "until", None) else None
+        ),
+        command=getattr(args, "command", None),
+        outcome=getattr(args, "outcome", None),
+        account=getattr(args, "account", None),
+        resource=getattr(args, "resource", None),
+        limit=getattr(args, "limit", 50),
+        include_running=bool(getattr(args, "include_running", False)),
+    )
+
+
+def _history_list_text(records: list[dict[str, object]], *, wide: bool = False) -> str:
+    columns = ["ID", "STARTED", "S", "COMMAND", "PROFILE"]
+    if wide:
+        columns.extend(("ACCOUNT", "RESOURCE", "RESULT", "MS"))
+    rows: list[list[object]] = []
+    used_symbols: set[str] = set()
+    for record in records:
+        outcome = str(record.get("outcome") or "")
+        symbol = _HISTORY_OUTCOMES.get(outcome, ("…", "running/unknown"))[0]
+        used_symbols.add(symbol)
+        row: list[object] = [
+            str(record["id"])[:8],
+            str(record.get("startedAt") or "-").replace("T", " ")[:19],
+            symbol,
+            record.get("command"),
+            record.get("profile"),
+        ]
+        if wide:
+            row.extend(
+                (
+                    record.get("accountId"),
+                    record.get("resourceName") or record.get("resourceArn"),
+                    record.get("resultCode"),
+                    record.get("durationMs"),
+                )
+            )
+        rows.append(row)
+    table = _text_table(columns, rows)
+    if not rows:
+        return table
+    meanings = [
+        (symbol, meaning)
+        for outcome, (symbol, meaning) in _HISTORY_OUTCOMES.items()
+        if symbol in used_symbols and outcome
+    ]
+    if "…" in used_symbols:
+        meanings.append(("…", "running/unknown"))
+    return f"{table}\n\nKey: " + "  ".join(
+        f"{symbol} {meaning}" for symbol, meaning in meanings
+    )
+
+
+def _history_show_text(record: dict[str, object]) -> str:
+    lines = [
+        f"History ID: {record['id']}",
+        f"Command: {record['command']}",
+        f"Safe template: {_history.command_template(record)}",
+        f"Outcome: {record.get('outcome') or record.get('state')}",
+        f"Result: {record.get('resultCode') or '-'} (exit {record.get('exitCode')})",
+        f"Started: {record.get('startedAt')}",
+        f"Ended: {record.get('endedAt') or '-'}",
+        f"Duration: {record.get('durationMs') or 0} ms",
+        f"Confirmation: {record.get('confirmation')}",
+    ]
+    context = [
+        f"{label}={record.get(key)}"
+        for key, label in (
+            ("accountId", "account"),
+            ("location", "location"),
+            ("profile", "profile"),
+            ("target", "target"),
+            ("resourceName", "resource"),
+            ("resourceArn", "arn"),
+        )
+        if record.get(key)
+    ]
+    if context:
+        lines.append("Context: " + ", ".join(context))
+    safe = record.get("safe")
+    if isinstance(safe, dict):
+        input_kinds = safe.get("inputKinds")
+        if isinstance(input_kinds, list) and input_kinds:
+            lines.append(
+                "Inputs: "
+                + ", ".join(
+                    f"{item.get('role')} ({item.get('format')})"
+                    for item in input_kinds
+                    if isinstance(item, dict)
+                )
+            )
+        secret_presence = safe.get("secretPresence")
+        if isinstance(secret_presence, dict) and any(secret_presence.values()):
+            present = [
+                name
+                for key, name in (
+                    ("mfaCode", "MFA code"),
+                    ("externalId", "external ID"),
+                )
+                if secret_presence.get(key) is True
+            ]
+            lines.append(
+                "Secret inputs supplied (values never stored): " + ", ".join(present)
+            )
+    if record.get("recoveryUnresolved") is True:
+        lines.append("Recovery: unresolved; retention and clear preserve this record.")
+    return "\n".join(lines)
+
+
+def _history_report(records: list[dict[str, object]]) -> dict[str, object]:
+    outcomes: dict[str, int] = {}
+    commands: dict[str, int] = {}
+    duration = 0
+    for record in records:
+        outcome = str(record.get("outcome") or record.get("state") or "unknown")
+        command = str(record.get("command") or "unknown")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        commands[command] = commands.get(command, 0) + 1
+        value = record.get("durationMs")
+        if type(value) is int:
+            duration += value
+    return {
+        "count": len(records),
+        "durationMs": duration,
+        "outcomes": dict(sorted(outcomes.items())),
+        "commands": dict(sorted(commands.items())),
+    }
+
+
+def _history_report_text(report: dict[str, object]) -> str:
+    outcomes = cast("dict[str, int]", report["outcomes"])
+    commands = cast("dict[str, int]", report["commands"])
+    return "\n\n".join(
+        (
+            f"Commands: {report['count']}  Total duration: {report['durationMs']} ms",
+            "Outcomes\n" + _text_table(("OUTCOME", "COUNT"), list(outcomes.items())),
+            "Command families\n"
+            + _text_table(("COMMAND", "COUNT"), list(commands.items())),
+        )
+    )
+
+
+def _history_status_text(report: dict[str, object]) -> str:
+    retention = cast("dict[str, object]", report["retention"])
+    return "\n".join(
+        (
+            f"History database: {report['database']}",
+            f"Health: {report['integrity']}",
+            f"Records: {report['count']} ({report['running']} running)",
+            f"Logical size: {report['logicalBytes']} bytes",
+            f"Range: {report['oldest'] or '-'} to {report['newest'] or '-'}",
+            (
+                "Retention: "
+                f"{retention['max_age']}s, {retention['max_entries']} entries, "
+                f"{retention['max_bytes']} bytes; "
+                f"recording {'enabled' if retention['enabled'] else 'disabled'}"
+            ),
+        )
+    )
+
+
+def _run_history(args: argparse.Namespace) -> _configs.Result:
+    action = args.history_action
+    if action in {"list", "search"}:
+        records = _history_records(args)
+        return _configs.Result(
+            "HISTORY_LIST" if action == "list" else "HISTORY_SEARCH",
+            _history_list_text(records, wide=args.wide),
+            data={"count": len(records), "records": records},
+            kind="info",
+        )
+    if action == "show":
+        record = _history.get_record(args.history_id)
+        return _configs.Result(
+            "HISTORY_SHOW", _history_show_text(record), data=record, kind="info"
+        )
+    if action == "report":
+        report = _history_report(_history_records(args))
+        return _configs.Result(
+            "HISTORY_REPORT", _history_report_text(report), data=report, kind="info"
+        )
+    if action == "export":
+        records = _history_records(args)
+        encoded = _history.export_records(records, format_name=args.format)
+        if args.output:
+            destination = Path(args.output).expanduser().absolute()
+            _state.atomic_write(destination, encoded.encode("utf-8"))
+            return _configs.Result(
+                "HISTORY_EXPORT",
+                f"Exported {len(records)} safe history records to {destination}.",
+                data={
+                    "count": len(records),
+                    "format": args.format,
+                    "output": str(destination),
+                },
+            )
+        return _configs.Result(
+            "HISTORY_EXPORT",
+            encoded.rstrip("\n"),
+            data={"count": len(records), "format": args.format, "records": records},
+            kind="info",
+        )
+    if action == "status":
+        report = _history.status()
+        return _configs.Result(
+            "HISTORY_STATUS", _history_status_text(report), data=report, kind="info"
+        )
+    if action == "check":
+        report = _history.check()
+        return _configs.Result(
+            "HISTORY_CHECK_OK" if report["ok"] else "HISTORY_CHECK_FAILED",
+            (
+                "History database and safe records are valid."
+                if report["ok"]
+                else f"History check found {report['corruptRecords']} corrupt records."
+            ),
+            0 if report["ok"] else 1,
+            data=report,
+            kind="success" if report["ok"] else "error",
+        )
+    if action == "clear":
+        before = _history.parse_time(args.before) if args.before else None
+        plan = _history.clear(before=before, all_records=args.all, apply=False)
+        if args.dry_run or plan["count"] == 0:
+            return _configs.Result(
+                "HISTORY_CLEAR_PLAN",
+                f"Would remove {plan['count']} eligible safe history records; no changes made.",
+                data=plan,
+                kind="info",
+            )
+        if args.yes:
+            _history.note_confirmation("yes-flag", "bypassed")
+        elif bool(getattr(args, "json", False)) or not sys.stdin.isatty():
+            _history.note_confirmation("exact-yes", "unavailable")
+            return _configs.Result(
+                "CONFIRMATION_REQUIRED",
+                "History clear requires an interactive exact 'yes' or --yes.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                data=plan,
+            )
+        else:
+            answer = input(
+                f"History clear plan: remove {plan['count']} eligible records "
+                f"({plan['logicalBytes']} logical bytes).\n"
+                "Running commands and unresolved recovery records are preserved.\n"
+                "Type 'yes' exactly to continue: "
+            )
+            accepted = answer.strip() == "yes"
+            _history.note_confirmation(
+                "exact-yes", "accepted" if accepted else "declined"
+            )
+            if not accepted:
+                return _configs.Result(
+                    "HISTORY_CLEAR_CANCELLED",
+                    "History clear cancelled; no records were removed.",
+                    _configs.EXIT_CANCELLED,
+                    "stderr",
+                    data=plan,
+                )
+        applied = _history.clear(before=before, all_records=args.all, apply=True)
+        return _configs.Result(
+            "HISTORY_CLEAR",
+            f"Removed {applied['count']} eligible safe history records.",
+            data=applied,
+        )
+    _print_help(("history",))
+    return _configs.Result(
+        "HISTORY_HELP", "Choose a history action.", _configs.EXIT_USAGE, "stderr"
+    )
+
+
+def _console_main_invocation(
+    arguments: Sequence[str] | None = None,
+    *,
+    history_handle: _history.HistoryHandle | None = None,
+) -> _configs.Result:
     raw_arguments = list(sys.argv[1:] if arguments is None else arguments)
     preselected_json = _json_requested(raw_arguments)
     _configs.configure_output(color="auto", json_output=preselected_json)
@@ -2358,11 +2855,21 @@ def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs
         return _configs.Result(
             "ACCESS_TYPE_HELP", "Not enough arguments.", 2, "stderr"
         ).echo()
+    if (
+        namespace.access_type == "mfa"
+        and namespace.action in {"login", "in"}
+        and namespace.target
+        and namespace.profile
+        and namespace.mfa_code is None
+    ):
+        namespace.mfa_code = namespace.profile
+        namespace.profile = None
     if namespace.access_type == "mfa" and namespace.action in {"login", "in"}:
-        if namespace.target and namespace.profile and namespace.mfa_code is None:
-            namespace.mfa_code = namespace.profile
-            namespace.profile = None
-        if namespace.mfa_code is None:
+        missing_code = namespace.mfa_code is None and not bool(
+            getattr(namespace, "mfa_code_stdin", False)
+        )
+        missing_source = namespace.profile is None and not namespace.target
+        if missing_source or (missing_code and (use_json or not sys.stdin.isatty())):
             usage = parser.format_usage().strip()
             if not use_json:
                 parser.print_usage(sys.stderr)
@@ -2373,6 +2880,8 @@ def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs
                 "stderr",
                 {"usage": usage} if use_json else None,
             ).echo()
+    if history_handle is not None:
+        _history.enrich(history_handle, namespace)
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
     machine_stdin = _NonInteractiveStdin()
@@ -2431,6 +2940,8 @@ def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs
                 result = _run_policy(namespace)
             elif namespace.access_type == "cache":
                 result = _run_cache(namespace)
+            elif namespace.access_type == "history":
+                result = _run_history(namespace)
             else:
                 result = _run_config(namespace)
     except _configs.OperationalError as error:
@@ -2448,8 +2959,18 @@ def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs
 
 def console_main(arguments: Sequence[str] | None = None) -> _configs.Result:
     """Run one isolated CLI invocation without leaking output mode to callers."""
+    raw_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    history_handle = _history.begin(
+        json_mode=_json_requested(raw_arguments), interactive=sys.stdin.isatty()
+    )
     _configs.configure_output()
     try:
-        return _console_main_invocation(arguments)
+        result = _console_main_invocation(raw_arguments, history_handle=history_handle)
+    except BaseException as error:
+        _history.fail(history_handle, error)
+        raise
+    else:
+        _history.finish(history_handle, result)
+        return result
     finally:
         _configs.configure_output()

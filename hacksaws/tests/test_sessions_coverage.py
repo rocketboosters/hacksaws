@@ -132,6 +132,42 @@ def _write_source(aws: Path) -> None:
     )
 
 
+def _write_browser_login(
+    config: Path,
+    cache: Path,
+    profile: str,
+    *,
+    login_session: str = f"arn:aws:iam::{ACCOUNT}:user/test",
+    dpop: str = "test-DPoP-generation",
+) -> Path:
+    parser = _sessions._read_ini(config)
+    parser[_sessions._section(profile, config=True)] = {
+        "region": "us-west-2",
+        "login_session": login_session,
+    }
+    _sessions._write_ini(config, parser)
+    cache.mkdir(parents=True, exist_ok=True)
+    path = cache / f"{_state.digest(login_session.encode())}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "accessToken": {
+                    "accessKeyId": "access",
+                    "secretAccessKey": "secret",
+                    "sessionToken": "token",
+                    "accountId": ACCOUNT,
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                },
+                "refreshToken": "refresh",
+                "clientId": "client",
+                "dpopKey": dpop,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _archive(path: Path, config: dict[str, object], files: dict[str, bytes]) -> Path:
     config_bytes = (json.dumps(config, indent=2) + "\n").encode()
     payloads = {"config.json": config_bytes, **files}
@@ -146,7 +182,7 @@ def _archive(path: Path, config: dict[str, object], files: dict[str, bytes]) -> 
     return path
 
 
-def test_journal_commit_and_crash_recovery_restore_files_and_cache(
+def test_journal_recovery_restores_files_without_snapshotting_browser_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _home(tmp_path, monkeypatch)
@@ -159,7 +195,9 @@ def test_journal_commit_and_crash_recovery_restore_files_and_cache(
     preexisting_directory.mkdir(parents=True)
     old_cache.write_bytes(b"cached")
 
-    journal = _sessions._begin([original, created], cache_roots=[cache])
+    journal = _sessions._begin([original, created])
+    assert journal["browser_cache_claims"] == []
+    assert "cache_snapshots" not in journal
     assert _sessions._journal_path().exists()
     original.write_bytes(b"changed")
     created.write_bytes(b"new")
@@ -172,9 +210,9 @@ def test_journal_commit_and_crash_recovery_restore_files_and_cache(
     _sessions.recover_journal()
     assert original.read_bytes() == b"original"
     assert not created.exists()
-    assert old_cache.read_bytes() == b"cached"
-    assert not (cache / "new.json").exists()
-    assert not (cache / "created").exists()
+    assert old_cache.read_bytes() == b"changed-cache"
+    assert (cache / "new.json").exists()
+    assert (cache / "created").exists()
     assert preexisting_directory.is_dir()
     assert not _sessions._journal_path().exists()
 
@@ -184,18 +222,18 @@ def test_journal_commit_and_crash_recovery_restore_files_and_cache(
     assert journal["safe_to_rollback"] is True
 
 
-def test_cache_rollback_removes_an_entire_new_nested_cache_root(
+def test_generic_rollback_never_claims_an_entire_new_cache_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _home(tmp_path, monkeypatch)
     cache = tmp_path / "absent-before"
     assert not cache.exists()
-    journal = _sessions._begin([], cache_roots=[cache])
+    journal = _sessions._begin([])
     token = cache / "provider" / "nested" / "token.json"
     token.parent.mkdir(parents=True)
     token.write_text("broad", encoding="utf-8")
     _sessions._rollback(journal)
-    assert not cache.exists()
+    assert token.exists()
     assert not _sessions._journal_path().exists()
 
 
@@ -695,18 +733,34 @@ def test_native_browser_remote_cache_ecr_success_and_logout(
     old_cache = aws / "login" / "cache" / "old.json"
     old_cache.parent.mkdir(parents=True)
     old_cache.write_text("old")
-    new_cache = old_cache.with_name("new.json")
+    new_cache = old_cache.with_name(
+        f"{_state.digest(f'arn:aws:iam::{ACCOUNT}:user/test'.encode())}.json"
+    )
     monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(old_cache.parent))
     native = MagicMock(region_name="us-west-2")
     registry = f"{ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com"
 
-    def login(*args: object, **kwargs: object) -> None:
-        new_cache.write_text("new")
+    def login(
+        config: Path,
+        _credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del remote
+        assert (
+            _write_browser_login(config, login_cache, profile).absolute()
+            == new_cache.absolute()
+        )
 
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login) as aws_login,
         patch("hacksaws._sessions.boto3.Session", return_value=native),
-        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT, "aws", f"arn:aws:iam::{ACCOUNT}:user/test"),
+        ),
         patch("hacksaws._ecr.login_with_session", return_value=[registry]),
     ):
         result = _sessions.browser_login(
@@ -715,7 +769,7 @@ def test_native_browser_remote_cache_ecr_success_and_logout(
     assert result.code == "BROWSER_LOGIN"
     assert aws_login.call_args.kwargs["remote"] is True
     saved = _state.load_sessions()[f"{aws.absolute()}::out"]
-    assert saved["login_cache_files"] == [str(new_cache.absolute())]
+    assert saved["login_cache_lineage"]["path"] == str(new_cache.absolute())
     assert old_cache.exists()
 
     with patch("hacksaws._ecr._run_container_engine") as engine:
@@ -734,7 +788,8 @@ def test_native_browser_logout_preserves_a_later_same_path_replacement(
     aws = tmp_path / "alternate-aws"
     cache = tmp_path / "shared-login-cache"
     old_cache = cache / "old.json"
-    new_cache = cache / "debug.json"
+    login_session = f"arn:aws:iam::{ACCOUNT}:user/test"
+    new_cache = cache / f"{_state.digest(login_session.encode())}.json"
     old_cache.parent.mkdir(parents=True)
     old_cache.write_text("old", encoding="utf-8")
     monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache))
@@ -752,22 +807,24 @@ def test_native_browser_logout_preserves_a_later_same_path_replacement(
         assert profile == "debug"
         assert login_cache == cache.absolute()
         config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(
-            "[profile debug]\nregion=us-west-2\nlogin_session=x\n",
-            encoding="utf-8",
+        assert (
+            _write_browser_login(config, login_cache, profile).absolute()
+            == new_cache.absolute()
         )
-        new_cache.write_text("new", encoding="utf-8")
 
     args = _args(directory=str(aws), profile="debug")
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=native),
-        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT, "aws", login_session),
+        ),
     ):
         _sessions.browser_login(_configs.Context(args))
     saved = _state.load_sessions()[f"{aws.absolute()}::debug"]
-    assert saved["login_cache_files"] == [str(new_cache.absolute())]
-    assert saved["login_cache_directories"] == [str(cache.absolute())]
+    assert saved["login_cache_lineage"]["path"] == str(new_cache.absolute())
+    assert saved["login_cache_lineage"]["root"] == str(cache.absolute())
     assert old_cache.read_text(encoding="utf-8") == "old"
     new_cache.write_text("independent replacement", encoding="utf-8")
     with pytest.raises(_configs.OperationalError, match="changed after login"):
@@ -787,7 +844,8 @@ def test_native_browser_post_login_failure_reports_complete_rollback(
     config.write_bytes(b"[default]\nregion=us-east-1\n")
     cache = tmp_path / "cache"
     old_cache = cache / "old.json"
-    new_cache = cache / "new.json"
+    login_session = f"arn:aws:iam::{ACCOUNT}:user/test"
+    new_cache = cache / f"{_state.digest(login_session.encode())}.json"
     cache.mkdir()
     old_cache.write_text("old", encoding="utf-8")
     monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache))
@@ -802,8 +860,10 @@ def test_native_browser_post_login_failure_reports_complete_rollback(
     ) -> None:
         del credentials, profile, remote
         assert login_cache == cache.absolute()
-        config_path.write_text("[profile debug]\nlogin_session=x\n", encoding="utf-8")
-        new_cache.write_text("broad", encoding="utf-8")
+        assert (
+            _write_browser_login(config_path, login_cache, "debug").absolute()
+            == new_cache.absolute()
+        )
 
     args = _args(directory=str(aws), profile="debug")
     with (
@@ -848,15 +908,16 @@ def test_bounded_browser_success_removes_login_session_and_staging(
         assert root / "staging" in login_cache.parents
         assert login_cache != inherited_cache
         config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text("[profile dev]\nregion=us-west-2\nlogin_session=x\n")
+        _write_browser_login(config, login_cache, "dev")
         credentials.write_text("[dev]\na=x\n")
-        login_cache.mkdir(parents=True)
-        (login_cache / "broad.json").write_text("broad", encoding="utf-8")
 
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=intermediate),
-        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT, "aws", f"arn:aws:iam::{ACCOUNT}:user/test"),
+        ),
         patch(
             "hacksaws._sessions._assume",
             return_value=(_credentials(), {"target_account": ACCOUNT}),
@@ -891,15 +952,17 @@ def test_bounded_browser_restores_environment_when_assume_fails(
         remote: bool,
         login_cache: Path,
     ) -> None:
-        del config, credentials, profile, remote
+        del credentials, remote
         assert inherited_cache not in login_cache.parents
-        login_cache.mkdir(parents=True)
-        (login_cache / "broad.json").write_text("broad", encoding="utf-8")
+        _write_browser_login(config, login_cache, profile)
 
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=MagicMock()),
-        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT, "aws", f"arn:aws:iam::{ACCOUNT}:user/test"),
+        ),
         patch("hacksaws._sessions._assume", side_effect=RuntimeError("after-auth")),
         pytest.raises(RuntimeError, match="after-auth"),
     ):
@@ -1006,7 +1069,8 @@ def test_logout_conservatively_preserves_legacy_unfingerprinted_cache(
     assert _sessions.logout(
         _configs.Context(_args(directory=str(aws), profile="dev", force=True))
     )
-    assert not cache.exists()
+    assert cache.exists()
+    assert _state.load_sessions()[key]["auth_method"] == "browser-cache-residue"
 
 
 def test_status_is_secret_free_and_handles_expiry_values(

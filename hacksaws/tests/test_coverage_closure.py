@@ -129,7 +129,9 @@ def test_typed_marker_and_build_metadata() -> None:
 
 def test_prettier_wrapper_forwards_paths_without_scanning_ignored_cache() -> None:
     git_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
-        ["git"], 0, b"README.md\0CHEATSHEET.md\0"
+        ["git"],
+        0,
+        b"README.md\0CHEATSHEET.md\0.tmp/pytest-cache/inaccessible\0",
     )
     prettier_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
         ["npx"], 0
@@ -155,6 +157,11 @@ def test_prettier_wrapper_forwards_paths_without_scanning_ignored_cache() -> Non
     ]
     assert not any(".cache" in argument for argument in run.call_args_list[1].args[0])
 
+    ignored = (
+        Path(__file__).parents[2].joinpath(".gitignore").read_text(encoding="utf-8")
+    )
+    assert ".tmp/" in ignored.splitlines()
+
 
 def test_prettier_wrapper_terminates_options_before_git_filenames() -> None:
     git_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
@@ -169,6 +176,7 @@ def test_prettier_wrapper_terminates_options_before_git_filenames() -> None:
             side_effect=[git_result, prettier_result],
         ) as run,
         patch("scripts.prettier.shutil.which", side_effect=["git", "npx"]),
+        patch("scripts.prettier.os.path.isfile", return_value=True),
     ):
         assert prettier.main(["write", "."]) == 0
 

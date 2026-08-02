@@ -17,6 +17,15 @@ profile `agent` in `~/.aws`. Use `--to-profile agent` to write into the source
 location, or a bounded target such as `hacksaws assume +prod-agent` to load the
 source, destination, role, and optional policy together.
 
+The concise same-location form is also supported:
+
+```shell
+hacksaws assume admin agent --name horizon --role AgentSession
+```
+
+Here `SOURCE` is `admin` and positional `DEST` is `agent`; `DEST` is exactly
+equivalent to `--to-profile agent` and conflicts with other destination forms.
+
 ## Destination safety
 
 A destination is mandatory. Choose exactly one:
@@ -97,3 +106,8 @@ hacksaws assume admin --role AgentSession --to default:agent --yes --json
 Preview and result JSON never include access keys, secret keys, session tokens,
 credential backups, or policy documents. Account or partition disagreement is a
 hard failure before local credential mutation.
+
+Browser sources tolerate ordinary token refresh only when live STS identity and
+stable hashed browser lineage still match. A different login generation or a
+refresh racing final deletion is preserved and reported as residue instead of
+being deleted as though Hacksaws still owned it.

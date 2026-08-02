@@ -19,6 +19,8 @@ from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
+from hacksaws import _audit
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -249,10 +251,15 @@ def confirm(
 ) -> bool:
     """Ask a safe default-no confirmation without allowing noninteractive hangs."""
     if assume_yes:
+        _audit.note_confirmation("yes-flag", "bypassed")
         return True
     if not interactive:
+        _audit.note_confirmation("yes-no", "unavailable")
         return False
     source = sys.stdin if stdin is None else stdin
     if not bool(getattr(source, "isatty", lambda: False)()):
+        _audit.note_confirmation("yes-no", "unavailable")
         return False
-    return input(f"{prompt} [y/N] ").strip().casefold() in {"y", "yes"}
+    accepted = input(f"{prompt} [y/N] ").strip().casefold() in {"y", "yes"}
+    _audit.note_confirmation("yes-no", "accepted" if accepted else "declined")
+    return accepted

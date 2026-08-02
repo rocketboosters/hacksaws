@@ -28,9 +28,11 @@ from hacksaws._iam_managed_policies import ManagedPolicyArn
 from hacksaws._iam_managed_policies import ManagedPolicyRecord
 from hacksaws._iam_managed_policies import OperationJournal
 from hacksaws._iam_managed_policies import OperationPlan
+from hacksaws._iam_managed_policies import OperationStep
 from hacksaws._iam_managed_policies import PackedPolicyDiagnostic
 from hacksaws._iam_managed_policies import PackedPolicyProbeError
 from hacksaws._iam_managed_policies import PackedPolicyWarning
+from hacksaws._iam_managed_policies import PlannedPolicyState
 from hacksaws._iam_managed_policies import PolicyChangePlan
 from hacksaws._iam_managed_policies import PolicyDeletionPlan
 from hacksaws._iam_managed_policies import PolicyDependencies
@@ -68,6 +70,9 @@ def record(
             Tag("hacksaws:managed-by", "hacksaws"),
             Tag("hacksaws:resource-id", "resource-1"),
             Tag("hacksaws:resource-kind", "managed-policy"),
+            Tag("hacksaws:created-by", f"arn:aws:iam::{ACCOUNT}:user/tester"),
+            Tag("hacksaws:created-at", NOW.isoformat()),
+            Tag("hacksaws:ownership-origin", "created"),
         )
         if owned and not aws
         else ()
@@ -243,6 +248,28 @@ def test_create_reports_no_change_and_conflict_requires_replace(
     assert result.code == "IAM_POLICY_COLLISION"
 
 
+def test_create_replace_never_adopts_an_unowned_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "AgentRead.json"
+    path.write_text(json.dumps(DOCUMENT), encoding="utf-8")
+    fake = service()
+    unowned = record(owned=False)
+    fake.resolve.return_value = ResolutionResult("AgentRead", (unowned,))
+    fake.get_policy.return_value = unowned
+    monkeypatch.setattr(cli, "_service", lambda _: fake)
+    monkeypatch.setattr(cli._state, "load_config", _state.default_config)
+
+    result = cli.dispatch(
+        parser().parse_args(["create", str(path), "--replace", "--yes"]), context()
+    )
+
+    assert result is not None
+    assert result.code == "IAM_POLICY_COLLISION"
+    assert "adopt" in result.message
+    fake.plan_publish.assert_not_called()
+
+
 def test_generated_create_name_can_be_accepted_edited_or_cancelled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -360,8 +387,50 @@ def test_noninteractive_update_fails_closed(
         parser().parse_args(["update", "AgentRead", str(path)]), context()
     )
     assert result is not None
-    assert result.code == "IAM_POLICY_CANCELLED"
+    assert result.code == "IAM_POLICY_CONFIRMATION_REQUIRED"
+    assert result.exit_code == 4
     fake.execute_change.assert_not_called()
+
+
+def test_policy_inputs_are_order_independent_and_explicit(tmp_path: Path) -> None:
+    source = tmp_path / "policy.json"
+    source.write_text(json.dumps(DOCUMENT), encoding="utf-8")
+    for values in (
+        ["create", "AgentRead", str(source)],
+        ["create", str(source), "AgentRead"],
+        ["create", "--name", "AgentRead", "--file", str(source)],
+    ):
+        args = parser().parse_args(values)
+        cli.normalize_arguments(args)
+        assert args.name == "AgentRead"
+        assert args.file == str(source)
+
+    args = parser().parse_args(["update", str(source), "AgentRead"])
+    cli.normalize_arguments(args)
+    assert args.policy_or_file == "AgentRead"
+    assert args.file == str(source)
+
+    with pytest.raises(cli.OperationalError, match="Unable to distinguish"):
+        cli.normalize_arguments(parser().parse_args(["create", "one", "two"]))
+
+    with pytest.raises(cli.OperationalError, match="cannot be combined with --file"):
+        cli.normalize_arguments(
+            parser().parse_args(
+                ["update", "AgentRead", "--from-stored", "Saved", "--file", str(source)]
+            )
+        )
+    with pytest.raises(cli.OperationalError, match="at most one policy reference"):
+        cli.normalize_arguments(
+            parser().parse_args(
+                [
+                    "update",
+                    "AgentRead",
+                    "Other",
+                    "--from-stored",
+                    "Saved",
+                ]
+            )
+        )
 
 
 def test_ambiguous_reference_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -578,7 +647,7 @@ def test_edit_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     result = cli.dispatch(parser().parse_args(["edit", "AgentRead"]), context())
     assert result is not None
-    assert result.code == "IAM_POLICY_CHANGED"
+    assert result.code == "IAM_POLICY_NO_CHANGE"
     monkeypatch.setattr(
         cli.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=7)
     )
@@ -608,7 +677,7 @@ def test_rollback_and_owned_delete_execute(monkeypatch: pytest.MonkeyPatch) -> N
         parser().parse_args(["rollback", "AgentRead", "v1", "--yes"]), context()
     )
     assert result is not None
-    assert result.code == "IAM_POLICY_CHANGED"
+    assert result.code == "IAM_POLICY_NO_CHANGE"
 
     dependencies = PolicyDependencies(
         permission_roles=(EntityReference("Role", "Agent", "R1"),)
@@ -627,7 +696,7 @@ def test_rollback_and_owned_delete_execute(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert result is not None
     assert result.code == "IAM_POLICY_DELETED"
-    assert result.data["dependencies"]["permissionRoles"] == ["Agent"]
+    assert result.data["plan"]["dependencies"]["permissionRoles"] == ["Agent"]
 
 
 def test_check_success_warning_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -695,13 +764,81 @@ def test_tag_list_remove_and_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
         parser().parse_args(["adopt", "AgentRead", "--yes"]), context()
     )
     assert result is not None
-    assert result.code == "IAM_POLICY_OWNERSHIP_CHANGED"
+    assert result.code == "IAM_POLICY_NO_CHANGE"
     fake.plan_release.return_value = ownership_plan
     result = cli.dispatch(
         parser().parse_args(["release", "AgentRead", "--yes"]), context()
     )
     assert result is not None
-    assert result.data["action"] == "release"
+    assert result.data["result"]["action"] == "release"
+
+
+def test_ownership_plan_dry_run_confirmation_decline_and_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = replace(record(), tags=(*record().tags, Tag("team", "agents")))
+    after_tags = (Tag("team", "agents"),)
+    remove = tuple(tag.key for tag in current.tags if tag.key != "team")
+    step = OperationStep("release", "UntagPolicy", {"TagKeys": list(remove)})
+    plan = TagChangePlan(
+        current,
+        OperationPlan("release", ChangeAction.RELEASE, "Release policy.", (step,)),
+        (),
+        remove,
+        "digest",
+        before_tags=current.tags,
+        after_tags=after_tags,
+    )
+    fake = service()
+    fake.plan_release.return_value = plan
+    fake.get_policy.return_value = current
+    monkeypatch.setattr(cli, "_service", lambda _: fake)
+
+    dry_run = cli.dispatch(
+        parser().parse_args(["release", "AgentRead", "--dry-run"]), context()
+    )
+    assert dry_run is not None
+    assert dry_run.code == "IAM_POLICY_OWNERSHIP_DRY_RUN"
+    after_values = dry_run.data["plan"]["changes"]["tags"]["after"]
+    assert after_values["team"].startswith("sha256:")
+    assert "agents" not in json.dumps(dry_run.data)
+    assert dry_run.data["result"]["journalId"] is None
+
+    monkeypatch.setattr(cli.sys, "stdin", StringIO())
+    required = cli.dispatch(parser().parse_args(["release", "AgentRead"]), context())
+    assert required is not None
+    assert required.code == "IAM_POLICY_CONFIRMATION_REQUIRED"
+
+    monkeypatch.setattr(cli, "_confirmation_unavailable", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "not-now")
+    declined = cli.dispatch(parser().parse_args(["release", "AgentRead"]), context())
+    assert declined is not None
+    assert declined.code == "IAM_POLICY_CANCELLED"
+
+    applied = cli.dispatch(
+        parser().parse_args(["release", "AgentRead", "--yes"]), context()
+    )
+    assert applied is not None
+    assert applied.code == "IAM_POLICY_OWNERSHIP_CHANGED"
+    assert applied.message.startswith("Released ownership")
+    assert applied.data["result"]["journalId"] == "journal-1"
+
+    fallback = TagChangePlan(
+        current,
+        OperationPlan("release", ChangeAction.RELEASE, "Release policy.", (step,)),
+        (),
+        ("team",),
+        "digest",
+    )
+    fallback_data = cli._ownership_plan_data(fallback, context(), "release")
+    assert "team" not in fallback_data["changes"]["tags"]["after"]
+
+    fake.get_policy.return_value = replace(current, tags=after_tags)
+    drifted = cli.dispatch(
+        parser().parse_args(["release", "AgentRead", "--yes"]), context()
+    )
+    assert drifted is not None
+    assert drifted.code == "IAM_POLICY_DRIFT"
 
 
 def test_dispatch_normalizes_drift_and_unknown_action(
@@ -795,9 +932,189 @@ def test_policy_dry_run_returns_plan_without_confirmation_or_journal() -> None:
         context(),
     )
     assert result.code == "IAM_POLICY_DRY_RUN"
-    assert result.data["dryRun"] is True
-    assert result.data["classification"] == "planned"
+    assert result.data["result"]["classification"] == "dry-run"
+    assert result.data["result"]["journalId"] is None
+    assert result.data["plan"]["classification"] == "planned"
     assert fake.execute_change.call_count == 0
+
+
+def test_policy_plan_has_exact_deltas_without_documents_or_parameters() -> None:
+    before_record = record()
+    raw_tag_values = (
+        "TAG-CANARY-BEFORE",
+        "TAG-CANARY-AFTER",
+        "TAG-CANARY-ADDED",
+    )
+    before_tags = (*before_record.tags, Tag("environment", raw_tag_values[0]))
+    after_tags = (
+        *before_record.tags,
+        Tag("environment", raw_tag_values[1]),
+        Tag("team", raw_tag_values[2]),
+    )
+    after_document: dict[str, JsonValue] = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["logs:GetLogEvents", "logs:FilterLogEvents"],
+                "Resource": "arn:aws:logs:*:*:log-group:private-agent-log",
+            }
+        ],
+    }
+    before = PlannedPolicyState(
+        ARN,
+        "ANPA123",
+        "AgentRead",
+        "/hacksaws/",
+        None,
+        DOCUMENT,
+        before_tags,
+        "v1",
+    )
+    after = replace(before, document=after_document, tags=after_tags)
+    step = OperationStep(
+        "publish",
+        "CreatePolicyVersion",
+        {
+            "PolicyArn": ARN,
+            "PolicyDocument": after_document,
+            "SecretAccessKey": "must-not-leak",
+        },
+    )
+    plan = PolicyChangePlan(
+        OperationPlan("plan", ChangeAction.UPDATE, "Update policy.", (step,)),
+        ManagedPolicyArn.parse(ARN),
+        "AgentRead",
+        "/hacksaws/",
+        after_document,
+        None,
+        after_tags,
+        validation=ValidationReport(),
+        before=before,
+        after=after,
+    )
+
+    data = cli._policy_plan_data(plan, context(), [], [])
+    encoded = json.dumps(data)
+    assert "private-agent-log" not in encoded
+    assert "must-not-leak" not in encoded
+    changed_tag = data["changes"]["tags"]["changed"]["environment"]
+    assert changed_tag["before"].startswith("sha256:")
+    assert changed_tag["after"].startswith("sha256:")
+    assert data["changes"]["tags"]["added"]["team"].startswith("sha256:")
+    assert data["changes"]["document"]["after"]["actions"] == 2
+    assert data["operations"] == [
+        {
+            "id": "publish",
+            "action": "CreatePolicyVersion",
+            "destructive": False,
+            "reversible": False,
+            "detail": {},
+        }
+    ]
+    review = cli._policy_plan_text(data)
+    assert review.endswith("No changes have been made.")
+    assert "environment: sha256:" in review
+    assert all(value not in review for value in raw_tag_values)
+
+    version_step = cli._policy_step_data(
+        OperationStep("delete-version", "DeletePolicyVersion", {"VersionId": "v2"})
+    )
+    assert version_step["detail"] == {"versionId": "v2"}
+    tag_step = cli._policy_step_data(
+        OperationStep(
+            "tag",
+            "TagPolicy",
+            {"Tags": [{"Key": "team", "Value": "ai"}, {"Value": "ignored"}]},
+        )
+    )
+    assert tag_step["detail"] == {"tagKeys": ["team"]}
+    untag_step = cli._policy_step_data(
+        OperationStep("untag", "UntagPolicy", {"TagKeys": ["old", "team"]})
+    )
+    assert untag_step["detail"] == {"tagKeys": ["old", "team"]}
+
+    warned = {**data, "warnings": ["Review the account boundary."]}
+    assert "Warnings:" in cli._policy_plan_text(warned)
+
+
+def test_interactive_decline_is_cancelled_without_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = OperationStep("publish", "CreatePolicyVersion", {"PolicyArn": ARN})
+    plan = PolicyChangePlan(
+        OperationPlan("plan", ChangeAction.UPDATE, "Update policy.", (step,)),
+        ManagedPolicyArn.parse(ARN),
+        "AgentRead",
+        "/hacksaws/",
+        DOCUMENT,
+        None,
+        record().tags,
+        validation=ValidationReport(),
+    )
+    monkeypatch.setattr(cli, "_confirmation_unavailable", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    durable = Mock(side_effect=AssertionError("journal must not be created"))
+    monkeypatch.setattr(cli, "_durable_reconcile", durable)
+
+    result = cli._execute_plan(
+        service(), plan, argparse.Namespace(yes=False, dry_run=False), context()
+    )
+
+    assert result.code == "IAM_POLICY_CANCELLED"
+    assert result.data["result"]["classification"] == "cancelled"
+    durable.assert_not_called()
+
+
+def test_noop_skips_confirmation_and_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = PolicyChangePlan(
+        OperationPlan("plan", ChangeAction.NOOP, "Already current.", ()),
+        ManagedPolicyArn.parse(ARN),
+        "AgentRead",
+        "/hacksaws/",
+        DOCUMENT,
+        None,
+        record().tags,
+        validation=ValidationReport(),
+    )
+    fake = service()
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("no-op must not prompt")
+    )
+    durable = Mock(side_effect=AssertionError("no-op must not create a journal"))
+    monkeypatch.setattr(cli, "_durable_reconcile", durable)
+
+    result = cli._execute_plan(
+        fake, plan, argparse.Namespace(yes=False, dry_run=False), context()
+    )
+
+    assert result.code == "IAM_POLICY_NO_CHANGE"
+    assert result.data["result"]["classification"] == "no-change"
+    assert result.data["result"]["journalId"] is None
+    durable.assert_not_called()
+
+
+def test_change_state_snapshot_rejects_missing_document_and_drift() -> None:
+    plan = PolicyChangePlan(
+        OperationPlan("plan", ChangeAction.UPDATE, "Update policy.", ()),
+        ManagedPolicyArn.parse(ARN),
+        "AgentRead",
+        "/hacksaws/",
+        DOCUMENT,
+        None,
+        record().tags,
+        expected_default_version_id="v1",
+        expected_digest=cli.policy_digest(DOCUMENT),
+        validation=ValidationReport(),
+    )
+    fake = service()
+    fake.get_policy.return_value = record(document=False)
+    with pytest.raises(cli.PolicyServiceError, match="document is unavailable"):
+        cli._change_states(fake, plan)
+
+    fake.get_policy.return_value = replace(record(), default_version_id="v2")
+    with pytest.raises(cli.PolicyDriftError, match="changed after planning"):
+        cli._change_states(fake, plan)
 
 
 def test_missing_reference_and_missing_document_are_errors(
@@ -869,7 +1186,37 @@ def test_delete_dependencies_and_confirmation_are_safe(
     monkeypatch.setattr(cli.sys, "stdin", StringIO())
     result = cli.dispatch(parser().parse_args(["delete", "AgentRead"]), context())
     assert result is not None
-    assert result.code == "IAM_POLICY_CANCELLED"
+    assert result.code == "IAM_POLICY_CONFIRMATION_REQUIRED"
+    assert result.exit_code == 4
+
+
+def test_delete_interactive_decline_and_post_plan_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planned_policy = record()
+    plan = PolicyDeletionPlan(
+        policy=planned_policy,
+        dependencies=PolicyDependencies(),
+        operation=OperationPlan("delete", ChangeAction.DELETE, "Delete policy.", ()),
+        cascade=False,
+    )
+    fake = service()
+    fake.plan_delete.return_value = plan
+    monkeypatch.setattr(cli, "_service", lambda _: fake)
+    monkeypatch.setattr(cli, "_confirmation_unavailable", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "wrong-name")
+
+    declined = cli.dispatch(parser().parse_args(["delete", "AgentRead"]), context())
+    assert declined is not None
+    assert declined.code == "IAM_POLICY_CANCELLED"
+    assert declined.data["result"]["classification"] == "cancelled"
+
+    fake.get_policy.return_value = replace(planned_policy, policy_id="ANPA-REPLACED")
+    drifted = cli.dispatch(
+        parser().parse_args(["delete", "AgentRead", "--yes"]), context()
+    )
+    assert drifted is not None
+    assert drifted.code == "IAM_POLICY_DRIFT"
 
 
 def test_dispatch_normalizes_immutable_and_os_errors(
@@ -1200,9 +1547,9 @@ def test_delete_requires_explicit_boundary_removal_and_snapshots_preview(
     )
     assert deleted is not None
     assert deleted.code == "IAM_POLICY_DELETED"
-    assert deleted.data["preview"]["attachments"]["roles"] == ["Reader"]
-    assert deleted.data["preview"]["permissionBoundaries"]["users"] == ["Restricted"]
-    assert deleted.data["preview"]["versions"][0]["id"] == "v1"
+    assert deleted.data["plan"]["dependencies"]["permissionRoles"] == ["Reader"]
+    assert deleted.data["plan"]["dependencies"]["boundaryUsers"] == ["Restricted"]
+    assert deleted.data["result"]["policyId"] == "ANPA123"
     assert snapshots[0][0]["exists"] is False
     assert snapshots[0][1]["dependencies"]["boundaryUsers"] == [
         {"type": "User", "name": "Restricted", "id": "U1"}

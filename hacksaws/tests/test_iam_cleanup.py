@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import threading
 from dataclasses import replace
@@ -16,6 +17,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from hacksaws import _iam_cleanup as cleanup
+from hacksaws import _iam_cli as iam_cli
 from hacksaws import _iam_managed_policies as managed
 from hacksaws import _iam_recovery as recovery
 from hacksaws import _iam_roles as roles
@@ -39,7 +41,13 @@ def policy(
         managed.Tag("hacksaws:resource-id", resource_id),
     ]
     if origin is not None:
-        tags.append(managed.Tag(cleanup.ORIGIN_TAG, origin))
+        tags.extend(
+            (
+                managed.Tag("hacksaws:created-by", CALLER),
+                managed.Tag("hacksaws:created-at", "2026-08-01T00:00:00+00:00"),
+                managed.Tag(cleanup.ORIGIN_TAG, origin),
+            )
+        )
     return managed.ManagedPolicyRecord(
         managed.ManagedPolicyArn.parse(
             f"arn:aws:iam::{ACCOUNT}:policy/hacksaws/{name}"
@@ -321,6 +329,64 @@ def test_inventory_classifies_origins_groups_smoke_and_filters() -> None:
     )
     assert selected == (inventory.items[2],)
     assert inventory.as_dict()["count"] == 3
+
+
+def test_legacy_is_visible_by_default_but_cleanup_requires_explicit_origin() -> None:
+    legacy = policy(
+        "hacksaws-Agents-assume-roles",
+        resource_id="group-Agents",
+        origin=None,
+    )
+    selected = service(policy_values=(legacy,))
+    summary, _, _ = summary_service(policy_values=(legacy,))
+    visible = summary.inventory_summary(cleanup.InventoryQuery())
+    assert [item.origin for item in visible.items] == [cleanup.OwnershipOrigin.LEGACY]
+
+    safe_default = selected.plan(cleanup.CleanupOptions(all_resources=True))
+    assert safe_default.resources == ()
+    explicit = selected.plan(
+        cleanup.CleanupOptions(
+            all_resources=True,
+            origins=frozenset({cleanup.OwnershipOrigin.LEGACY}),
+        )
+    )
+    assert [item.origin for item in explicit.resources] == [
+        cleanup.OwnershipOrigin.LEGACY
+    ]
+    default_args = argparse.Namespace(created=False, adopted=False, legacy=False)
+    explicit_args = argparse.Namespace(created=False, adopted=False, legacy=True)
+    assert cleanup.OwnershipOrigin.LEGACY not in iam_cli._cleanup_origins(default_args)
+    assert iam_cli._cleanup_origins(explicit_args) == frozenset(
+        {cleanup.OwnershipOrigin.LEGACY}
+    )
+
+
+def test_recovery_call_rejects_ownership_tag_drift_before_mutation() -> None:
+    class TaggedIam:
+        def __init__(self) -> None:
+            self.deleted = False
+
+        def get_policy(self, **_kwargs: object) -> dict[str, object]:
+            return {"Policy": {"PolicyId": "ANPA-STABLE"}}
+
+        def list_policy_tags(self, **_kwargs: object) -> dict[str, object]:
+            return {"Tags": [{"Key": "owner", "Value": "changed"}]}
+
+        def delete_policy(self, **_kwargs: object) -> None:
+            self.deleted = True
+
+    iam = TaggedIam()
+    with pytest.raises(OperationalError, match="ownership tags changed"):
+        cleanup._call(
+            SimpleNamespace(iam=iam),
+            "delete_policy",
+            {
+                "PolicyArn": "arn:aws:iam::123456789012:policy/hacksaws/Test",
+                "ExpectedPolicyId": "ANPA-STABLE",
+                "ExpectedOwnershipTags": {"owner": "planned"},
+            },
+        )
+    assert not iam.deleted
 
 
 def test_summary_inventory_has_bounded_call_budget_and_stable_output() -> None:
@@ -916,7 +982,7 @@ def test_origin_tags_are_emitted_for_create_and_adopt() -> None:
         for operation in adopted.operations
         for item in operation.params["Tags"]
     }
-    assert tags[roles.ORIGIN_TAG] == "adopted"
+    assert tags[roles.ORIGIN_TAG] == "legacy"
 
 
 def test_policy_dependency_steps_cover_every_relationship_and_drift() -> None:

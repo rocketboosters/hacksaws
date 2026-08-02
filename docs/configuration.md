@@ -27,5 +27,18 @@ performs a deny-all AssumeRole probe before offering interactive repairs.
 Naming rules have global account defaults and policy/role overrides for prefix,
 suffix, case, path, and enforcement.
 
+Local history settings are first-class options as well:
+
+```shell
+hacksaws config get history.enabled
+hacksaws config set history.enabled false
+hacksaws config set history.max_age 7776000
+hacksaws config set history.max_entries 10000
+hacksaws config set history.max_bytes 52428800
+```
+
+The limits use seconds, entries, and bytes. See
+[Local command history](history.md) for the redaction and retention contract.
+
 `config export` creates a portable zip excluding temporary caches.
 `config import` validates the complete archive before replacing state.

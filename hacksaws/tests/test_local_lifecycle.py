@@ -547,17 +547,18 @@ def test_browser_cache_cleanup_is_scoped_and_fingerprint_guarded(
     }
     with pytest.raises(_configs.OperationalError, match="no logout changes"):
         _sessions._tracked_login_cache_plan(session, destination, force=False)
-    roots, removals, residue = _sessions._tracked_login_cache_plan(
+    roots, removals, residue, _ = _sessions._tracked_login_cache_plan(
         session, destination, force=True
     )
     assert roots == [root.absolute()]
     residue = _sessions._remove_tracked_login_cache(removals, residue, force=True)
     assert not matched.exists()
-    assert not changed.exists()
+    assert changed.exists()
     assert outside.exists()
-    assert residue == [
-        {"path": str(outside.absolute()), "reason": "outside tracked cache roots"}
-    ]
+    assert {item["path"] for item in residue} == {
+        str(changed.absolute()),
+        str(outside.absolute()),
+    }
 
 
 def test_logout_not_managed_and_bulk_collects_independent_errors(
@@ -904,11 +905,14 @@ def test_browser_logout_cache_drift_fails_closed_and_force_tracks_residue(
 
     outcome = _sessions._logout_key(key, _logout_args(directory, force=True))
     assert outcome["state"] == "logout-residue"
-    assert not changed.exists()
+    assert changed.exists()
     assert outside.exists()
     residue_session = _state.load_sessions()[key]
     assert residue_session["auth_method"] == "browser-cache-residue"
-    assert residue_session["login_cache_residue"][0]["path"] == str(outside.absolute())
+    assert {item["path"] for item in residue_session["login_cache_residue"]} == {
+        str(changed.absolute()),
+        str(outside.absolute()),
+    }
 
 
 def test_config_check_scopes_local_stored_policies_to_selected_account(

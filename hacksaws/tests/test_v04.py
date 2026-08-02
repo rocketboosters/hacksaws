@@ -65,6 +65,36 @@ def _minimal_target(home: Path, *, boundary: bool = False) -> None:
     _state.save_config(data)
 
 
+def _browser_login_files(config: Path, cache: Path, profile: str) -> Path:
+    login_session = "arn:aws:iam::123456789012:user/dev"
+    parser = _sessions._read_ini(config)
+    parser[_sessions._section(profile, config=True)] = {
+        "login_session": login_session,
+        "region": "us-east-1",
+    }
+    _sessions._write_ini(config, parser)
+    cache.mkdir(parents=True, exist_ok=True)
+    path = cache / f"{_state.digest(login_session.encode())}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "accessToken": {
+                    "accessKeyId": "access",
+                    "secretAccessKey": "secret",
+                    "sessionToken": "token",
+                    "accountId": "123456789012",
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                },
+                "refreshToken": "refresh",
+                "clientId": "client",
+                "dpopKey": "dpop-generation",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_remote_name_listing_failure_is_only_same_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,12 +277,22 @@ def test_native_browser_cache_is_removed_after_identity_failure(
 ) -> None:
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "home"))
     _minimal_target(tmp_path)
-    cache_file = tmp_path / "aws" / "login" / "cache" / "new.json"
-    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache_file.parent))
+    cache_root = tmp_path / "aws" / "login" / "cache"
+    cache_file = cache_root / (
+        f"{_state.digest(b'arn:aws:iam::123456789012:user/dev')}.json"
+    )
+    monkeypatch.setenv("AWS_LOGIN_CACHE_DIRECTORY", str(cache_root))
 
-    def fake_login(*args: object, **kwargs: object) -> None:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text("{}", encoding="utf-8")
+    def fake_login(
+        config: Path,
+        _credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del remote
+        assert _browser_login_files(config, login_cache, profile) == cache_file
 
     namespace = _cli._create_parser().parse_args(["web", "in", "+Prod"])
     _cli._validate_login(namespace)
@@ -605,8 +645,19 @@ def test_bounded_browser_ecr_is_cleaned_when_assume_role_fails(
         on_success(registry)  # type: ignore[operator]
         return [registry]
 
+    def browser_login(
+        config: Path,
+        _credentials: Path,
+        profile: str,
+        *,
+        remote: bool,
+        login_cache: Path,
+    ) -> None:
+        del remote
+        _browser_login_files(config, login_cache, profile)
+
     with (
-        patch("hacksaws._sessions._aws_login"),
+        patch("hacksaws._sessions._aws_login", side_effect=browser_login),
         patch("boto3.Session", return_value=MagicMock(region_name="us-east-1")),
         patch(
             "hacksaws._sessions._identity",
@@ -781,7 +832,7 @@ def test_remote_check_does_not_scope_same_id_other_partition(
     iam.get_role.assert_not_called()
 
 
-def test_cache_rollback_restores_modified_deleted_and_removes_created(
+def test_generic_rollback_does_not_snapshot_or_rewrite_cache_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "home"))
@@ -792,14 +843,14 @@ def test_cache_rollback_restores_modified_deleted_and_removes_created(
     created = cache / "created.json"
     modified.write_bytes(b"original-modified")
     deleted.write_bytes(b"original-deleted")
-    journal = _sessions._begin([], cache_roots=[cache])
+    journal = _sessions._begin([])
     modified.write_bytes(b"changed")
     deleted.unlink()
     created.write_bytes(b"new")
     _sessions._rollback(journal)
-    assert modified.read_bytes() == b"original-modified"
-    assert deleted.read_bytes() == b"original-deleted"
-    assert not created.exists()
+    assert modified.read_bytes() == b"changed"
+    assert not deleted.exists()
+    assert created.read_bytes() == b"new"
 
 
 def test_import_rejects_manifest_declared_unused_junk(

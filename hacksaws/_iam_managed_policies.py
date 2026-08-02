@@ -173,6 +173,23 @@ class PolicyKind(StrEnum):
     CUSTOMER_MANAGED = "customer-managed"
 
 
+class OwnershipOrigin(StrEnum):
+    """Supported ownership origins persisted on current resources."""
+
+    CREATED = "created"
+    ADOPTED = "adopted"
+    LEGACY = "legacy"
+
+
+class OwnershipStatus(StrEnum):
+    """Safety classification for the complete protected tag domain."""
+
+    CURRENT = "current"
+    LEGACY = "legacy"
+    UNOWNED = "unowned"
+    UNSAFE = "unsafe"
+
+
 class DiagnosticSeverity(StrEnum):
     """Severity of a local or AWS policy validation diagnostic."""
 
@@ -268,6 +285,99 @@ class Tag:
         return {"Key": self.key, "Value": self.value}
 
 
+def _protected_tag_values(tags: Iterable[Tag]) -> dict[str, str] | None:
+    """Return case-folded protected tags, or ``None`` for duplicate keys."""
+    values: dict[str, str] = {}
+    for tag in tags:
+        key = tag.key.casefold()
+        if key not in RESERVED_TAGS:
+            continue
+        if key in values:
+            return None
+        values[key] = tag.value
+    return values
+
+
+def classify_ownership(tags: Iterable[Tag]) -> OwnershipStatus:  # noqa: PLR0911
+    """Classify current, safely legacy, truly unowned, and unsafe tag sets."""
+    values = _protected_tag_values(tags)
+    if values is None:
+        return OwnershipStatus.UNSAFE
+    if not values:
+        return OwnershipStatus.UNOWNED
+    core = OWNERSHIP_TAGS
+    legacy_audit = RESERVED_TAGS - {"hacksaws:ownership-origin"}
+    migrated_core = core | {"hacksaws:ownership-origin"}
+    if set(values) not in {core, legacy_audit, migrated_core, RESERVED_TAGS}:
+        return OwnershipStatus.UNSAFE
+    if (
+        values.get("hacksaws:managed-by") != "hacksaws"
+        or values.get("hacksaws:resource-kind") != "managed-policy"
+        or not values.get("hacksaws:resource-id")
+    ):
+        return OwnershipStatus.UNSAFE
+    if set(values) in {core, legacy_audit}:
+        if set(values) == legacy_audit and (
+            not values.get("hacksaws:created-by")
+            or not values.get("hacksaws:created-at")
+        ):
+            return OwnershipStatus.UNSAFE
+        return OwnershipStatus.LEGACY
+    if set(values) == migrated_core:
+        return (
+            OwnershipStatus.CURRENT
+            if values.get("hacksaws:ownership-origin") == OwnershipOrigin.LEGACY.value
+            else OwnershipStatus.UNSAFE
+        )
+    if not values.get("hacksaws:created-by") or not values.get("hacksaws:created-at"):
+        return OwnershipStatus.UNSAFE
+    if values.get("hacksaws:ownership-origin") not in {
+        item.value for item in OwnershipOrigin
+    }:
+        return OwnershipStatus.UNSAFE
+    return OwnershipStatus.CURRENT
+
+
+def ownership_origin(tags: Iterable[Tag]) -> OwnershipOrigin | None:
+    """Return a safe policy origin, inferring only complete legacy ownership."""
+    status = classify_ownership(tags)
+    if status is OwnershipStatus.LEGACY:
+        return OwnershipOrigin.LEGACY
+    if status is not OwnershipStatus.CURRENT:
+        return None
+    values = _protected_tag_values(tags)
+    if values is None:  # pragma: no cover - guaranteed by current status
+        return None
+    return OwnershipOrigin(values["hacksaws:ownership-origin"])
+
+
+def reconcile_owned_tags(
+    policy: ManagedPolicyRecord, user_tags: Sequence[Tag] = ()
+) -> tuple[Tag, ...]:
+    """Build exact owned-policy tags while preserving its immutable identity."""
+    collisions = [tag.key for tag in user_tags if tag.key.casefold() in RESERVED_TAGS]
+    if collisions:
+        message = f"User tags cannot override reserved tags: {', '.join(collisions)}."
+        raise PolicyServiceError(message)
+    status = policy.ownership_status
+    if status is OwnershipStatus.UNOWNED:
+        message = (
+            f"Policy {policy.arn.value} is not Hacksaws-owned; adopt it before "
+            "creating or updating it by name."
+        )
+        raise PolicyServiceError(message)
+    if status is OwnershipStatus.UNSAFE:
+        message = (
+            f"Policy {policy.arn.value} has conflicting or partial Hacksaws "
+            "ownership tags; repair or release those tags explicitly."
+        )
+        raise PolicyServiceError(message)
+    protected = [tag for tag in policy.tags if tag.key.casefold() in RESERVED_TAGS]
+    if status is OwnershipStatus.LEGACY:
+        protected.append(Tag("hacksaws:ownership-origin", OwnershipOrigin.LEGACY.value))
+    return (*user_tags, *protected)
+
+
 @dataclass(frozen=True, slots=True)
 class RepairAction:
     """Machine-readable proposed correction for a diagnostic."""
@@ -342,13 +452,21 @@ class ManagedPolicyRecord:
 
     @property
     def owned(self) -> bool:
-        """Return whether standard Hacksaws ownership tags are present."""
-        values = {tag.key.casefold(): tag.value for tag in self.tags}
-        return (
-            values.get("hacksaws:managed-by") == "hacksaws"
-            and values.get("hacksaws:resource-kind") == "managed-policy"
-            and bool(values.get("hacksaws:resource-id"))
-        )
+        """Return whether the policy has a safe current or legacy identity."""
+        return classify_ownership(self.tags) in {
+            OwnershipStatus.CURRENT,
+            OwnershipStatus.LEGACY,
+        }
+
+    @property
+    def ownership_status(self) -> OwnershipStatus:
+        """Return the complete protected-tag safety classification."""
+        return classify_ownership(self.tags)
+
+    @property
+    def ownership_origin(self) -> OwnershipOrigin | None:
+        """Return the safe ownership origin, including inferred legacy origin."""
+        return ownership_origin(self.tags)
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,9 +559,26 @@ class PolicyChangePlan:
     tags: tuple[Tag, ...]
     expected_default_version_id: str | None = None
     expected_digest: str | None = None
+    expected_tag_digest: str | None = None
     prune_version_id: str | None = None
     rollback_version_id: str | None = None
     validation: ValidationReport = ValidationReport()
+    before: PlannedPolicyState | None = None
+    after: PlannedPolicyState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedPolicyState:
+    """Credential-free semantic state used by previews and durable adapters."""
+
+    arn: str
+    policy_id: str | None
+    name: str
+    path: str
+    description: str | None
+    document: dict[str, JsonValue]
+    tags: tuple[Tag, ...]
+    default_version_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +657,8 @@ class TagChangePlan:
     add: tuple[Tag, ...]
     remove: tuple[str, ...]
     expected_digest: str
+    before_tags: tuple[Tag, ...] = ()
+    after_tags: tuple[Tag, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1061,6 +1198,18 @@ class IamManagedPolicyService:
             raise PolicyValidationError(report)
         return tuple(result)
 
+    def reconciled_owned_tags(
+        self,
+        policy: ManagedPolicyRecord,
+        user_tags: Sequence[Tag] = (),
+    ) -> tuple[Tag, ...]:
+        """Return exact desired tags without ever rewriting owned identity tags."""
+        result = reconcile_owned_tags(policy, user_tags)
+        report = ValidationReport(tuple(self._validate_tags(result)))
+        if not report.valid:
+            raise PolicyValidationError(report)
+        return tuple(result)
+
     def list_policies(
         self,
         *,
@@ -1291,6 +1440,47 @@ class IamManagedPolicyService:
             )
         return replace(current, tags=tags, document=document, versions=versions)
 
+    @staticmethod
+    def _planned_state(  # noqa: PLR0913
+        *,
+        arn: str,
+        policy_id: str | None,
+        name: str,
+        path: str,
+        description: str | None,
+        document: dict[str, JsonValue],
+        tags: Sequence[Tag],
+        default_version_id: str | None,
+    ) -> PlannedPolicyState:
+        """Build a typed renderer/recovery checkpoint from semantic policy data."""
+        return PlannedPolicyState(
+            arn,
+            policy_id,
+            name,
+            path,
+            description,
+            document,
+            tuple(tags),
+            default_version_id,
+        )
+
+    @classmethod
+    def _record_state(cls, record: ManagedPolicyRecord) -> PlannedPolicyState:
+        """Build a typed checkpoint from a fully hydrated policy record."""
+        if record.document is None:
+            message = "Current managed policy document was not loaded."
+            raise PolicyServiceError(message)
+        return cls._planned_state(
+            arn=record.arn.value,
+            policy_id=record.policy_id,
+            name=record.name,
+            path=record.path,
+            description=record.description,
+            document=record.document,
+            tags=record.tags,
+            default_version_id=record.default_version_id,
+        )
+
     def plan_create(
         self,
         name: str,
@@ -1348,6 +1538,20 @@ class IamManagedPolicyService:
             description=selected_options.description,
             tags=tags,
             validation=report,
+            before=None,
+            after=self._planned_state(
+                arn=(
+                    f"arn:{self.partition}:iam::{self.account_id}:policy"
+                    f"{selected_path}{name}"
+                ),
+                policy_id=None,
+                name=name,
+                path=selected_path,
+                description=selected_options.description,
+                document=document,
+                tags=tags,
+                default_version_id=None,
+            ),
         )
 
     def plan_publish(
@@ -1356,6 +1560,7 @@ class IamManagedPolicyService:
         document: dict[str, JsonValue],
         *,
         include_aws_validation: bool = True,
+        planned_tags: Sequence[Tag] | None = None,
     ) -> PolicyChangePlan:
         """Plan a no-op or safely versioned customer-policy update."""
         current = self.get_policy(
@@ -1365,18 +1570,24 @@ class IamManagedPolicyService:
             include_tags=True,
         )
         self._require_mutable(current)
+        desired_tags = tuple(planned_tags) if planned_tags is not None else current.tags
         report = self.validate_policy(
             document,
             name=current.name,
             path=current.path,
-            tags=current.tags,
+            tags=desired_tags,
             include_aws=include_aws_validation,
         )
         if current.document is None:
             message = "Current managed policy document was not loaded."
             raise PolicyServiceError(message)
         current_digest = policy_digest(current.document)
-        if current_digest == policy_digest(document):
+        document_changed = current_digest != policy_digest(document)
+        current_tag_digest = self._tag_digest(current.tags)
+        tags_changed = current_tag_digest != self._tag_digest(desired_tags)
+        before = self._record_state(current)
+        after = replace(before, document=document, tags=desired_tags)
+        if current_digest == policy_digest(document) and not tags_changed:
             operation = _operation_plan(
                 ChangeAction.NOOP,
                 f"Policy {current.arn.value} is semantically unchanged.",
@@ -1392,13 +1603,16 @@ class IamManagedPolicyService:
                 tags=current.tags,
                 expected_default_version_id=current.default_version_id,
                 expected_digest=current_digest,
+                expected_tag_digest=current_tag_digest,
                 validation=report,
+                before=before,
+                after=after,
             )
 
         prune_id: str | None = None
         warnings: list[str] = []
         steps: list[OperationStep] = []
-        if len(current.versions) >= MAX_POLICY_VERSIONS:
+        if document_changed and len(current.versions) >= MAX_POLICY_VERSIONS:
             nondefault = [item for item in current.versions if not item.is_default]
             if not current.owned:
                 repair = RepairAction(
@@ -1457,26 +1671,78 @@ class IamManagedPolicyService:
                         )
                     )
                 )
-        steps.append(
-            _new_step(
-                "CreatePolicyVersion",
-                {
-                    "PolicyArn": current.arn.value,
-                    "PolicyDocument": canonical_policy_json(document),
-                    "SetAsDefault": True,
-                },
-                compensation=Compensation(
-                    "SetDefaultPolicyVersion",
+        if document_changed:
+            steps.append(
+                _new_step(
+                    "CreatePolicyVersion",
                     {
                         "PolicyArn": current.arn.value,
-                        "VersionId": current.default_version_id,
+                        "PolicyDocument": canonical_policy_json(document),
+                        "SetAsDefault": True,
                     },
-                ),
+                    compensation=Compensation(
+                        "SetDefaultPolicyVersion",
+                        {
+                            "PolicyArn": current.arn.value,
+                            "VersionId": current.default_version_id,
+                        },
+                    ),
+                )
             )
+        if tags_changed:
+            observed = {tag.key: tag.value for tag in current.tags}
+            wanted = {tag.key: tag.value for tag in desired_tags}
+            additions = tuple(
+                Tag(key, value)
+                for key, value in wanted.items()
+                if observed.get(key) != value
+            )
+            removals = tuple(key for key in observed if key not in wanted)
+            if additions:
+                steps.append(
+                    _new_step(
+                        "TagPolicy",
+                        {
+                            "PolicyArn": current.arn.value,
+                            "Tags": [tag.as_request() for tag in additions],
+                        },
+                        compensation=Compensation(
+                            "RestorePolicyTags",
+                            {"Tags": [tag.as_request() for tag in current.tags]},
+                        ),
+                    )
+                )
+            if removals:
+                steps.append(
+                    _new_step(
+                        "UntagPolicy",
+                        {
+                            "PolicyArn": current.arn.value,
+                            "TagKeys": list(removals),
+                        },
+                        compensation=Compensation(
+                            "TagPolicy",
+                            {
+                                "PolicyArn": current.arn.value,
+                                "Tags": [
+                                    tag.as_request()
+                                    for tag in current.tags
+                                    if tag.key in set(removals)
+                                ],
+                            },
+                        ),
+                    )
+                )
+        summary = (
+            f"Publish a new default version and reconcile tags for {current.arn.value}."
+            if document_changed and tags_changed
+            else f"Publish a new default version for {current.arn.value}."
+            if document_changed
+            else f"Reconcile ownership and user tags for {current.arn.value}."
         )
         operation = _operation_plan(
             ChangeAction.UPDATE,
-            f"Publish a new default version for {current.arn.value}.",
+            summary,
             steps,
             warnings=warnings,
         )
@@ -1487,11 +1753,14 @@ class IamManagedPolicyService:
             path=current.path,
             document=document,
             description=None,
-            tags=current.tags,
+            tags=desired_tags,
             expected_default_version_id=current.default_version_id,
             expected_digest=current_digest,
+            expected_tag_digest=current_tag_digest,
             prune_version_id=prune_id,
             validation=report,
+            before=before,
+            after=after,
         )
 
     def plan_rollback(
@@ -1543,6 +1812,7 @@ class IamManagedPolicyService:
             f"Set {version_id} as default for {current.arn.value}.",
             steps,
         )
+        before = self._record_state(current)
         return PolicyChangePlan(
             operation=operation,
             policy_arn=current.arn,
@@ -1553,7 +1823,14 @@ class IamManagedPolicyService:
             tags=current.tags,
             expected_default_version_id=current.default_version_id,
             expected_digest=policy_digest(current.document),
+            expected_tag_digest=self._tag_digest(current.tags),
             rollback_version_id=version_id,
+            before=before,
+            after=replace(
+                before,
+                document=target_document,
+                default_version_id=version_id,
+            ),
         )
 
     def execute_change(self, plan: PolicyChangePlan) -> PublishResult:
@@ -1599,6 +1876,7 @@ class IamManagedPolicyService:
             created.arn,
             expected_version=created.default_version_id,
             expected_digest=policy_digest(plan.document),
+            expected_tags=plan.tags,
         )
         return PublishResult(ChangeAction.CREATE, verified, journal)
 
@@ -1621,6 +1899,10 @@ class IamManagedPolicyService:
         if (
             current.default_version_id != plan.expected_default_version_id
             or policy_digest(current.document) != plan.expected_digest
+            or (
+                plan.expected_tag_digest is not None
+                and self._tag_digest(current.tags) != plan.expected_tag_digest
+            )
         ):
             message = (
                 f"Policy {current.arn.value} changed after planning; rebuild and "
@@ -1636,36 +1918,37 @@ class IamManagedPolicyService:
         current: ManagedPolicyRecord,
         journal: OperationJournal,
     ) -> PublishResult:
-        step_index = 0
-        if plan.prune_version_id is not None:
-            prune_step = plan.operation.steps[step_index]
+        version_id = current.default_version_id
+        for step in plan.operation.steps:
             try:
-                self._iam.delete_policy_version(
-                    PolicyArn=current.arn.value,
-                    VersionId=plan.prune_version_id,
-                )
+                if step.operation == "DeletePolicyVersion":
+                    self._iam.delete_policy_version(**dict(step.parameters))
+                elif step.operation == "CreatePolicyVersion":
+                    response = self._iam.create_policy_version(**dict(step.parameters))
+                    version = _mapping(
+                        response.get("PolicyVersion"), label="PolicyVersion"
+                    )
+                    version_id = _string(version.get("VersionId"), label="VersionId")
+                elif step.operation == "TagPolicy":
+                    self._iam.tag_policy(**dict(step.parameters))
+                elif step.operation == "UntagPolicy":
+                    self._iam.untag_policy(**dict(step.parameters))
+                else:  # pragma: no cover - plans are constructed internally
+                    message = f"Unsupported policy update step {step.operation!r}."
+                    raise PolicyServiceError(message)
             except ClientError as error:
-                journal.record(prune_step.step_id, StepState.FAILED, str(error))
+                journal.record(step.step_id, StepState.FAILED, str(error))
                 raise
-            journal.record(prune_step.step_id, StepState.SUCCEEDED)
-            step_index += 1
-        publish_step = plan.operation.steps[step_index]
-        try:
-            response = self._iam.create_policy_version(
-                PolicyArn=current.arn.value,
-                PolicyDocument=canonical_policy_json(plan.document),
-                SetAsDefault=True,
+            journal.record(
+                step.step_id,
+                StepState.SUCCEEDED,
+                version_id if step.operation == "CreatePolicyVersion" else None,
             )
-        except ClientError as error:
-            journal.record(publish_step.step_id, StepState.FAILED, str(error))
-            raise
-        version = _mapping(response.get("PolicyVersion"), label="PolicyVersion")
-        version_id = _string(version.get("VersionId"), label="VersionId")
-        journal.record(publish_step.step_id, StepState.SUCCEEDED, version_id)
         verified = self._verify_policy(
             current.arn,
             expected_version=version_id,
             expected_digest=policy_digest(plan.document),
+            expected_tags=plan.tags,
         )
         return PublishResult(ChangeAction.UPDATE, verified, journal)
 
@@ -1702,6 +1985,7 @@ class IamManagedPolicyService:
         *,
         expected_version: str,
         expected_digest: str,
+        expected_tags: Sequence[Tag] | None = None,
     ) -> ManagedPolicyRecord:
         last_detail = "policy was not visible"
         for delay in self.retry.delays:
@@ -1726,6 +2010,10 @@ class IamManagedPolicyService:
             if (
                 current.default_version_id == expected_version
                 and policy_digest(current.document) == expected_digest
+                and (
+                    expected_tags is None
+                    or self._tag_digest(current.tags) == self._tag_digest(expected_tags)
+                )
             ):
                 return current
             last_detail = (
@@ -1792,35 +2080,68 @@ class IamManagedPolicyService:
             include_tags=True,
         )
         self._require_mutable(policy)
-        values = {tag.key.casefold(): tag.value for tag in policy.tags}
-        manager = values.get("hacksaws:managed-by")
-        if manager is not None and manager != "hacksaws":
-            message = f"Policy is already managed by {manager!r}."
+        status = policy.ownership_status
+        if status is OwnershipStatus.UNSAFE:
+            values = _protected_tag_values(policy.tags) or {}
+            manager = values.get("hacksaws:managed-by")
+            if manager not in {None, "hacksaws"}:
+                message = (
+                    f"Policy is already managed by {manager!r}; release or repair "
+                    "the conflicting ownership tags before adoption."
+                )
+                raise PolicyServiceError(message)
+            message = (
+                f"Policy {policy.arn.value} has conflicting or partial Hacksaws "
+                "ownership tags; repair or release those tags before adoption."
+            )
             raise PolicyServiceError(message)
-        add = self.ownership_tags(
-            resource_id,
-            user_tags,
-            caller=caller,
-            ownership_origin="adopted",
-        )
-        report = ValidationReport(tuple(self._validate_tags(add)))
+        if status is OwnershipStatus.UNOWNED:
+            desired = self.ownership_tags(
+                resource_id,
+                user_tags,
+                caller=caller,
+                ownership_origin=OwnershipOrigin.ADOPTED.value,
+            )
+            existing = {tag.key: tag.value for tag in policy.tags}
+            desired = tuple(
+                Tag(key, value)
+                for key, value in {
+                    **existing,
+                    **{tag.key: tag.value for tag in desired},
+                }.items()
+            )
+        else:
+            existing = {tag.key: tag.value for tag in policy.tags}
+            existing.update({tag.key: tag.value for tag in user_tags})
+            if status is OwnershipStatus.LEGACY:
+                existing["hacksaws:ownership-origin"] = OwnershipOrigin.LEGACY.value
+            desired = tuple(Tag(key, value) for key, value in existing.items())
+        observed = {tag.key: tag.value for tag in policy.tags}
+        add = tuple(tag for tag in desired if observed.get(tag.key) != tag.value)
+        report = ValidationReport(tuple(self._validate_tags(desired)))
         if not report.valid:
             raise PolicyValidationError(report)
-        step = _new_step(
-            "TagPolicy",
-            {
-                "PolicyArn": policy.arn.value,
-                "Tags": [tag.as_request() for tag in add],
-            },
-            compensation=Compensation(
-                "RestorePolicyTags",
-                {"Tags": [tag.as_request() for tag in policy.tags]},
-            ),
+        steps = (
+            (
+                _new_step(
+                    "TagPolicy",
+                    {
+                        "PolicyArn": policy.arn.value,
+                        "Tags": [tag.as_request() for tag in add],
+                    },
+                    compensation=Compensation(
+                        "RestorePolicyTags",
+                        {"Tags": [tag.as_request() for tag in policy.tags]},
+                    ),
+                ),
+            )
+            if add
+            else ()
         )
         operation = _operation_plan(
             ChangeAction.ADOPT,
             f"Adopt {policy.arn.value} into Hacksaws ownership.",
-            (step,),
+            steps,
         )
         return TagChangePlan(
             policy,
@@ -1828,6 +2149,8 @@ class IamManagedPolicyService:
             add,
             (),
             self._tag_digest(policy.tags),
+            policy.tags,
+            desired,
         )
 
     def plan_release(self, reference: str) -> TagChangePlan:
@@ -1868,6 +2191,8 @@ class IamManagedPolicyService:
             (),
             remove,
             self._tag_digest(policy.tags),
+            policy.tags,
+            tuple(tag for tag in policy.tags if tag.key not in set(remove)),
         )
 
     def execute_tag_change(self, plan: TagChangePlan) -> MutationResult:

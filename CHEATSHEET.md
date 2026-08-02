@@ -12,6 +12,8 @@ hacksaws mfa login PROFILE MFA_CODE [-l SECONDS|--lifespan SECONDS]
 hacksaws mfa in PROFILE MFA_CODE
 hacksaws mfa in +TARGET MFA_CODE
 hacksaws mfa in MFA_CODE --target TARGET
+hacksaws mfa in PROFILE                 # hidden interactive MFA prompt
+hacksaws mfa in PROFILE --mfa-code-stdin
 hacksaws mfa logout [PROFILE]
 hacksaws mfa out [PROFILE]
 
@@ -76,7 +78,11 @@ hacksaws assume SOURCE --role ROLE_OR_ARN \
 hacksaws assume SOURCE --boundary NAME (--self | --to ... | --to-profile ...)
 hacksaws assume +TARGET [OPTIONS]
 hacksaws assume --target TARGET [OPTIONS]
+hacksaws assume SOURCE DEST --role ROLE_OR_ARN [OPTIONS]
 ```
+
+Positional `DEST` means `--to-profile DEST` in the source location. It conflicts
+with every other destination spelling.
 
 Common options:
 
@@ -184,6 +190,32 @@ hacksaws config fix [--account ACCOUNT] \
 hacksaws config export [ARCHIVE.zip]
 hacksaws config import ARCHIVE.zip [--replace] [--yes]
 ```
+
+## Redacted command history
+
+```shell
+hacksaws history list [PATTERN]... [--since TIME] [--until TIME] [--wide]
+hacksaws history search PATTERN... [--command FAMILY] [--outcome OUTCOME]
+hacksaws history show HISTORY_ID
+hacksaws history report [--since TIME] [--account ACCOUNT]
+hacksaws history export [PATTERN]... [--format jsonl|json] [--output FILE]
+hacksaws history status
+hacksaws history check
+hacksaws history clear (--before TIME|--all) [--dry-run] [--yes]
+```
+
+List/search/report/export also accept `--command`, `--outcome`, `--account`,
+`--resource`, `--limit`, and `--include-running`. `TIME` is an ISO timestamp or
+a duration ago using seconds, minutes, hours, days, or weeks, such as `15m`,
+`24h`, `7d`, or `2weeks`. Clear never removes a running command or unresolved
+recovery record; interactive apply requires typing exactly `yes`, and
+noninteractive/JSON apply requires `--yes`.
+
+History stores safe command metadata and outcomes, never raw arguments,
+stdout/stderr, prompts, paths, documents, credentials, MFA codes, external IDs,
+or exception text. Defaults are 90 days, 10,000 records, and 50 MiB. Inspect or
+change `history.enabled`, `history.max_age`, `history.max_entries`, and
+`history.max_bytes` with `hacksaws config options|get|set`.
 
 Human `status` output is a compact, dynamic table. `LOCATION` is hidden when all
 rows use the default location; `TTL` is hidden when no displayed session has a
@@ -432,6 +464,12 @@ hacksaws iam policy tag remove POLICY KEY... [selectors] [--dry-run] [--yes]
 hacksaws iam policy adopt POLICY [--tag KEY=VALUE]... [selectors] [--dry-run] [--yes]
 hacksaws iam policy release POLICY [selectors] [--dry-run] [--yes]
 ```
+
+Policy create accepts `NAME FILE` or `FILE NAME`; `--name` and `--file` are the
+explicit forms. Policy update similarly accepts `POLICY FILE` in either
+unambiguous order, with `--policy` and `--file` available to resolve ambiguity.
+Role `inline-policy put` and `trust set` follow the same rule. Ambiguous or
+missing inputs fail before AWS credential discovery.
 
 `POLICY` accepts the adapter's account- and partition-safe ARN/name resolution.
 AWS-managed policies may be inspected, exported, validated, and checked, but

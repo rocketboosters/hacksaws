@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import asdict
 from dataclasses import replace
 from io import StringIO
@@ -34,8 +36,10 @@ from hacksaws import _configs
 from hacksaws import _iam_recovery
 from hacksaws import _output
 from hacksaws import _policies
+from hacksaws import _resource_input
 from hacksaws import _state
 from hacksaws._configs import OperationalError
+from hacksaws._iam_managed_policies import RESERVED_TAGS
 from hacksaws._iam_managed_policies import AssumeRoleProbeOptions
 from hacksaws._iam_managed_policies import ChangeAction
 from hacksaws._iam_managed_policies import CreatePolicyOptions
@@ -45,6 +49,8 @@ from hacksaws._iam_managed_policies import IamManagedPolicyService
 from hacksaws._iam_managed_policies import ImmutablePolicyError
 from hacksaws._iam_managed_policies import ManagedPolicyArn
 from hacksaws._iam_managed_policies import ManagedPolicyRecord
+from hacksaws._iam_managed_policies import OperationStep
+from hacksaws._iam_managed_policies import OwnershipStatus
 from hacksaws._iam_managed_policies import PackedPolicyProbeError
 from hacksaws._iam_managed_policies import PolicyChangePlan
 from hacksaws._iam_managed_policies import PolicyDeletionPlan
@@ -57,7 +63,11 @@ from hacksaws._iam_managed_policies import PolicyServiceOptions
 from hacksaws._iam_managed_policies import PolicyValidationError
 from hacksaws._iam_managed_policies import PolicyVersionRecord
 from hacksaws._iam_managed_policies import Tag
+from hacksaws._iam_managed_policies import TagChangePlan
 from hacksaws._iam_managed_policies import ValidationReport
+from hacksaws._iam_managed_policies import classify_ownership
+from hacksaws._iam_managed_policies import ownership_origin
+from hacksaws._iam_managed_policies import reconcile_owned_tags
 from hacksaws._iam_policy_documents import InputMetadata
 from hacksaws._iam_policy_documents import JsonValue
 from hacksaws._iam_policy_documents import LoadedPolicyInput
@@ -70,8 +80,6 @@ from hacksaws._iam_policy_documents import policy_digest
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from collections.abc import Mapping
-    from collections.abc import Sequence
 
     from hacksaws._iam_cli import IamCommandContext
 
@@ -138,20 +146,33 @@ def _selectors(parser: argparse.ArgumentParser, *, mutation: bool = False) -> No
             "--dry-run",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="Validate and show the plan without changing AWS or local state.",
+            help=(
+                "Show credential-free identity, before/after, actions, dependencies, "
+                "warnings, and confirmation without changing AWS or local state."
+            ),
         )
         safety.add_argument(
             "--yes",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="Approve the displayed plan without prompting.",
+            help="Approve the exact displayed plan without prompting.",
         )
 
 
 def _input_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--format", choices=_FORMAT_CHOICES)
-    parser.add_argument("--metadata", choices=_METADATA_CHOICES)
-    parser.add_argument("--metadata-file", type=Path)
+    parser.add_argument(
+        "--format",
+        choices=_FORMAT_CHOICES,
+        help="Explicit input document format when it cannot be inferred.",
+    )
+    parser.add_argument(
+        "--metadata",
+        choices=_METADATA_CHOICES,
+        help="Input metadata layout: embedded, separate sidecar, or omitted.",
+    )
+    parser.add_argument(
+        "--metadata-file", type=Path, help="Metadata sidecar file for the policy input."
+    )
     parser.add_argument(
         "--local-validation-only",
         action="store_true",
@@ -192,12 +213,20 @@ def register(parser: argparse.ArgumentParser) -> None:
     )
     create.set_defaults(policy_action="create")
     create.add_argument(
-        "file", help="JSON, YAML, or TOML policy document, or '-' for stdin."
+        "policy_inputs",
+        nargs="*",
+        metavar="NAME_OR_FILE",
+        help="Policy NAME and FILE in either order; NAME may be omitted.",
     )
     create.add_argument(
-        "name",
-        nargs="?",
-        help="IAM policy name; defaults to a configured name derived from FILE.",
+        "--name",
+        dest="explicit_name",
+        help="Explicit IAM policy name; otherwise derive it from FILE.",
+    )
+    create.add_argument(
+        "--file",
+        dest="explicit_file",
+        help="Explicit JSON, YAML, or TOML policy document, or '-' for stdin.",
     )
     create.add_argument("--description", help="Human-readable IAM policy description.")
     create.add_argument(
@@ -239,9 +268,27 @@ def register(parser: argparse.ArgumentParser) -> None:
     _selectors(export)
 
     update = actions.add_parser("update", help="Publish a new policy version.")
-    update.add_argument("policy_or_file", nargs="?")
-    update.add_argument("file", nargs="?")
-    update.add_argument("--from-stored", metavar="NAME")
+    update.add_argument(
+        "policy_inputs",
+        nargs="*",
+        metavar="POLICY_OR_FILE",
+        help="Policy reference and FILE in either order, or metadata-bearing FILE.",
+    )
+    update.add_argument(
+        "--policy",
+        dest="explicit_policy",
+        help="Explicit policy name or ARN; use with --file to resolve ambiguity.",
+    )
+    update.add_argument(
+        "--file",
+        dest="explicit_file",
+        help="Explicit JSON/YAML/TOML policy document, or '-' for stdin.",
+    )
+    update.add_argument(
+        "--from-stored",
+        metavar="NAME",
+        help="Publish the named policy from Hacksaws' local policy store.",
+    )
     _input_options(update)
     _selectors(update, mutation=True)
 
@@ -295,12 +342,53 @@ def register(parser: argparse.ArgumentParser) -> None:
     _selectors(tag_remove, mutation=True)
 
     adopt = actions.add_parser("adopt", help="Adopt a customer-managed policy.")
-    adopt.add_argument("policy")
+    adopt.add_argument("policy", help="Existing customer-managed policy name or ARN.")
     _tag_options(adopt)
     _selectors(adopt, mutation=True)
     release = actions.add_parser("release", help="Release Hacksaws ownership tags.")
-    release.add_argument("policy")
+    release.add_argument("policy", help="Managed policy name or ARN to release.")
     _selectors(release, mutation=True)
+
+
+def normalize_arguments(args: argparse.Namespace) -> None:
+    """Resolve policy mutation inputs before creating any AWS client."""
+    action = getattr(args, "policy_action", None)
+    if action == "create" and hasattr(args, "policy_inputs"):
+        resolved = _resource_input.resolve_name_file(
+            args.policy_inputs,
+            explicit_name=getattr(args, "explicit_name", None),
+            explicit_file=getattr(args, "explicit_file", None),
+            require_name=False,
+        )
+        args.name = resolved.name
+        args.file = str(resolved.file) if resolved.file is not None else None
+        return
+    if action != "update" or not hasattr(args, "policy_inputs"):
+        return
+    values = list(args.policy_inputs)
+    explicit_policy = getattr(args, "explicit_policy", None)
+    explicit_file = getattr(args, "explicit_file", None)
+    if getattr(args, "from_stored", None):
+        if explicit_file is not None:
+            raise OperationalError("--from-stored cannot be combined with --file.")
+        if len(values) + int(explicit_policy is not None) > 1:
+            raise OperationalError(
+                "--from-stored accepts at most one policy reference; use --policy "
+                "to make it explicit."
+            )
+        args.policy_or_file = explicit_policy or (values[0] if values else None)
+        args.file = None
+        return
+    resolved = _resource_input.resolve_name_file(
+        values,
+        explicit_name=explicit_policy,
+        explicit_file=explicit_file,
+        require_name=False,
+        name_label="POLICY",
+        name_option="--policy",
+    )
+    args.policy_or_file = resolved.name
+    args.file = str(resolved.file) if resolved.file is not None else None
 
 
 def _service(context: IamCommandContext) -> IamManagedPolicyService:
@@ -1488,6 +1576,8 @@ def _stored_policy(stored_name: str) -> LoadedPolicyInput:
 
 
 def _loaded_update(args: argparse.Namespace) -> tuple[str, LoadedPolicyInput]:
+    if hasattr(args, "policy_inputs") and not hasattr(args, "policy_or_file"):
+        normalize_arguments(args)
     if args.from_stored:
         loaded = _stored_policy(args.from_stored)
         reference = args.policy_or_file or loaded.metadata.name
@@ -1496,8 +1586,8 @@ def _loaded_update(args: argparse.Namespace) -> tuple[str, LoadedPolicyInput]:
                 "--from-stored cannot be combined with a policy file."
             )
     elif args.file is not None:
-        reference = args.policy_or_file
         loaded = _load_from_file(args, args.file)
+        reference = args.policy_or_file or loaded.metadata.name
     elif args.policy_or_file is not None:
         loaded = _load_from_file(args, args.policy_or_file)
         reference = loaded.metadata.name
@@ -1671,6 +1761,474 @@ def _diagnostic_text(report: ValidationReport) -> str:
     )
 
 
+def _tag_map(tags: Sequence[Tag]) -> dict[str, str]:
+    """Return deterministic tag keys with non-reversible value references."""
+    return dict(
+        sorted(
+            (tag.key, f"sha256:{_state.digest(tag.value.encode('utf-8'))[:12]}")
+            for tag in tags
+        )
+    )
+
+
+def _tag_delta(before: Sequence[Tag], after: Sequence[Tag]) -> dict[str, object]:
+    """Return exact changed keys without exposing potentially sensitive values."""
+    old = _tag_map(before)
+    new = _tag_map(after)
+    return {
+        "before": old,
+        "after": new,
+        "added": {key: new[key] for key in new.keys() - old.keys()},
+        "removed": {key: old[key] for key in old.keys() - new.keys()},
+        "changed": {
+            key: {"before": old[key], "after": new[key]}
+            for key in old.keys() & new.keys()
+            if old[key] != new[key]
+        },
+    }
+
+
+def _document_summary(document: Mapping[str, JsonValue] | None) -> dict[str, object]:
+    """Summarize policy semantics without exposing the policy document."""
+    if document is None:
+        return {
+            "exists": False,
+            "sha256": None,
+            "minifiedBytes": 0,
+            "statements": 0,
+            "allowStatements": 0,
+            "denyStatements": 0,
+            "actions": 0,
+            "resources": 0,
+        }
+    raw_statements = document.get("Statement", [])
+    statements = (
+        [raw_statements]
+        if isinstance(raw_statements, Mapping)
+        else raw_statements
+        if isinstance(raw_statements, list)
+        else []
+    )
+    valid = [item for item in statements if isinstance(item, Mapping)]
+
+    def values(item: Mapping[str, object], key: str) -> int:
+        value = item.get(key)
+        if isinstance(value, list):
+            return len(value)
+        return int(value is not None)
+
+    minified = canonical_policy_json(cast("dict[str, JsonValue]", document))
+    return {
+        "exists": True,
+        "sha256": policy_digest(cast("dict[str, JsonValue]", document)),
+        "minifiedBytes": len(minified.encode("utf-8")),
+        "statements": len(valid),
+        "allowStatements": sum(item.get("Effect") == "Allow" for item in valid),
+        "denyStatements": sum(item.get("Effect") == "Deny" for item in valid),
+        "actions": sum(values(item, "Action") for item in valid),
+        "resources": sum(values(item, "Resource") for item in valid),
+    }
+
+
+def _policy_step_data(step: OperationStep) -> dict[str, object]:
+    """Return one bounded operation row without policy documents or raw params."""
+    operation = step
+    params = step.parameters
+    detail: dict[str, object] = {}
+    if isinstance(params, Mapping):
+        if isinstance(params.get("VersionId"), str):
+            detail["versionId"] = params["VersionId"]
+        raw_tags = params.get("Tags")
+        if isinstance(raw_tags, list):
+            detail["tagKeys"] = sorted(
+                str(item.get("Key"))
+                for item in raw_tags
+                if isinstance(item, Mapping) and item.get("Key") is not None
+            )
+        raw_keys = params.get("TagKeys")
+        if isinstance(raw_keys, list):
+            detail["tagKeys"] = sorted(str(item) for item in raw_keys)
+    return {
+        "id": operation.step_id,
+        "action": operation.operation,
+        "destructive": bool(operation.destructive),
+        "reversible": operation.compensation is not None,
+        "detail": detail,
+    }
+
+
+def _policy_plan_data(
+    plan: PolicyChangePlan,
+    context: IamCommandContext,
+    diagnostics: list[dict[str, object]],
+    warnings: list[str],
+) -> dict[str, object]:
+    """Build the stable, document-free policy mutation review model."""
+    before = plan.before
+    after = plan.after
+    arn = (
+        after.arn
+        if after is not None
+        else before.arn
+        if before is not None
+        else plan.policy_arn.value
+        if plan.policy_arn is not None
+        else (
+            f"arn:{context.partition}:iam::{context.account_id}:policy"
+            f"{plan.path}{plan.name}"
+        )
+    )
+    before_tags = before.tags if before is not None else ()
+    after_tags = after.tags if after is not None else plan.tags
+    before_origin = ownership_origin(before_tags)
+    after_origin = ownership_origin(after_tags)
+    before_document = before.document if before is not None else None
+    after_document = after.document if after is not None else plan.document
+    document_before = _document_summary(before_document)
+    document_after = _document_summary(after_document)
+    document_delta = {
+        "before": document_before,
+        "after": document_after,
+        "changed": document_before["sha256"] != document_after["sha256"],
+    }
+    action = plan.operation.action.value
+    risk = (
+        "none"
+        if plan.operation.action is ChangeAction.NOOP
+        else "high"
+        if any(step.destructive for step in plan.operation.steps)
+        else "moderate"
+        if plan.operation.action in {ChangeAction.UPDATE, ChangeAction.ROLLBACK}
+        else "low"
+    )
+    return {
+        "classification": (
+            "no-change"
+            if plan.operation.action is ChangeAction.NOOP
+            else "blocked"
+            if not plan.validation.valid
+            else "planned"
+        ),
+        "action": action,
+        "risk": risk,
+        "verifiedIdentity": {
+            "accountId": context.account_id,
+            "partition": context.partition,
+            "callerArn": getattr(context, "arn", None),
+        },
+        "resource": {
+            "type": "managed-policy",
+            "name": plan.name,
+            "arn": arn,
+            "policyId": (
+                before.policy_id
+                if before is not None
+                else after.policy_id
+                if after is not None
+                else None
+            ),
+            "path": plan.path,
+            "ownershipBefore": classify_ownership(before_tags).value,
+            "ownershipAfter": classify_ownership(after_tags).value,
+            "originBefore": before_origin.value if before_origin else None,
+            "originAfter": after_origin.value if after_origin else None,
+        },
+        "changes": {
+            "tags": _tag_delta(before_tags, after_tags),
+            "document": document_delta,
+            "prunedVersion": plan.prune_version_id,
+        },
+        "operations": [_policy_step_data(step) for step in plan.operation.steps],
+        "dependencies": {},
+        "blockers": [item for item in diagnostics if item.get("severity") == "error"],
+        "warnings": warnings,
+        "journalExpected": plan.operation.action is not ChangeAction.NOOP,
+        "recovery": (
+            "A credential-free journal will be written before the first AWS mutation."
+            if plan.operation.action is not ChangeAction.NOOP
+            else "No journal is needed because no mutation is planned."
+        ),
+    }
+
+
+def _ownership_plan_data(
+    plan: TagChangePlan,
+    context: IamCommandContext,
+    action: str,
+) -> dict[str, object]:
+    """Adapt an ownership-only plan to the stable policy review model."""
+    before_tags = plan.before_tags or plan.policy.tags
+    if plan.after_tags:
+        after_tags = plan.after_tags
+    else:
+        values = {tag.key: tag.value for tag in before_tags}
+        values.update({tag.key: tag.value for tag in plan.add})
+        for key in plan.remove:
+            values.pop(key, None)
+        after_tags = tuple(Tag(key, value) for key, value in sorted(values.items()))
+    before_origin = ownership_origin(before_tags)
+    after_origin = ownership_origin(after_tags)
+    return {
+        "classification": "planned" if plan.operation.steps else "no-change",
+        "action": action,
+        "risk": "low" if plan.operation.steps else "none",
+        "verifiedIdentity": {
+            "accountId": context.account_id,
+            "partition": context.partition,
+            "callerArn": getattr(context, "arn", None),
+        },
+        "resource": {
+            "type": "managed-policy",
+            "name": plan.policy.name,
+            "arn": plan.policy.arn.value,
+            "policyId": plan.policy.policy_id,
+            "path": plan.policy.path,
+            "ownershipBefore": classify_ownership(before_tags).value,
+            "ownershipAfter": classify_ownership(after_tags).value,
+            "originBefore": before_origin.value if before_origin else None,
+            "originAfter": after_origin.value if after_origin else None,
+        },
+        "changes": {
+            "tags": _tag_delta(before_tags, after_tags),
+            "document": {
+                "before": _document_summary(None),
+                "after": _document_summary(None),
+                "changed": False,
+            },
+            "prunedVersion": None,
+        },
+        "operations": [_policy_step_data(step) for step in plan.operation.steps],
+        "dependencies": {},
+        "blockers": [],
+        "warnings": list(plan.operation.warnings),
+        "journalExpected": bool(plan.operation.steps),
+        "recovery": (
+            "A credential-free journal will be written before the first AWS mutation."
+            if plan.operation.steps
+            else "No journal is needed because ownership already matches."
+        ),
+    }
+
+
+def _policy_delete_plan_data(
+    plan: PolicyDeletionPlan,
+    context: IamCommandContext,
+    *,
+    allow_unmanaged: bool,
+    remove_boundaries: bool,
+) -> dict[str, object]:
+    """Build a bounded deletion review including dependency blockers."""
+    policy = plan.policy
+    dependencies = _dependency_data(plan)
+    blockers: list[dict[str, str]] = []
+    if not policy.owned and not allow_unmanaged:
+        blockers.append(
+            {
+                "code": "UNMANAGED_POLICY",
+                "message": (
+                    "Policy is not Hacksaws-owned; --allow-unmanaged is required."
+                ),
+            }
+        )
+    if (
+        plan.dependencies.boundary_users or plan.dependencies.boundary_roles
+    ) and not remove_boundaries:
+        blockers.append(
+            {
+                "code": "BOUNDARY_OPT_IN_REQUIRED",
+                "message": "Permissions-boundary removal requires --remove-boundaries.",
+            }
+        )
+    if not plan.executable:
+        blockers.append(
+            {
+                "code": "CASCADE_REQUIRED",
+                "message": "Policy dependencies require --cascade before deletion.",
+            }
+        )
+    origin = policy.ownership_origin
+    return {
+        "classification": "blocked" if blockers else "planned",
+        "action": "delete",
+        "risk": "critical",
+        "verifiedIdentity": {
+            "accountId": context.account_id,
+            "partition": context.partition,
+            "callerArn": getattr(context, "arn", None),
+        },
+        "resource": {
+            "type": "managed-policy",
+            "name": policy.name,
+            "arn": policy.arn.value,
+            "policyId": policy.policy_id,
+            "path": policy.path,
+            "ownershipBefore": policy.ownership_status.value,
+            "ownershipAfter": "absent",
+            "originBefore": origin.value if origin else None,
+            "originAfter": None,
+        },
+        "changes": {
+            "tags": _tag_delta(policy.tags, ()),
+            "document": {
+                "before": _document_summary(policy.document),
+                "after": _document_summary(None),
+                "changed": policy.document is not None,
+            },
+            "prunedVersion": None,
+        },
+        "operations": [_policy_step_data(step) for step in plan.operation.steps],
+        "dependencies": dependencies,
+        "blockers": blockers,
+        "warnings": list(plan.operation.warnings),
+        "journalExpected": not blockers,
+        "recovery": (
+            "Deletion is irreversible after AWS accepts DeletePolicy; the journal "
+            "retains a commit-point receipt but will not recreate the identity."
+        ),
+    }
+
+
+def _short_hash(value: object) -> str:
+    """Render a compact hash while preserving absent-state clarity."""
+    return str(value)[:12] if value else "absent"
+
+
+def _policy_plan_text(data: Mapping[str, object]) -> str:
+    """Render a compact policy mutation review without raw JSON or documents."""
+    identity = cast("Mapping[str, object]", data["verifiedIdentity"])
+    resource = cast("Mapping[str, object]", data["resource"])
+    changes = cast("Mapping[str, object]", data["changes"])
+    tags = cast("Mapping[str, object]", changes["tags"])
+    document = cast("Mapping[str, object]", changes["document"])
+    before_doc = cast("Mapping[str, object]", document["before"])
+    after_doc = cast("Mapping[str, object]", document["after"])
+    lines = [
+        f"PLAN — {str(data['action']).upper()} ({data['risk']} risk)",
+        f"Account: {identity['accountId']} ({identity['partition']})",
+        f"Caller: {identity.get('callerArn') or 'unknown'}",
+        f"Policy: {resource['name']}",
+        f"ARN: {resource['arn']}",
+        f"Policy ID: {resource.get('policyId') or 'assigned by AWS on create'}",
+        (
+            "Ownership: "
+            f"{resource['ownershipBefore']}/{resource.get('originBefore') or '-'}"
+            " → "
+            f"{resource['ownershipAfter']}/{resource.get('originAfter') or '-'}"
+        ),
+        (
+            "Document: "
+            f"{_short_hash(before_doc.get('sha256'))} → "
+            f"{_short_hash(after_doc.get('sha256'))} "
+            f"({after_doc.get('minifiedBytes', 0)} bytes; "
+            f"{after_doc.get('statements', 0)} statements, "
+            f"{after_doc.get('allowStatements', 0)} allow, "
+            f"{after_doc.get('denyStatements', 0)} deny)"
+        ),
+    ]
+    added = cast("Mapping[str, object]", tags["added"])
+    removed = cast("Mapping[str, object]", tags["removed"])
+    changed = cast("Mapping[str, Mapping[str, object]]", tags["changed"])
+    if added or removed or changed:
+        lines.append("Tag changes:")
+        lines.extend(f"  + {key}={value}" for key, value in sorted(added.items()))
+        lines.extend(f"  - {key}={value}" for key, value in sorted(removed.items()))
+        lines.extend(
+            f"  ~ {key}: {value['before']} → {value['after']}"
+            for key, value in sorted(changed.items())
+        )
+    else:
+        lines.append("Tag changes: none")
+    operations = cast("list[Mapping[str, object]]", data["operations"])
+    if operations:
+        lines.append("Ordered AWS operations:")
+        lines.extend(
+            f"  {index}. {item['action']} "
+            f"[{'reversible' if item['reversible'] else 'irreversible'}]"
+            for index, item in enumerate(operations, 1)
+        )
+    blockers = cast("list[Mapping[str, object]]", data["blockers"])
+    if blockers:
+        lines.append("Blockers:")
+        lines.extend(f"  - {item.get('message', item)}" for item in blockers)
+    dependencies = cast("Mapping[str, object]", data["dependencies"])
+    populated = {
+        key: value
+        for key, value in dependencies.items()
+        if isinstance(value, list) and value
+    }
+    if populated:
+        lines.append("Dependencies:")
+        lines.extend(
+            f"  - {key}: {', '.join(str(item) for item in value)}"
+            for key, value in sorted(populated.items())
+        )
+    warnings = cast("list[str]", data["warnings"])
+    if warnings:
+        lines.append("Warnings:")
+        lines.extend(f"  - {item}" for item in warnings)
+    lines.append(str(data["recovery"]))
+    lines.append("No changes have been made.")
+    return "\n".join(_output.safe_terminal_text(line) for line in lines)
+
+
+def _confirmation_unavailable() -> bool:
+    """Return whether a mutation needs explicit ``--yes`` in this process."""
+    return _configs.json_output_enabled() or not bool(
+        getattr(sys.stdin, "isatty", lambda: False)()
+    )
+
+
+def _policy_success_text(
+    plan_data: Mapping[str, object],
+    policy: ManagedPolicyRecord,
+    *,
+    journal_id: str | None,
+    console_url: str,
+) -> str:
+    """Render a definitive verified policy result with only applied deltas."""
+    action = str(plan_data["action"])
+    verb = {
+        "create": "Created",
+        "update": "Updated",
+        "rollback": "Rolled back",
+        "noop": "No change —",
+    }.get(action, action.replace("-", " ").title() + "d")
+    changes = cast("Mapping[str, object]", plan_data["changes"])
+    tags = cast("Mapping[str, object]", changes["tags"])
+    document = cast("Mapping[str, object]", changes["document"])
+    lines = [f"{verb} managed policy {policy.name}."]
+    applied: list[str] = []
+    if document.get("changed"):
+        before = cast("Mapping[str, object]", document["before"])
+        after = cast("Mapping[str, object]", document["after"])
+        applied.append(
+            f"document {_short_hash(before.get('sha256'))} → "
+            f"{_short_hash(after.get('sha256'))}"
+        )
+    tag_count = sum(
+        len(cast("Mapping[str, object]", tags[key]))
+        for key in ("added", "removed", "changed")
+    )
+    if tag_count:
+        applied.append(f"{tag_count} tag delta(s)")
+    lines.append("Applied: " + (", ".join(applied) if applied else "none"))
+    lines.extend(
+        (
+            f"ARN: {policy.arn.value}",
+            f"Policy ID: {policy.policy_id}",
+            f"Verified: IAM read-back matched version {policy.default_version_id}.",
+            (
+                f"Journal: {journal_id} (completed; use 'hacksaws iam recovery get "
+                f"{journal_id}' for the recovery receipt)."
+                if journal_id
+                else "Journal: none (no mutation was required)."
+            ),
+            f"AWS Console: {console_url}",
+        )
+    )
+    return "\n".join(_output.safe_terminal_text(line) for line in lines)
+
+
 def _semantic_diff(
     service: IamManagedPolicyService, plan: PolicyChangePlan
 ) -> list[str]:
@@ -1770,6 +2328,11 @@ def _change_states(
     if (
         before.default_version_id != plan.expected_default_version_id
         or policy_digest(before.document) != plan.expected_digest
+        or (
+            plan.expected_tag_digest is not None
+            and service._tag_digest(before.tags)  # noqa: SLF001
+            != plan.expected_tag_digest
+        )
     ):
         raise PolicyDriftError(
             "Policy changed after planning; review the operation again."
@@ -1779,7 +2342,14 @@ def _change_states(
         for version in before.versions
         if version.version_id != plan.prune_version_id
     ]
-    if plan.operation.action is ChangeAction.UPDATE:
+    publishes_version = any(
+        step.operation == "CreatePolicyVersion" for step in plan.operation.steps
+    ) or (
+        plan.operation.action is ChangeAction.UPDATE
+        and plan.before is None
+        and plan.after is None
+    )
+    if plan.operation.action is ChangeAction.UPDATE and publishes_version:
         for version in after_versions:
             version["default"] = False
         after_versions.append(
@@ -1791,6 +2361,7 @@ def _change_states(
     dependencies = service.policy_dependencies(plan.policy_arn.value)
     after = _policy_state(before, dependencies=dependencies)
     after["versions"] = after_versions
+    after["tags"] = [tag.as_request() for tag in plan.tags]
     return after, _policy_state(before, dependencies=dependencies)
 
 
@@ -1841,6 +2412,7 @@ def _repair(
         plan.policy_arn.value,
         document,
         include_aws_validation=not bool(getattr(args, "local_validation_only", False)),
+        planned_tags=plan.tags,
     )
 
 
@@ -1852,39 +2424,63 @@ def _execute_plan(
 ) -> _configs.Result:
     plan = _repair(plan, args, service)
     diagnostics = _diagnostic_data(plan.validation)
-    if not plan.validation.valid:
-        return _error(
-            "IAM_POLICY_VALIDATION_FAILED",
-            _diagnostic_text(plan.validation),
-            _configs.EXIT_POLICY,
-        )
     warnings = [
         item.message
         for item in plan.validation.diagnostics
         if item.severity is not DiagnosticSeverity.ERROR
     ]
     warnings.extend(plan.operation.warnings)
-    diff = _semantic_diff(service, plan)
-    preview = _change_preview(plan, context, diagnostics, warnings, diff)
+    preview = _policy_plan_data(plan, context, diagnostics, warnings)
+    review = _policy_plan_text(preview)
+    if not plan.validation.valid:
+        return _configs.Result(
+            "IAM_POLICY_VALIDATION_FAILED",
+            review,
+            _configs.EXIT_POLICY,
+            "stderr",
+            {"plan": preview, "result": {"classification": "blocked"}},
+        )
     if bool(getattr(args, "dry_run", False)):
-        data = {**preview, "dryRun": True}
-        message = (
-            f"DRY RUN — {plan.operation.summary}\nNo AWS or local state was changed."
+        return _configs.Result(
+            "IAM_POLICY_DRY_RUN",
+            "DRY RUN\n" + review,
+            data={
+                "plan": preview,
+                "result": {
+                    "classification": "dry-run",
+                    "journalId": None,
+                    "changed": False,
+                },
+            },
         )
-        if diff:
-            message += "\n" + "\n".join(diff)
-        return _configs.Result("IAM_POLICY_DRY_RUN", message, data=data)
-    confirmation = f"{plan.operation.summary}\nReview:\n" + json.dumps(
-        preview, indent=2, sort_keys=True
-    )
-    if plan.operation.action is not ChangeAction.NOOP and not _confirm(
-        args, confirmation
+    if plan.operation.action is not ChangeAction.NOOP and not bool(
+        getattr(args, "yes", False)
     ):
-        return _error(
-            "IAM_POLICY_CANCELLED",
-            "Policy change cancelled; no AWS changes were made.",
-            _configs.EXIT_CANCELLED,
-        )
+        if _confirmation_unavailable():
+            return _configs.Result(
+                "IAM_POLICY_CONFIRMATION_REQUIRED",
+                review + "\nConfirmation required: rerun with --yes.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "confirmation-required"},
+                },
+            )
+        answer = input(
+            review + "\n\nType exactly 'yes' to apply this plan:\n> "
+        ).strip()
+        if answer.casefold() != "yes":
+            return _configs.Result(
+                "IAM_POLICY_CANCELLED",
+                "CANCELLED — Policy change declined. No changes have been made.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "cancelled"},
+                },
+            )
     if plan.operation.action is ChangeAction.NOOP:
         policy = service.get_policy(
             cast("ManagedPolicyArn", plan.policy_arn).value,
@@ -1905,29 +2501,34 @@ def _execute_plan(
             include_versions=True,
             include_tags=True,
         )
-    data = {
+    console_url = _console_url(context, policy.arn.value)
+    applied = cast("Mapping[str, object]", preview["changes"])
+    result_data = {
+        "classification": (
+            "no-change" if plan.operation.action is ChangeAction.NOOP else "applied"
+        ),
         "action": plan.operation.action.value,
         "arn": policy.arn.value,
         "name": policy.name,
+        "policyId": policy.policy_id,
         "version": policy.default_version_id,
-        "warnings": warnings,
-        "diagnostics": diagnostics,
-        "prunedVersion": plan.prune_version_id,
-        "diff": diff,
         "journalId": journal_id,
-        "consoleUrl": _console_url(context, policy.arn.value),
-        "preview": preview,
+        "verified": True,
+        "recoveryAvailable": journal_id is not None,
+        "consoleUrl": console_url,
     }
-    message = plan.operation.summary
-    if diff:
-        message += "\n" + "\n".join(diff)
-    if warnings:
-        message += "\n" + "\n".join(f"Warning: {item}" for item in warnings)
-    message += (
-        f"\nARN: {policy.arn.value}\nPolicy ID: {policy.policy_id}"
-        f"\nAWS Console: {data['consoleUrl']}"
+    return _configs.Result(
+        "IAM_POLICY_NO_CHANGE"
+        if plan.operation.action is ChangeAction.NOOP
+        else "IAM_POLICY_CHANGED",
+        _policy_success_text(
+            preview,
+            policy,
+            journal_id=journal_id,
+            console_url=console_url,
+        ),
+        data={"plan": preview, "applied": applied, "result": result_data},
     )
-    return _configs.Result("IAM_POLICY_CHANGED", message, data=data)
 
 
 def _create(
@@ -1952,16 +2553,30 @@ def _create(
             include_versions=True,
             include_tags=True,
         )
-        current_user_tags = {
-            tag.key: tag.value
-            for tag in target.tags
-            if not tag.key.casefold().startswith(_RESERVED_PREFIX)
-        }
-        desired_user_tags = {tag.key: tag.value for tag in tags}
+        if target.ownership_status is OwnershipStatus.UNOWNED:
+            return _error(
+                "IAM_POLICY_COLLISION",
+                f"Policy {policy_name!r} already exists at {target.arn.value} but "
+                "is not Hacksaws-owned. Review it and run 'iam policy adopt' "
+                "before creating or updating it by name; --replace never adopts or "
+                "rewrites ownership identity.",
+                _configs.EXIT_POLICY,
+            )
+        if target.ownership_status is OwnershipStatus.UNSAFE:
+            return _error(
+                "IAM_POLICY_OWNERSHIP_UNSAFE",
+                f"Policy {policy_name!r} has conflicting or partial Hacksaws "
+                "ownership tags. Repair or release those tags explicitly; no "
+                "document or identity changes were planned.",
+                _configs.EXIT_POLICY,
+            )
+        desired_tags = reconcile_owned_tags(target, tags)
         same_document = target.document is not None and policy_digest(
             target.document
         ) == policy_digest(loaded.document)
-        same_tags = current_user_tags == desired_user_tags
+        same_tags = tuple(sorted((tag.key, tag.value) for tag in target.tags)) == tuple(
+            sorted((tag.key, tag.value) for tag in desired_tags)
+        )
         same_attributes = (selected_path is None or selected_path == target.path) and (
             (args.description is None and loaded.metadata.description is None)
             or (args.description or loaded.metadata.description) == target.description
@@ -1979,7 +2594,7 @@ def _create(
                     "version": target.default_version_id,
                 },
             )
-        if not args.replace:
+        if not args.replace and not (same_document and same_attributes):
             return _error(
                 "IAM_POLICY_COLLISION",
                 f"Policy {policy_name!r} already exists at {target.arn.value}; "
@@ -1992,27 +2607,8 @@ def _create(
             target.arn.value,
             loaded.document,
             include_aws_validation=not args.local_validation_only,
+            planned_tags=desired_tags,
         )
-        desired_tags = tuple(
-            [
-                tag
-                for tag in target.tags
-                if tag.key.casefold().startswith(_RESERVED_PREFIX)
-            ]
-            + list(tags)
-        )
-        if tuple(sorted((tag.key, tag.value) for tag in plan.tags)) != tuple(
-            sorted((tag.key, tag.value) for tag in desired_tags)
-        ):
-            plan = replace(
-                plan,
-                tags=desired_tags,
-                operation=replace(
-                    plan.operation,
-                    action=ChangeAction.UPDATE,
-                    summary=f"Replace policy {target.arn.value} document and tags.",
-                ),
-            )
     else:
         plan = service.plan_create(
             policy_name,
@@ -2336,8 +2932,33 @@ def _update(
 ) -> _configs.Result:
     reference, loaded = _loaded_update(args)
     arn = _reference(service, reference)
+    current = service.get_policy(
+        arn, include_document=False, include_versions=False, include_tags=True
+    )
+    planned_tags: tuple[Tag, ...] | None = None
+    if current.arn.kind is PolicyKind.CUSTOMER_MANAGED:
+        if current.ownership_status is OwnershipStatus.UNOWNED:
+            return _error(
+                "IAM_POLICY_UNMANAGED",
+                "Policy is not Hacksaws-owned; review and adopt it before update.",
+                _configs.EXIT_POLICY,
+            )
+        if current.ownership_status is OwnershipStatus.UNSAFE:
+            return _error(
+                "IAM_POLICY_OWNERSHIP_UNSAFE",
+                "Policy has conflicting or partial Hacksaws ownership tags; repair "
+                "or release them before update.",
+                _configs.EXIT_POLICY,
+            )
+        user_tags = tuple(
+            tag for tag in current.tags if tag.key.casefold() not in RESERVED_TAGS
+        )
+        planned_tags = reconcile_owned_tags(current, user_tags)
     plan = service.plan_publish(
-        arn, loaded.document, include_aws_validation=not args.local_validation_only
+        arn,
+        loaded.document,
+        include_aws_validation=not args.local_validation_only,
+        planned_tags=planned_tags,
     )
     return _execute_plan(service, plan, args, context)
 
@@ -2349,6 +2970,20 @@ def _edit(
 ) -> _configs.Result:
     arn = _reference(service, args.policy)
     exported = service.export_policy(arn)
+    if exported.policy.arn.kind is PolicyKind.CUSTOMER_MANAGED:
+        if exported.policy.ownership_status is OwnershipStatus.UNOWNED:
+            return _error(
+                "IAM_POLICY_UNMANAGED",
+                "Policy is not Hacksaws-owned; review and adopt it before editing.",
+                _configs.EXIT_POLICY,
+            )
+        if exported.policy.ownership_status is OwnershipStatus.UNSAFE:
+            return _error(
+                "IAM_POLICY_OWNERSHIP_UNSAFE",
+                "Policy has conflicting or partial Hacksaws ownership tags; repair "
+                "or release them before editing.",
+                _configs.EXIT_POLICY,
+            )
     selected = PolicyFormat(args.format)
     suffix = ".yaml" if selected is PolicyFormat.YAML else f".{selected.value}"
     with tempfile.TemporaryDirectory(prefix="hacksaws-edit-") as directory:
@@ -2377,7 +3012,22 @@ def _edit(
             "Policy changed while the editor was open; no update was made."
         )
     plan = service.plan_publish(
-        arn, loaded.document, include_aws_validation=not args.local_validation_only
+        arn,
+        loaded.document,
+        include_aws_validation=not args.local_validation_only,
+        planned_tags=(
+            reconcile_owned_tags(
+                exported.policy,
+                tuple(
+                    tag
+                    for tag in exported.policy.tags
+                    if tag.key.casefold() not in RESERVED_TAGS
+                ),
+            )
+            if exported.policy.arn.kind is PolicyKind.CUSTOMER_MANAGED
+            and exported.policy.owned
+            else None
+        ),
     )
     return _execute_plan(service, plan, args, context)
 
@@ -2444,29 +3094,26 @@ def _delete(
 ) -> _configs.Result:
     arn = _reference(service, args.policy)
     plan = service.plan_delete(arn, cascade=args.cascade)
-    if not plan.policy.owned and not args.allow_unmanaged:
-        return _error(
-            "IAM_POLICY_UNMANAGED",
-            "Refusing to delete an unmanaged policy; inspect it and repeat with "
-            "--allow-unmanaged.",
-            _configs.EXIT_POLICY,
-        )
-    boundary_names = (
-        *plan.dependencies.boundary_users,
-        *plan.dependencies.boundary_roles,
+    preview = _policy_delete_plan_data(
+        plan,
+        context,
+        allow_unmanaged=bool(args.allow_unmanaged),
+        remove_boundaries=bool(args.remove_boundaries),
     )
-    if boundary_names and not args.remove_boundaries:
-        return _error(
-            "IAM_POLICY_BOUNDARIES",
-            "Policy is used as a permissions boundary. Removing boundary assignments "
-            "requires both --cascade and --remove-boundaries after review.",
+    review = _policy_plan_text(preview)
+    if preview["classification"] == "blocked":
+        first_blocker = cast("list[Mapping[str, object]]", preview["blockers"])[0]
+        blocked_code = {
+            "UNMANAGED_POLICY": "IAM_POLICY_UNMANAGED",
+            "BOUNDARY_OPT_IN_REQUIRED": "IAM_POLICY_BOUNDARIES",
+            "CASCADE_REQUIRED": "IAM_POLICY_DEPENDENCIES",
+        }.get(str(first_blocker.get("code")), "IAM_POLICY_DELETE_BLOCKED")
+        return _configs.Result(
+            blocked_code,
+            review,
             _configs.EXIT_POLICY,
-        )
-    if not plan.executable:
-        return _error(
-            "IAM_POLICY_DEPENDENCIES",
-            "Policy still has dependencies; use --cascade only after reviewing them.",
-            _configs.EXIT_POLICY,
+            "stderr",
+            {"plan": preview, "result": {"classification": "blocked"}},
         )
     policy = service.get_policy(
         arn, include_document=True, include_versions=True, include_tags=True
@@ -2491,67 +3138,80 @@ def _delete(
         raise PolicyDriftError(
             "Policy or dependencies changed after deletion planning; review again."
         )
-    preview = {
-        "attachments": {
-            "users": [item.name for item in dependencies.permission_users],
-            "groups": [item.name for item in dependencies.permission_groups],
-            "roles": [item.name for item in dependencies.permission_roles],
-        },
-        "permissionBoundaries": {
-            "users": [item.name for item in dependencies.boundary_users],
-            "roles": [item.name for item in dependencies.boundary_roles],
-        },
-        "versions": [
-            {
-                "id": version.version_id,
-                "default": version.is_default,
-                "digest": (
-                    policy_digest(version.document) if version.document else None
-                ),
-            }
-            for version in policy.versions
-        ],
-    }
-    confirmation = (
-        f"{plan.operation.summary}\nExact deletion preview:\n"
-        f"{json.dumps(preview, indent=2, sort_keys=True)}\n"
-    )
     if bool(getattr(args, "dry_run", False)):
         return _configs.Result(
             "IAM_POLICY_DELETE_DRY_RUN",
-            f"DRY RUN — {confirmation.rstrip()}\nNo AWS or local state was changed.",
+            "DRY RUN\n" + review,
             data={
-                "dryRun": True,
-                "classification": "planned",
-                "arn": arn,
-                "cascade": args.cascade,
-                "removeBoundaries": args.remove_boundaries,
-                "dependencies": _dependency_data(plan),
-                "preview": preview,
+                "plan": preview,
+                "result": {
+                    "classification": "dry-run",
+                    "journalId": None,
+                    "changed": False,
+                },
             },
         )
-    if not _confirm_exact(args, confirmation, policy.name):
-        return _error(
-            "IAM_POLICY_CANCELLED",
-            "Policy deletion cancelled; no AWS changes were made.",
-            _configs.EXIT_CANCELLED,
-        )
+    if not bool(getattr(args, "yes", False)):
+        if _confirmation_unavailable():
+            return _configs.Result(
+                "IAM_POLICY_CONFIRMATION_REQUIRED",
+                review + "\nConfirmation required: rerun with --yes.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "confirmation-required"},
+                },
+            )
+        if (
+            input(review + f"\n\nType exactly {policy.name!r} to delete:\n> ").strip()
+            != policy.name
+        ):
+            return _configs.Result(
+                "IAM_POLICY_CANCELLED",
+                "CANCELLED — Policy deletion declined. No changes have been made.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "cancelled"},
+                },
+            )
     journal_id = _durable_reconcile(
         context,
         "delete",
         _absent_state(arn, policy.name, policy.path),
         _policy_state(policy, dependencies=dependencies),
     )
+    operation_count = len(plan.operation.steps)
+    console_url = _console_url(context, arn)
+    message = (
+        f"Deleted managed policy {policy.name}."
+        f"\nApplied: {operation_count} ordered AWS operation(s); resource is absent."
+        f"\nARN: {arn}\nPolicy ID: {policy.policy_id}"
+        "\nVerified: IAM reported the policy absent."
+        f"\nJournal: {journal_id} (completed; irreversible deletion receipt retained)."
+        f"\nAWS Console: {console_url}"
+    )
+    result_data = {
+        "classification": "deleted",
+        "action": "delete",
+        "arn": arn,
+        "name": policy.name,
+        "policyId": policy.policy_id,
+        "operationsCompleted": operation_count,
+        "journalId": journal_id,
+        "verifiedAbsent": True,
+        "recoveryAvailable": True,
+        "consoleUrl": console_url,
+    }
     return _configs.Result(
         "IAM_POLICY_DELETED",
-        confirmation.rstrip(),
+        _output.safe_terminal_text(message),
         data={
-            "arn": arn,
-            "cascade": args.cascade,
-            "removeBoundaries": args.remove_boundaries,
-            "dependencies": _dependency_data(plan),
-            "preview": preview,
-            "journalId": journal_id,
+            "plan": preview,
+            "applied": preview["changes"],
+            "result": result_data,
         },
     )
 
@@ -2740,23 +3400,49 @@ def _ownership(
         plan = service.plan_adopt(arn, uuid.uuid4().hex, user_tags=_tags(args.tag))
     else:
         plan = service.plan_release(arn)
+    preview = _ownership_plan_data(plan, context, args.policy_action)
+    review = _policy_plan_text(preview)
     if bool(getattr(args, "dry_run", False)):
         return _configs.Result(
             "IAM_POLICY_OWNERSHIP_DRY_RUN",
-            f"DRY RUN — {plan.operation.summary}\nNo AWS or local state was changed.",
+            "DRY RUN\n" + review,
             data={
-                "dryRun": True,
-                "action": args.policy_action,
-                "arn": arn,
-                "classification": plan.operation.action.value,
+                "plan": preview,
+                "result": {
+                    "classification": "dry-run",
+                    "journalId": None,
+                    "changed": False,
+                },
             },
         )
-    if not _confirm(args, plan.operation.summary):
-        return _error(
-            "IAM_POLICY_CANCELLED",
-            "Ownership change cancelled.",
-            _configs.EXIT_CANCELLED,
-        )
+    if plan.operation.steps and not bool(getattr(args, "yes", False)):
+        if _confirmation_unavailable():
+            return _configs.Result(
+                "IAM_POLICY_CONFIRMATION_REQUIRED",
+                review + "\nConfirmation required: rerun with --yes.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "confirmation-required"},
+                },
+            )
+        if (
+            input(review + "\n\nType exactly 'yes' to apply this plan:\n> ")
+            .strip()
+            .casefold()
+            != "yes"
+        ):
+            return _configs.Result(
+                "IAM_POLICY_CANCELLED",
+                "CANCELLED — Ownership change declined. No changes have been made.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                {
+                    "plan": preview,
+                    "result": {"classification": "cancelled"},
+                },
+            )
     current = service.get_policy(
         arn, include_document=True, include_versions=True, include_tags=True
     )
@@ -2774,21 +3460,47 @@ def _ownership(
         current,
         tags=tuple(Tag(key, value) for key, value in sorted(values.items())),
     )
-    dependencies = service.policy_dependencies(arn)
-    journal_id = _durable_reconcile(
-        context,
-        args.policy_action,
-        _policy_state(desired, dependencies=dependencies),
-        _policy_state(current, dependencies=dependencies),
+    journal_id = None
+    if plan.operation.steps:
+        dependencies = service.policy_dependencies(arn)
+        journal_id = _durable_reconcile(
+            context,
+            args.policy_action,
+            _policy_state(desired, dependencies=dependencies),
+            _policy_state(current, dependencies=dependencies),
+        )
+    result_data = {
+        "classification": "applied" if journal_id else "no-change",
+        "action": args.policy_action,
+        "arn": arn,
+        "policyId": desired.policy_id,
+        "owned": desired.owned,
+        "journalId": journal_id,
+        "verified": True,
+        "recoveryAvailable": journal_id is not None,
+    }
+    ownership_verb = {"adopt": "Adopted", "release": "Released"}[args.policy_action]
+    message = (
+        f"{ownership_verb} ownership for managed policy {desired.name}."
+        if journal_id
+        else f"No change — managed policy {desired.name} ownership already matches."
+    )
+    message += (
+        f"\nARN: {arn}\nPolicy ID: {desired.policy_id}"
+        f"\nVerified: IAM read-back matched the planned tags."
+        + (
+            f"\nJournal: {journal_id} (completed; recovery receipt available)."
+            if journal_id
+            else "\nJournal: none (no mutation was required)."
+        )
     )
     return _configs.Result(
-        "IAM_POLICY_OWNERSHIP_CHANGED",
-        plan.operation.summary,
+        "IAM_POLICY_OWNERSHIP_CHANGED" if journal_id else "IAM_POLICY_NO_CHANGE",
+        _output.safe_terminal_text(message),
         data={
-            "arn": arn,
-            "action": args.policy_action,
-            "owned": desired.owned,
-            "journalId": journal_id,
+            "plan": preview,
+            "applied": preview["changes"],
+            "result": result_data,
         },
     )
 
@@ -2797,6 +3509,7 @@ def dispatch(
     args: argparse.Namespace, context: IamCommandContext
 ) -> _configs.Result | None:
     """Dispatch one managed-policy leaf and normalize failures for JSON envelopes."""
+    normalize_arguments(args)
     action = getattr(args, "policy_action", None)
     if action is None:
         return None

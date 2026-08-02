@@ -332,8 +332,9 @@ def test_iam_inventory_and_cleanup_cli_results(monkeypatch: pytest.MonkeyPatch) 
         ),
         context,
     )
-    assert dry_run.code == "IAM_CLEANUP_PLAN"
-    assert dry_run.data["classification"] == "planned"
+    assert dry_run.code == "IAM_CLEANUP_DRY_RUN"
+    assert dry_run.data["plan"]["classification"] == "planned"
+    assert dry_run.data["result"]["journalId"] is None
 
     execute_args = argparse.Namespace(
         patterns=["*Agent*"],
@@ -440,18 +441,77 @@ def test_cleanup_blocked_confirmation_and_partial_results(
         yes=False,
     )
     result = _iam_cli.cleanup_result(args, SimpleNamespace())
-    assert result.code == "IAM_CLEANUP_PLAN"
-    assert result.exit_code == 2
+    assert result.code == "IAM_CLEANUP_BLOCKED"
+    assert result.exit_code == 3
 
     selected_plan = planned
     monkeypatch.setattr(_iam_cli.os, "isatty", lambda _fd: False)
     result = _iam_cli.cleanup_result(args, SimpleNamespace())
     assert result.code == "IAM_CLEANUP_CONFIRMATION_REQUIRED"
+    assert result.exit_code == 4
+
+    monkeypatch.setattr(_iam_cli.os, "isatty", lambda _fd: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    result = _iam_cli.cleanup_result(args, SimpleNamespace())
+    assert result.code == "IAM_CLEANUP_CANCELLED"
+    assert result.data["result"]["classification"] == "cancelled"
 
     args.yes = True
     result = _iam_cli.cleanup_result(args, SimpleNamespace())
     assert result.code == "IAM_CLEANUP_PARTIAL"
     assert result.exit_code == 2
+    assert result.data["result"]["consoleUrl"].startswith("https://")
+
+
+def test_cleanup_no_matches_does_not_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    options = _iam_cleanup.CleanupOptions(patterns=("missing",), dry_run=False)
+    no_matches = _iam_cleanup.CleanupPlan(
+        "123456789012",
+        "aws",
+        "arn:aws:iam::123456789012:user/test",
+        options,
+        (),
+        (),
+    )
+
+    class Service:
+        def __init__(self, _context: object) -> None:
+            pass
+
+        def plan(
+            self, _options: _iam_cleanup.CleanupOptions
+        ) -> _iam_cleanup.CleanupPlan:
+            return no_matches
+
+    monkeypatch.setattr(_iam_cli._iam_cleanup, "CleanupService", Service)
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("no-op must not prompt")
+    )
+    args = argparse.Namespace(
+        patterns=["missing"],
+        all=False,
+        roles=False,
+        policies=True,
+        group_grants=False,
+        created=False,
+        adopted=False,
+        smoke=False,
+        smoke_run=None,
+        cascade=False,
+        remove_boundaries=False,
+        remove_from_instance_profiles=False,
+        dry_run=False,
+        yes=False,
+    )
+
+    result = _iam_cli.cleanup_result(args, SimpleNamespace())
+
+    assert result.code == "IAM_CLEANUP_NO_MATCHES"
+    assert result.data["result"] == {
+        "classification": "no-change",
+        "journalId": None,
+        "leaveNoTrace": True,
+    }
 
 
 def test_inventory_rendering_and_central_dispatch_branches(

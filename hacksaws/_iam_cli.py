@@ -7,7 +7,6 @@ import contextlib
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,6 +29,7 @@ from hacksaws import _state
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Mapping
 
 
 class IamAdapter(Protocol):
@@ -315,6 +315,14 @@ def _resource_filters(parser: argparse.ArgumentParser) -> None:
         help="Include resources explicitly adopted by Hacksaws.",
     )
     resources.add_argument(
+        "--legacy",
+        action="store_true",
+        help=(
+            "Include safely identified Hacksaws resources created before origin "
+            "tracking. Cleanup excludes them unless this selector is explicit."
+        ),
+    )
+    resources.add_argument(
         "--smoke",
         action="store_true",
         help="Restrict selection to tagged smoke-test resources.",
@@ -424,17 +432,22 @@ def _cleanup_types(args: argparse.Namespace) -> frozenset[_iam_cleanup.ResourceT
 
 
 def _cleanup_origins(
-    args: argparse.Namespace,
+    args: argparse.Namespace, *, include_legacy_by_default: bool = False
 ) -> frozenset[_iam_cleanup.OwnershipOrigin]:
     values: set[_iam_cleanup.OwnershipOrigin] = set()
     if args.created:
         values.add(_iam_cleanup.OwnershipOrigin.CREATED)
     if args.adopted:
         values.add(_iam_cleanup.OwnershipOrigin.ADOPTED)
-    return frozenset(
-        values
-        or {_iam_cleanup.OwnershipOrigin.CREATED, _iam_cleanup.OwnershipOrigin.ADOPTED}
-    )
+    if getattr(args, "legacy", False):
+        values.add(_iam_cleanup.OwnershipOrigin.LEGACY)
+    defaults = {
+        _iam_cleanup.OwnershipOrigin.CREATED,
+        _iam_cleanup.OwnershipOrigin.ADOPTED,
+    }
+    if include_legacy_by_default:
+        defaults.add(_iam_cleanup.OwnershipOrigin.LEGACY)
+    return frozenset(values or defaults)
 
 
 def _inventory_text(
@@ -579,8 +592,9 @@ def _inventory_progress_text(event: _iam_cleanup.InventoryProgress) -> str:
 def _inventory_query(args: argparse.Namespace) -> _iam_cleanup.InventoryQuery:
     origins = (
         frozenset()
-        if args.all_account and not (args.created or args.adopted)
-        else _cleanup_origins(args)
+        if args.all_account
+        and not (args.created or args.adopted or getattr(args, "legacy", False))
+        else _cleanup_origins(args, include_legacy_by_default=True)
     )
     return _iam_cleanup.InventoryQuery(
         patterns=tuple(args.patterns),
@@ -664,6 +678,128 @@ def _inventory_command_result(args: argparse.Namespace) -> _configs.Result:
             return result
 
 
+def _cleanup_plan_data(plan: _iam_cleanup.CleanupPlan) -> dict[str, object]:
+    """Build a bounded cleanup review without policy/trust documents or raw params."""
+    resources = [item.as_dict() for item in plan.resources]
+    operations = [
+        {
+            "order": index,
+            "id": step.id,
+            "resource": step.resource_key,
+            "action": step.action,
+            "reversible": step.compensate_action is not None,
+            "irreversible": step.irreversible,
+            "prerequisites": list(step.prerequisites),
+        }
+        for index, step in enumerate(plan.steps, 1)
+    ]
+    dependency_counts = {
+        key: sum(
+            len(values)
+            for item in plan.resources
+            for name, values in item.dependencies.items()
+            if name == key
+        )
+        for key in sorted({key for item in plan.resources for key in item.dependencies})
+    }
+    return {
+        "classification": plan.classification.value,
+        "action": "cleanup",
+        "risk": "critical" if plan.resources else "none",
+        "verifiedIdentity": {
+            "accountId": plan.account_id,
+            "partition": plan.partition,
+            "callerArn": plan.caller_arn,
+        },
+        "selection": {
+            "resources": resources,
+            "count": len(resources),
+            "origins": sorted({str(item["origin"]) for item in resources}),
+            "types": sorted({str(item["type"]) for item in resources}),
+        },
+        "dependencies": dependency_counts,
+        "blockers": [item.as_dict() for item in plan.blockers],
+        "warnings": list(plan.warnings),
+        "operations": operations,
+        "journalExpected": plan.classification
+        is _iam_cleanup.PlanClassification.PLANNED,
+        "recovery": (
+            "A credential-free journal will be written before the first AWS mutation; "
+            "irreversible identity deletions retain commit-point receipts."
+            if plan.resources
+            else "No journal is needed because no resources matched."
+        ),
+        "leaveNoTrace": {
+            "expectedAbsent": [item.key for item in plan.resources],
+            "localRecoveryJournalRetained": True,
+        },
+    }
+
+
+def _cleanup_plan_text(data: Mapping[str, object]) -> str:
+    """Render compact cleanup review text from the credential-free plan model."""
+    identity = cast("Mapping[str, object]", data["verifiedIdentity"])
+    selection = cast("Mapping[str, object]", data["selection"])
+    resources = cast("list[Mapping[str, object]]", selection["resources"])
+    lines = [
+        f"PLAN — CLEANUP ({data['risk']} risk)",
+        f"Account: {identity['accountId']} ({identity['partition']})",
+        f"Caller: {identity['callerArn']}",
+        f"Resources selected: {selection['count']}",
+    ]
+    lines.extend(
+        f"  - {item['type']} {item['name']} [{item['origin']}] {item['arn']}"
+        for item in resources
+    )
+    dependencies = cast("Mapping[str, int]", data["dependencies"])
+    populated = {key: count for key, count in dependencies.items() if count}
+    lines.append(
+        "Dependencies: "
+        + (
+            ", ".join(f"{key}={count}" for key, count in populated.items())
+            if populated
+            else "none"
+        )
+    )
+    operations = cast("list[Mapping[str, object]]", data["operations"])
+    if operations:
+        lines.append("Ordered AWS operations:")
+        lines.extend(
+            f"  {item['order']}. {item['action']} — {item['resource']} "
+            "["
+            + (
+                "irreversible"
+                if item["irreversible"]
+                else "reversible"
+                if item["reversible"]
+                else "one-way"
+            )
+            + "]"
+            for item in operations
+        )
+    blockers = cast("list[Mapping[str, object]]", data["blockers"])
+    if blockers:
+        lines.append("Blockers:")
+        lines.extend(f"  - {item['message']}" for item in blockers)
+    warnings = cast("list[str]", data["warnings"])
+    if warnings:
+        lines.append("Warnings:")
+        lines.extend(f"  - {item}" for item in warnings)
+    lines.append(str(data["recovery"]))
+    lines.append("No changes have been made.")
+    return "\n".join(_output.safe_terminal_text(line) for line in lines)
+
+
+def _iam_console_url(partition: str) -> str:
+    """Return the partition-appropriate IAM console home link."""
+    domain = {
+        "aws": "console.aws.amazon.com",
+        "aws-cn": "console.amazonaws.cn",
+        "aws-us-gov": "console.amazonaws-us-gov.com",
+    }.get(partition, "console.aws.amazon.com")
+    return f"https://{domain}/iam/home#/home"
+
+
 def cleanup_result(
     args: argparse.Namespace, context: IamCommandContext
 ) -> _configs.Result:
@@ -690,49 +826,109 @@ def cleanup_result(
     )
     service = _iam_cleanup.CleanupService(context)
     plan = service.plan(options)
-    plan_data = plan.as_dict()
-    if (
-        args.dry_run
-        or plan.classification is not _iam_cleanup.PlanClassification.PLANNED
-    ):
-        blocked = plan.classification is _iam_cleanup.PlanClassification.BLOCKED
+    plan_data = _cleanup_plan_data(plan)
+    review = _cleanup_plan_text(plan_data)
+    if plan.classification is _iam_cleanup.PlanClassification.BLOCKED:
         return _configs.Result(
-            "IAM_CLEANUP_PLAN",
-            "DRY RUN — cleanup plan\n"
-            + json.dumps(plan_data, indent=2)
-            + "\nNo AWS or local state was changed.",
-            2 if blocked else 0,
-            "stderr" if blocked else "stdout",
-            plan_data,
+            "IAM_CLEANUP_BLOCKED",
+            review,
+            _configs.EXIT_POLICY,
+            "stderr",
+            {"plan": plan_data, "result": {"classification": "blocked"}},
+        )
+    if plan.classification is _iam_cleanup.PlanClassification.NO_MATCHES:
+        return _configs.Result(
+            "IAM_CLEANUP_NO_MATCHES",
+            "NO CHANGE — Cleanup matched no resources.\nNo changes have been made.",
+            data={
+                "plan": plan_data,
+                "applied": {"operationsCompleted": 0, "resourcesDeleted": 0},
+                "result": {
+                    "classification": "no-change",
+                    "journalId": None,
+                    "leaveNoTrace": True,
+                },
+            },
+        )
+    if args.dry_run:
+        return _configs.Result(
+            "IAM_CLEANUP_DRY_RUN",
+            "DRY RUN\n" + review,
+            data={
+                "plan": plan_data,
+                "result": {
+                    "classification": "dry-run",
+                    "journalId": None,
+                    "changed": False,
+                },
+            },
         )
     if not args.yes:
         if _configs.json_output_enabled() or not os.isatty(0):
             return _configs.Result(
                 "IAM_CLEANUP_CONFIRMATION_REQUIRED",
-                "Cleanup requires --yes in non-interactive or JSON mode.",
+                review + "\nConfirmation required: rerun with --yes.",
                 _configs.EXIT_CANCELLED,
                 "stderr",
-                plan_data,
+                {
+                    "plan": plan_data,
+                    "result": {"classification": "confirmation-required"},
+                },
             )
-        sys.stdout.write("Cleanup plan:\n" + json.dumps(plan_data, indent=2) + "\n")
-        if input("\nType exactly 'yes' to execute this plan:\n> ").strip() != "yes":
+        if (
+            input(review + "\n\nType exactly 'yes' to execute this plan:\n> ").strip()
+            != "yes"
+        ):
             return _configs.Result(
                 "IAM_CLEANUP_CANCELLED",
-                "Cleanup cancelled; no AWS changes were made.",
+                "CANCELLED — Cleanup declined. No changes have been made.",
                 _configs.EXIT_CANCELLED,
                 "stderr",
-                plan_data,
+                {
+                    "plan": plan_data,
+                    "result": {"classification": "cancelled"},
+                },
             )
     outcome = service.execute(plan)
-    data = {"plan": plan_data, "result": outcome.as_dict()}
+    result_data = outcome.as_dict()
+    console_url = _iam_console_url(plan.partition)
+    result_data["consoleUrl"] = console_url
+    applied = {
+        "operationsPlanned": len(plan.steps),
+        "operationsCompleted": len(outcome.completed),
+        "resourcesSelected": len(plan.resources),
+        "resourcesDeleted": len(plan.resources) if outcome.lnt else 0,
+        "failures": list(outcome.failed),
+        "residue": list(outcome.remaining),
+    }
+    data = {"plan": plan_data, "applied": applied, "result": result_data}
     partial = outcome.classification is not _iam_cleanup.ResultClassification.CLEANED
+    message = (
+        (
+            f"Cleanup incomplete: {len(outcome.failed)} failed operation(s), "
+            f"{len(outcome.remaining)} residue item(s)."
+        )
+        if partial
+        else f"Deleted {len(plan.resources)} IAM resource(s)."
+    )
+    message += (
+        f"\nApplied: {len(outcome.completed)}/{len(plan.steps)} ordered AWS "
+        "operation(s) completed."
+        f"\nFailures: {len(outcome.failed)}"
+        f"\nResidue: {len(outcome.remaining)}"
+        f"\nVerified: Leave No Trace {'succeeded' if outcome.lnt else 'not proven'}."
+        + (
+            f"\nJournal: {outcome.journal_id} "
+            "(recovery receipt retained; use 'hacksaws iam recovery get')."
+            if outcome.journal_id
+            else "\nJournal: none."
+        )
+        + "\nAWS Console: "
+        + console_url
+    )
     return _configs.Result(
         "IAM_CLEANUP_PARTIAL" if partial else "IAM_CLEANUP_COMPLETE",
-        (
-            "Cleanup completed with remaining resources."
-            if partial
-            else "Leave No Trace cleanup completed successfully."
-        ),
+        _output.safe_terminal_text(message),
         2 if partial else 0,
         "stderr" if partial else "stdout",
         data,
@@ -928,7 +1124,7 @@ def recovery_result(args: argparse.Namespace) -> _configs.Result:
     )
 
 
-def dispatch(args: argparse.Namespace) -> _configs.Result:  # noqa: PLR0911
+def dispatch(args: argparse.Namespace) -> _configs.Result:  # noqa: C901, PLR0911
     """Dispatch recovery locally or hand verified context to the owning leaf adapter."""
     if args.iam_action in {"recovery", "recover"}:
         return recovery_result(args)
@@ -957,6 +1153,10 @@ def dispatch(args: argparse.Namespace) -> _configs.Result:  # noqa: PLR0911
             _configs.EXIT_USAGE,
             "stderr",
         )
+    for adapter in candidates:
+        normalize = getattr(adapter, "normalize_arguments", None)
+        if normalize is not None:
+            normalize(args)
     context = IamCommandContext.create(args)
     for adapter in candidates:
         result = adapter.dispatch(args, context)

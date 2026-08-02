@@ -33,6 +33,7 @@ TOP_LEVEL = {
     "iam",
     "session",
     "output",
+    "history",
 }
 NAMING_FIELDS = {"case", "prefix", "suffix", "enforcement"}
 NAMING_CASES = {"Pascal", "camel", "snake", "kebab"}
@@ -78,6 +79,12 @@ def default_config() -> dict[str, Any]:
         "iam": {"path": "/hacksaws/"},
         "session": {"packed_policy_warning": 80, "packed_policy_enforcement": "off"},
         "output": {"color": "auto"},
+        "history": {
+            "enabled": True,
+            "max_age": 90 * 24 * 60 * 60,
+            "max_entries": 10_000,
+            "max_bytes": 50 * 1024 * 1024,
+        },
     }
 
 
@@ -146,7 +153,7 @@ def _validate_config(data: object) -> dict[str, Any]:
     if type(data) is not dict:
         raise OperationalError("Hacksaws config must be a JSON object.")
     defaults = default_config()
-    for key in ("naming", "iam", "session", "output"):
+    for key in ("naming", "iam", "session", "output", "history"):
         data.setdefault(key, deepcopy(defaults[key]))
     unknown = set(data) - TOP_LEVEL
     if unknown:
@@ -251,6 +258,21 @@ def _validate_foundation_settings(data: dict[str, Any]) -> None:
         or output["color"] not in COLOR_MODES
     ):
         raise OperationalError("Config output.color must be auto, always, or never.")
+    history = data["history"]
+    if type(history) is not dict or set(history) != {
+        "enabled",
+        "max_age",
+        "max_entries",
+        "max_bytes",
+    }:
+        raise OperationalError("Config history has an unsupported shape.")
+    if type(history["enabled"]) is not bool:
+        raise OperationalError("Config history.enabled must be true or false.")
+    for field in ("max_age", "max_entries", "max_bytes"):
+        if type(history[field]) is not int or history[field] < 1:
+            raise OperationalError(
+                f"Config history.{field} must be a positive integer."
+            )
 
 
 def _validate_resources(data: dict[str, Any]) -> None:
@@ -468,6 +490,22 @@ CONFIG_OPTION_PATTERNS: dict[str, dict[str, object]] = {
     "output.color": {
         "description": "Color mode: auto, always, or never.",
         "default": "auto",
+    },
+    "history.enabled": {
+        "description": "Record redacted command outcomes in local history.",
+        "default": True,
+    },
+    "history.max_age": {
+        "description": "Maximum history age in seconds before routine pruning.",
+        "default": 90 * 24 * 60 * 60,
+    },
+    "history.max_entries": {
+        "description": "Maximum retained resolved command records.",
+        "default": 10_000,
+    },
+    "history.max_bytes": {
+        "description": "Maximum logical history size in bytes.",
+        "default": 50 * 1024 * 1024,
     },
     "accounts.<account>.credential_target": {
         "description": "Per-account credential target used only when explicitly selected.",

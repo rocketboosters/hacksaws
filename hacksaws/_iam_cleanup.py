@@ -150,7 +150,11 @@ class InventoryQuery:
     patterns: tuple[str, ...] = ()
     resource_types: frozenset[ResourceType] = frozenset()
     origins: frozenset[OwnershipOrigin] = frozenset(
-        {OwnershipOrigin.CREATED, OwnershipOrigin.ADOPTED}
+        {
+            OwnershipOrigin.CREATED,
+            OwnershipOrigin.ADOPTED,
+            OwnershipOrigin.LEGACY,
+        }
     )
     owned_only: bool = True
     smoke_only: bool = False
@@ -266,7 +270,9 @@ class CleanupOptions:
     patterns: tuple[str, ...] = ()
     all_resources: bool = False
     resource_types: frozenset[ResourceType] = frozenset()
-    origins: frozenset[OwnershipOrigin] = frozenset()
+    origins: frozenset[OwnershipOrigin] = frozenset(
+        {OwnershipOrigin.CREATED, OwnershipOrigin.ADOPTED}
+    )
     smoke_only: bool = False
     smoke_run_id: str | None = None
     cascade: bool = False
@@ -396,6 +402,8 @@ def ownership_origin(
         return OwnershipOrigin.CREATED
     if value == OwnershipOrigin.ADOPTED.value:
         return OwnershipOrigin.ADOPTED
+    if value == OwnershipOrigin.LEGACY.value:
+        return OwnershipOrigin.LEGACY
     if value is None:
         return OwnershipOrigin.LEGACY
     return OwnershipOrigin.UNKNOWN
@@ -498,7 +506,7 @@ class CleanupService:
     @staticmethod
     def _role_item(role: roles.RoleSnapshot, *, details: bool) -> InventoryItem:
         tags = _tag_values(role.tags)
-        owned = tags.get(roles.MANAGED_TAG) == "true"
+        owned = role.owned
         dependencies: Mapping[str, tuple[str, ...]] = {}
         if details:
             dependencies = {
@@ -1186,8 +1194,12 @@ class CleanupService:
         for index, operation in enumerate(plan.operations):
             identifier = _step_id(f"role-{role.role_id or role.name}", index)
             params = dict(operation.params)
-            if operation.action == "delete_role":
-                params["ExpectedRoleId"] = role.role_id
+            params["ExpectedRoleId"] = role.role_id
+            params["ExpectedOwnershipTags"] = dict(role.tags)
+            compensation_params = dict(operation.compensate_params or {})
+            if compensation_params:
+                compensation_params["ExpectedRoleId"] = role.role_id
+                compensation_params["ExpectedOwnershipTags"] = dict(role.tags)
             result.append(
                 CleanupStep(
                     identifier,
@@ -1195,7 +1207,7 @@ class CleanupService:
                     operation.action,
                     params,
                     operation.compensate_action,
-                    dict(operation.compensate_params or {}),
+                    compensation_params,
                     previous,
                     operation.action == "delete_role",
                 )
@@ -1270,14 +1282,27 @@ class CleanupService:
             identifier = _step_id(
                 f"policy-{policy.policy_id or policy.name}", len(result)
             )
+            forward_params = {
+                **dict(params),
+                "ExpectedPolicyId": policy.policy_id,
+                "ExpectedPolicyArn": policy.arn.value,
+                "ExpectedOwnershipTags": {tag.key: tag.value for tag in policy.tags},
+            }
+            reverse_params = dict(compensation_params or {})
+            if reverse_params:
+                reverse_params["ExpectedPolicyId"] = policy.policy_id
+                reverse_params["ExpectedPolicyArn"] = policy.arn.value
+                reverse_params["ExpectedOwnershipTags"] = {
+                    tag.key: tag.value for tag in policy.tags
+                }
             result.append(
                 CleanupStep(
                     identifier,
                     item.key,
                     action,
-                    dict(params),
+                    forward_params,
                     compensation,
-                    dict(compensation_params or {}),
+                    reverse_params,
                     previous,
                     irreversible,
                 )
@@ -1338,7 +1363,7 @@ class CleanupService:
             )
         append(
             "delete_policy",
-            {"PolicyArn": arn, "ExpectedPolicyId": policy.policy_id},
+            {"PolicyArn": arn},
             irreversible=True,
         )
         return result, []
@@ -1614,14 +1639,42 @@ def _call(context: Any, action: str, params: Mapping[str, object]) -> None:
     request = dict(params)
     expected_role_id = request.pop("ExpectedRoleId", None)
     expected_policy_id = request.pop("ExpectedPolicyId", None)
+    expected_policy_arn = request.pop("ExpectedPolicyArn", None)
+    expected_tags = request.pop("ExpectedOwnershipTags", None)
+    if expected_tags is not None and not isinstance(expected_tags, Mapping):
+        raise OperationalError("Cleanup ownership checkpoint is invalid.")
     if expected_role_id is not None:
         current = context.iam.get_role(RoleName=request["RoleName"])["Role"]
         if current.get("RoleId") != expected_role_id:
             raise OperationalError("Role identity changed after cleanup planning.")
+        if expected_tags is not None:
+            live_tags = {
+                str(item.get("Key")): str(item.get("Value", ""))
+                for item in current.get("Tags", [])
+                if isinstance(item, Mapping) and item.get("Key") is not None
+            }
+            if live_tags != dict(expected_tags):
+                raise OperationalError(
+                    "Role ownership tags changed after cleanup planning."
+                )
     if expected_policy_id is not None:
-        current = context.iam.get_policy(PolicyArn=request["PolicyArn"])["Policy"]
+        policy_arn = expected_policy_arn or request.get("PolicyArn")
+        if not isinstance(policy_arn, str) or not policy_arn:
+            raise OperationalError("Cleanup policy identity checkpoint is invalid.")
+        current = context.iam.get_policy(PolicyArn=policy_arn)["Policy"]
         if current.get("PolicyId") != expected_policy_id:
             raise OperationalError("Policy identity changed after cleanup planning.")
+        if expected_tags is not None:
+            response = context.iam.list_policy_tags(PolicyArn=policy_arn)
+            live_tags = {
+                str(item.get("Key")): str(item.get("Value", ""))
+                for item in response.get("Tags", [])
+                if isinstance(item, Mapping) and item.get("Key") is not None
+            }
+            if live_tags != dict(expected_tags):
+                raise OperationalError(
+                    "Policy ownership tags changed after cleanup planning."
+                )
     getattr(context.iam, action)(**request)
 
 

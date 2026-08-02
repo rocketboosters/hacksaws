@@ -7,8 +7,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .cache/
+.tmp/
 .tmp-pytest-*/
 .coverage
+.coverage-*
 coverage.xml
 htmlcov/
 

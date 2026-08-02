@@ -741,6 +741,71 @@ def test_adopt_release_and_tag_drift() -> None:
     assert iam.tags["Existing"] == "yes"
 
 
+def test_ownership_classification_and_idempotent_legacy_migration() -> None:
+    iam = StatefulIam()
+    service = make_service(iam)
+    assert service.get_policy(ARN).ownership_status is managed.OwnershipStatus.LEGACY
+
+    legacy_id = iam.tags["hacksaws:resource-id"]
+    legacy = service.plan_adopt(ARN, "must-not-replace")
+    assert legacy.add == (managed.Tag("hacksaws:ownership-origin", "legacy"),)
+    migrated = service.execute_tag_change(legacy)
+    assert migrated.policy is not None
+    assert iam.tags["hacksaws:resource-id"] == legacy_id
+    assert iam.tags["hacksaws:ownership-origin"] == "legacy"
+
+    repeated = service.plan_adopt(ARN, "must-not-replace")
+    assert repeated.operation.steps == ()
+    assert repeated.add == ()
+
+    iam.tags = {"hacksaws:managed-by": "hacksaws"}
+    with pytest.raises(managed.PolicyServiceError, match="partial"):
+        service.plan_adopt(ARN, "new")
+    iam.tags = {"hacksaws:managed-by": "other"}
+    with pytest.raises(managed.PolicyServiceError, match="already managed"):
+        service.plan_adopt(ARN, "new")
+
+
+def test_publish_reconciles_tags_without_version_and_fences_tag_races() -> None:
+    iam = StatefulIam()
+    iam.tags.update(
+        {
+            "hacksaws:created-by": f"arn:aws:iam::{ACCOUNT}:user/tester",
+            "hacksaws:created-at": NOW.isoformat(),
+            "hacksaws:ownership-origin": "created",
+            "Team": "old",
+        }
+    )
+    service = make_service(iam)
+    current = service.get_policy(ARN)
+    desired = service.reconciled_owned_tags(current, (managed.Tag("Team", "agents"),))
+    plan = service.plan_publish(
+        ARN,
+        POLICY,
+        include_aws_validation=False,
+        planned_tags=desired,
+    )
+    assert plan.operation.action is managed.ChangeAction.UPDATE
+    assert [step.operation for step in plan.operation.steps] == ["TagPolicy"]
+    assert plan.before is not None
+    assert plan.after is not None
+    assert plan.before.policy_id == plan.after.policy_id
+    service.execute_change(plan)
+    assert iam.default == "v1"
+    assert "CreatePolicyVersion" not in iam.calls
+    assert iam.tags["Team"] == "agents"
+
+    raced = service.plan_publish(
+        ARN,
+        CHANGED,
+        include_aws_validation=False,
+        planned_tags=desired,
+    )
+    iam.tags["race"] = "changed"
+    with pytest.raises(managed.PolicyDriftError):
+        service.execute_change(raced)
+
+
 def test_dependency_complete_delete_requires_cascade_then_executes() -> None:
     iam = StatefulIam()
     iam.permission_users = {"U1": "alice"}

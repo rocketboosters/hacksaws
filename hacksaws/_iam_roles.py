@@ -13,9 +13,12 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
+from enum import StrEnum
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -62,6 +65,15 @@ class DependencyError(IamRoleError):
 
 class AmbiguousTrustError(IamRoleError):
     """Raised when a logical trust mutation cannot preserve a complex statement."""
+
+
+class OwnershipStatus(StrEnum):
+    """Safety classification for legacy and current role ownership tags."""
+
+    CURRENT = "current"
+    LEGACY = "legacy"
+    UNOWNED = "unowned"
+    UNSAFE = "unsafe"
 
 
 def canonical_json(value: object) -> str:
@@ -227,6 +239,8 @@ class MutationPlan:
     operations: tuple[Operation, ...]
     expected: Mapping[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    before: RoleSnapshot | None = None
+    after: RoleSpec | RoleSnapshot | None = None
 
 
 @dataclass
@@ -301,6 +315,43 @@ class RoleSnapshot:
     )
     role_id: str = ""
 
+    @property
+    def ownership_status(self) -> OwnershipStatus:
+        """Return the complete role ownership safety classification."""
+        return classify_ownership(self.tags)
+
+    @property
+    def owned(self) -> bool:
+        """Return whether this role has safe legacy or current ownership."""
+        return self.ownership_status in {
+            OwnershipStatus.CURRENT,
+            OwnershipStatus.LEGACY,
+        }
+
+
+def classify_ownership(tags: Mapping[str, str]) -> OwnershipStatus:
+    """Classify the complete protected role tag domain conservatively."""
+    protected_keys = {MANAGED_TAG, OWNER_TAG, AUDIT_TAG, ORIGIN_TAG}
+    values = {key: value for key, value in tags.items() if key in protected_keys}
+    if not values:
+        return OwnershipStatus.UNOWNED
+    if values.get(MANAGED_TAG) != "true" or not values.get(OWNER_TAG):
+        return OwnershipStatus.UNSAFE
+    allowed_legacy = (
+        frozenset({MANAGED_TAG, OWNER_TAG}),
+        frozenset({MANAGED_TAG, OWNER_TAG, AUDIT_TAG}),
+    )
+    if set(values) in allowed_legacy:
+        return OwnershipStatus.LEGACY
+    if frozenset(values) not in {
+        frozenset({MANAGED_TAG, OWNER_TAG, ORIGIN_TAG}),
+        frozenset(protected_keys),
+    }:
+        return OwnershipStatus.UNSAFE
+    if values.get(ORIGIN_TAG) not in {"created", "adopted", "legacy"}:
+        return OwnershipStatus.UNSAFE
+    return OwnershipStatus.CURRENT
+
 
 def ownership_tags(spec: RoleSpec) -> dict[str, str]:
     """Merge explicit naming/audit tags with required ownership markers."""
@@ -317,29 +368,33 @@ def ownership_tags(spec: RoleSpec) -> dict[str, str]:
 
 def plan_create_role(spec: RoleSpec, *, client: str = "iam") -> MutationPlan:
     """Plan role creation under the safe Hacksaws path by default."""
-    normalize_path(spec.path)
-    validate_trust_document(spec.trust)
+    planned = spec
+    normalize_path(planned.path)
+    validate_trust_document(planned.trust)
     params: dict[str, Any] = {
-        "RoleName": spec.name,
-        "Path": spec.path,
-        "AssumeRolePolicyDocument": canonical_json(spec.trust),
-        "MaxSessionDuration": spec.max_session_duration,
+        "RoleName": planned.name,
+        "Path": planned.path,
+        "AssumeRolePolicyDocument": canonical_json(planned.trust),
+        "MaxSessionDuration": planned.max_session_duration,
         "Tags": [
-            {"Key": key, "Value": value} for key, value in ownership_tags(spec).items()
+            {"Key": key, "Value": value}
+            for key, value in ownership_tags(planned).items()
         ],
     }
-    if spec.description is not None:
-        params["Description"] = spec.description
-    if spec.permissions_boundary:
-        params["PermissionsBoundary"] = spec.permissions_boundary
+    if planned.description is not None:
+        params["Description"] = planned.description
+    if planned.permissions_boundary:
+        params["PermissionsBoundary"] = planned.permissions_boundary
     operation = Operation(
         client,
         "create_role",
         params,
         "delete_role",
-        {"RoleName": spec.name},
+        {"RoleName": planned.name},
     )
-    return MutationPlan("role-create", (spec.name,), (operation,))
+    return MutationPlan(
+        "role-create", (planned.name,), (operation,), before=None, after=planned
+    )
 
 
 def plan_update_role(current: RoleSnapshot, desired: RoleSpec) -> MutationPlan:
@@ -431,6 +486,8 @@ def plan_update_role(current: RoleSnapshot, desired: RoleSpec) -> MutationPlan:
         (current.arn,),
         tuple(operations),
         expected={"role": role_snapshot_hash(current)},
+        before=current,
+        after=desired,
     )
 
 
@@ -457,17 +514,52 @@ def plan_adopt_role(
     role: RoleSnapshot, owner: str, audit_id: str | None = None
 ) -> MutationPlan:
     """Plan explicit adoption without changing role permissions or trust."""
+    status = role.ownership_status
     current_owner = role.tags.get(OWNER_TAG)
-    if role.tags.get(MANAGED_TAG) == "true" and current_owner not in {None, owner}:
+    if status is OwnershipStatus.UNSAFE:
+        if role.tags.get(MANAGED_TAG) == "true" and current_owner not in {
+            None,
+            owner,
+        }:
+            raise ConflictError(
+                f"Role is already managed by {current_owner!r}; release it before "
+                "adoption."
+            )
         raise ConflictError(
-            f"Role is already managed by {current_owner!r}; release it before adoption."
+            "Role has conflicting or partial Hacksaws ownership tags; repair or "
+            "release them before adoption."
         )
-    tags = {MANAGED_TAG: "true", OWNER_TAG: owner, ORIGIN_TAG: "adopted"}
-    if audit_id:
-        tags[AUDIT_TAG] = audit_id
-    return plan_put_tags(
+    if status is OwnershipStatus.UNOWNED:
+        tags = {
+            MANAGED_TAG: "true",
+            OWNER_TAG: owner,
+            AUDIT_TAG: audit_id or uuid.uuid4().hex,
+            ORIGIN_TAG: "adopted",
+        }
+    elif status is OwnershipStatus.LEGACY:
+        tags = {ORIGIN_TAG: "legacy"}
+        if audit_id and AUDIT_TAG not in role.tags:
+            tags[AUDIT_TAG] = audit_id
+    else:
+        if current_owner != owner:
+            raise ConflictError(
+                f"Role is already managed by {current_owner!r}; release it before "
+                "changing ownership."
+            )
+        tags = {}
+    if status is OwnershipStatus.CURRENT and audit_id not in {
+        None,
+        role.tags.get(AUDIT_TAG),
+    }:
+        raise ConflictError(
+            "Role already has a durable Hacksaws audit identity; adoption cannot "
+            "rewrite it."
+        )
+    plan = plan_put_tags(
         role.name, tags, current=role.tags, kind="role-adopt", expected_role=role
     )
+    desired_tags = {**role.tags, **tags}
+    return replace(plan, before=role, after=replace(role, tags=desired_tags))
 
 
 def plan_release_role(role: RoleSnapshot) -> MutationPlan:
@@ -510,6 +602,7 @@ def plan_put_tags(
             ),
         )
         for key, value in tags.items()
+        if current is None or current.get(key) != value
     )
     expected = (
         {"role": role_snapshot_hash(expected_role)} if expected_role is not None else {}

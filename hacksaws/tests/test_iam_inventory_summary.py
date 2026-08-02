@@ -68,6 +68,8 @@ def policy(
                 managed.Tag("hacksaws:managed-by", "hacksaws"),
                 managed.Tag("hacksaws:resource-kind", "managed-policy"),
                 managed.Tag("hacksaws:resource-id", resource_id),
+                managed.Tag("hacksaws:created-by", CALLER),
+                managed.Tag("hacksaws:created-at", "2026-08-01T00:00:00+00:00"),
             )
         )
     tags.append(managed.Tag(cleanup.ORIGIN_TAG, origin))

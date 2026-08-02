@@ -325,6 +325,94 @@ def test_distinct_profile_in_same_aws_files_does_not_back_up_source_session_secr
     assert "authenticated-token" not in persisted
 
 
+def test_keep_source_upgrades_valid_legacy_browser_cache_lineage_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _home(tmp_path, monkeypatch)
+    source = home / ".aws-source"
+    destination = home / ".aws-agent"
+    login_session = f"arn:aws:iam::{ACCOUNT}:user/browser-user"
+    cache_root = source / "login" / "cache"
+    cache = cache_root / f"{_state.digest(login_session.encode())}.json"
+    journal = _sessions._begin(
+        [source / "credentials", source / "config", _state.sessions_path()]
+    )
+    _ini(
+        source / "config",
+        {
+            "profile admin": {
+                "login_session": login_session,
+                "region": "us-west-2",
+            }
+        },
+    )
+    cache.parent.mkdir(parents=True)
+    cache.write_text(
+        json.dumps(
+            {
+                "accessToken": {
+                    "accountId": ACCOUNT,
+                    "accessKeyId": "access",
+                    "secretAccessKey": "secret",
+                    "sessionToken": "token",
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                },
+                "refreshToken": "refresh",
+                "clientId": "client-generation",
+                "dpopKey": "dpop-generation",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _sessions._record(
+        source,
+        "admin",
+        {
+            "source_account": ACCOUNT,
+            "target_account": ACCOUNT,
+            "role": None,
+            "boundary": None,
+            "policy": None,
+            "policy_provenance": "legacy AWS-native login_session",
+            "expires_at": None,
+            "login_cache_files": [str(cache.absolute())],
+            "login_cache_directories": [str(cache_root.absolute())],
+            "login_cache_fingerprints": {
+                str(cache.absolute()): _state.digest(cache.read_bytes())
+            },
+        },
+        journal,
+        method="browser-native",
+    )
+    _sessions._commit()
+
+    args = _args(
+        source,
+        to_directory=str(destination),
+        to_profile="debug",
+        keep_source=True,
+    )
+    session_patch, identity_patch = _identity_patches()
+    with (
+        session_patch,
+        identity_patch,
+        patch("hacksaws._sessions._assume", return_value=_final()),
+    ):
+        result = _sessions.assume_role(_configs.Context(args))
+
+    assert result.code == "ASSUME_ROLE"
+    assert cache.exists()
+    source_session = _state.load_sessions()[f"{source.absolute()}::admin"]
+    assert source_session["login_cache_lineage"]["schema_version"] == 1
+    assert source_session["login_cache_lineage"]["path"] == str(cache.absolute())
+    for legacy_key in (
+        "login_cache_files",
+        "login_cache_directories",
+        "login_cache_fingerprints",
+    ):
+        assert legacy_key not in source_session
+
+
 def test_self_assume_preserves_original_chain_and_never_backs_up_authenticated_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,6 +668,133 @@ def test_prepared_target_rejects_boundary_config_change_after_sts(
     assert not _sessions._journal_path().exists()
 
 
+def test_revalidation_refreshes_both_browser_cache_plans_without_stale_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source_record = {"auth_method": "browser-native", "profile": "admin"}
+    destination_record = {"auth_method": "browser-native", "profile": "debug"}
+    source_key = f"{source.absolute()}::admin"
+    destination_key = f"{destination.absolute()}::debug"
+    _state.save_sessions(
+        {source_key: source_record, destination_key: destination_record}
+    )
+    args = _args(
+        source,
+        to_directory=str(destination),
+        to_profile="debug",
+        keep_source=True,
+    )
+    absent = {
+        "exists": False,
+        "fingerprint": _state.digest(b"hacksaws:absent-section"),
+    }
+    old_source = tmp_path / "old-source-cache.json"
+    old_destination = tmp_path / "old-destination-cache.json"
+    old_source.write_bytes(b"source-refreshed-after-preview")
+    old_destination.write_bytes(b"destination-refreshed-after-preview")
+    new_source = tmp_path / "new-source-cache.json"
+    new_destination = tmp_path / "new-destination-cache.json"
+    new_source.write_bytes(b"source-current")
+    new_destination.write_bytes(b"destination-current")
+    source_claim = {
+        "path": str(new_source),
+        "whole_digest": _state.digest(new_source.read_bytes()),
+    }
+    destination_claim = {
+        "path": str(new_destination),
+        "whole_digest": _state.digest(new_destination.read_bytes()),
+    }
+    data: dict[str, Any] = {
+        "source": source,
+        "destination": destination,
+        "source_profile": "admin",
+        "destination_profile": "debug",
+        "source_expected": {"credentials": absent, "config": absent},
+        "destination_expected": {"credentials": absent, "config": absent},
+        "source_record": source_record,
+        "destination_record": destination_record,
+        "source_key": source_key,
+        "destination_key": destination_key,
+        "source_session_expected": _sessions._session_record_state(source_record),
+        "destination_session_expected": _sessions._session_record_state(
+            destination_record
+        ),
+        "source_cache": (
+            [old_source.parent],
+            [
+                {
+                    "path": str(old_source),
+                    "whole_digest": "preview-source-digest",
+                }
+            ],
+            [],
+            None,
+        ),
+        "destination_cache": (
+            [old_destination.parent],
+            [
+                {
+                    "path": str(old_destination),
+                    "whole_digest": "preview-destination-digest",
+                }
+            ],
+            [],
+            None,
+        ),
+        "cache_expected": {"preview": "stale"},
+        "keep_source": True,
+        "same_key": False,
+        "hacksaws_config_expected": _sessions._file_fingerprint(
+            _state.root() / "config.json"
+        ),
+        "policy_source_expected": None,
+    }
+    prepared = _sessions.AssumeRolePlan(
+        data, _sessions._assume_arguments_fingerprint(args)
+    )
+    refreshed_source: tuple[
+        list[Path], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]
+    ] = (
+        [new_source.parent],
+        [source_claim],
+        [],
+        {"schema_version": 1, **source_claim},
+    )
+    refreshed_destination: tuple[
+        list[Path], list[dict[str, Any]], list[dict[str, str]], dict[str, Any]
+    ] = (
+        [new_destination.parent],
+        [destination_claim],
+        [],
+        {"schema_version": 1, **destination_claim},
+    )
+    with (
+        patch(
+            "hacksaws._sessions._tracked_login_cache_plan",
+            side_effect=[refreshed_source, refreshed_destination],
+        ) as refresh,
+        patch(
+            "hacksaws._sessions._state.load_sessions",
+            return_value={
+                source_key: source_record,
+                destination_key: destination_record,
+            },
+        ),
+    ):
+        _sessions._revalidate_assume_plan(_configs.Context(args), prepared)
+
+    assert refresh.call_count == 2
+    assert data["source_cache"][1] == []
+    assert data["source_cache"][3] == refreshed_source[3]
+    assert data["destination_cache"] == refreshed_destination
+    assert data["cache_expected"] == {
+        str(new_destination.resolve()): _state.digest(new_destination.read_bytes())
+    }
+
+
 def test_prepared_local_policy_rejects_file_change_after_sts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -825,13 +1040,13 @@ def test_installed_recovery_rejects_browser_cache_drift(
     _install_crash_destination(journal)
     cache.write_text("externally-changed-token", encoding="utf-8")
 
-    with pytest.raises(_configs.OperationalError, match="manual review"):
+    with pytest.raises(_configs.OperationalError, match="browser-cache-residue"):
         _sessions._recover_assume_journal(journal)
     assert cache.read_text(encoding="utf-8") == "externally-changed-token"
     assert _sessions._read_ini(source / "credentials")["admin"][
         "aws_access_key_id"
-    ] == ("AUTHENTICATED")
-    assert _sessions._journal_path().exists()
+    ] == ("ORIGINAL")
+    assert not _sessions._journal_path().exists()
 
 
 def test_installed_recovery_retries_owned_cache_removal_without_restoring_auth(
@@ -869,16 +1084,16 @@ def test_installed_recovery_retries_owned_cache_removal_without_restoring_auth(
 
     with (
         patch.object(Path, "unlink", fail_cache_unlink),
-        pytest.raises(_configs.OperationalError, match="journal was retained"),
+        pytest.raises(_configs.OperationalError, match="browser-cache-residue"),
     ):
         _sessions._recover_assume_journal(journal)
     assert cache.exists()
     assert _sessions._read_ini(source / "credentials")["admin"][
         "aws_access_key_id"
     ] == ("ORIGINAL")
-    assert _sessions._journal_path().exists()
+    assert not _sessions._journal_path().exists()
 
-    _sessions._recover_assume_journal(journal)
+    _sessions._logout_key(source_key, _args(source, force=True))
     assert not cache.exists()
     assert not _sessions._journal_path().exists()
     assert _sessions._read_ini(source / "credentials")["admin"][
@@ -1227,7 +1442,7 @@ def test_assume_recovery_rejects_invalid_records_and_reports_cache_drift(
         }
     )
     assert {item["reason"] for item in residue} == {
-        "fingerprint changed",
+        "legacy cache fingerprint changed",
         "remove failed: locked by another process",
     }
     assert changed.exists()
