@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from rich.text import Text
 
 from hacksaws import _cli
 from hacksaws import _configs
@@ -32,6 +33,9 @@ def test_color_policy_handles_windows_style_non_tty_no_color_and_json() -> None:
     assert not _output.color_enabled(automatic, stream=_NotATerminal(), environ={})
     assert not _output.color_enabled(
         automatic, stream=object(), environ={"NO_COLOR": "1"}
+    )
+    assert not _output.color_enabled(
+        automatic, stream=_Terminal(), environ={"TERM": "dumb"}
     )
     assert _output.color_enabled(
         _output.OutputOptions(color="always"), stream=_NotATerminal(), environ={}
@@ -73,6 +77,455 @@ def test_global_json_wraps_argument_errors(
     assert rendered["schemaVersion"] == 1
     assert rendered["ok"] is False
     assert rendered["code"] == "ARGUMENT_ERROR"
+
+
+def test_status_help_teaches_compact_auth_and_scope_semantics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = _cli.console_main(["status", "--help"])
+    rendered = capsys.readouterr().out
+    assert result.exit_code == 0
+    assert "AUTH values:" in rendered
+    assert "web→role" in rendered
+    assert "SCOPE examples:" in rendered
+    assert "AgentSession (@Guardrail) → ReadLogs" in rendered
+    assert "Hacksaws boundary preset" in rendered
+
+
+def test_status_text_golden_is_compact_and_self_explaining() -> None:
+    rendered = _cli._status_text(
+        {
+            "sessions": [
+                {
+                    "location": "default",
+                    "profile": "debug",
+                    "state": "active",
+                    "auth_method": "browser-boundary",
+                    "target_account": "123456789012",
+                    "expires_at": "future",
+                    "remaining_seconds": 3583,
+                    "effective_scope": {
+                        "kind": "role-session",
+                        "role_label": "TerraformUnlimited",
+                        "boundary": None,
+                        "policy_label": "CloudWatchReadOnlyAccess",
+                    },
+                }
+            ]
+        }
+    )
+    assert rendered == (
+        "PROFILE  STATE  AUTH      ACCOUNT       SCOPE"
+        "                                          TTL\n"
+        "-------  -----  --------  ------------  "
+        "---------------------------------------------  ---\n"
+        "debug    🟢     web→role  123456789012  "
+        "TerraformUnlimited → CloudWatchReadOnlyAccess  60m\n"
+        "\n"
+        "State: 1 🟢active"
+    )
+    assert "LOCATION" not in rendered
+    assert "arn:" not in rendered
+    assert "\x1b" not in rendered
+    assert max(Text.from_ansi(line).cell_len for line in rendered.splitlines()) <= 100
+
+
+def test_status_text_empty_and_stable_mixed_state_counts() -> None:
+    assert _cli._status_text({"sessions": []}) == "(none)"
+    sessions = [
+        {"state": "future", "profile": "unknown"},
+        {"state": "expired", "profile": "old"},
+        {"state": "active", "profile": "one"},
+        {"state": "missing", "profile": "gone"},
+        {"state": "active", "profile": "two"},
+    ]
+    rendered = _cli._status_text({"sessions": sessions})
+    assert rendered.endswith(
+        "State: 2 🟢active | 1 🔴expired | 1 ❌missing | 1 ❔unknown/inconclusive"
+    )
+    assert rendered.count("\n\nState:") == 1
+    assert "Auth  " not in rendered
+    assert "Scope  " not in rendered
+
+
+def test_status_text_recomputes_optional_columns_and_state_counts() -> None:
+    report = {
+        "sessions": [
+            {
+                "location": "default",
+                "destination": "ignored",
+                "profile": "dev",
+                "state": "expiring",
+                "auth_method": "mfa",
+                "role": "arn:aws:iam::123456789012:role/team/Agent",
+                "source_account": "123456789012",
+                "expires_at": "future",
+                "remaining_seconds": 900,
+                "effective_scope": {
+                    "kind": "role-session",
+                    "role_label": "team/Agent",
+                    "boundary": None,
+                    "policy_label": None,
+                },
+                "verification": {"status": "verified"},
+            },
+            {
+                "location": "horizon",
+                "profile": "admin",
+                "state": "drifted",
+                "auth_method": "legacy-mfa",
+                "source_account": "210987654321",
+                "expires_at": "future",
+                "remaining_seconds": 7200,
+                "effective_scope": {
+                    "kind": "legacy-unknown",
+                    "role_label": None,
+                    "boundary": None,
+                    "policy_label": None,
+                },
+                "verification": {"status": "skipped"},
+            },
+        ]
+    }
+    rendered = _cli._status_text(report)
+    lines = rendered.splitlines()
+    assert "LOCATION" in lines[0]
+    assert "TTL" in lines[0]
+    assert "VERIFY" in lines[0]
+    assert "default" in lines[2]
+    assert "15m" in lines[2]
+    assert "verified" in lines[2]
+    assert "horizon" in lines[3]
+    assert "unknown (legacy)" in lines[3]
+    assert "skipped" not in rendered
+    assert rendered.endswith("State: 1 🟡expiring | 1 ⚠️drifted")
+    assert "Auth  " not in rendered
+    assert "Scope  " not in rendered
+    assert all(" - " not in line for line in lines[2:4])
+
+    filtered = _cli._status_text({"sessions": [report["sessions"][1]]})
+    assert "LOCATION" in filtered
+    assert "TTL" not in filtered
+    assert "VERIFY" not in filtered
+    assert "🟡" not in filtered
+    assert "mfa→role" not in filtered
+    assert filtered.endswith("State: 1 ⚠️drifted")
+
+
+@pytest.mark.parametrize(
+    ("state", "seconds", "expected"),
+    [
+        ("active", None, ""),
+        ("active", "not-a-duration", ""),
+        ("active", 0.25, "<1m"),
+        ("active", 59.99, "<1m"),
+        ("active", 60, "1m"),
+        ("expiring", 89, "1m"),
+        ("expiring", 90, "2m"),
+        ("expiring", 900, "15m"),
+        ("active", 3583, "60m"),
+        ("active", 7199, "120m"),
+        ("active", 7200, "2h"),
+        ("active", 8999, "2h"),
+        ("active", 9000, "3h"),
+        ("active", 0, ""),
+        ("expiring", -1, ""),
+        ("expired", 0, ""),
+        ("expired", 3583, ""),
+        ("invalid", 3583, ""),
+        ("missing", 3583, ""),
+        ("drifted", 3583, ""),
+        ("legacy-unverified", 3583, ""),
+        ("logout-residue", 3583, ""),
+        ("ecr-only", 3583, ""),
+    ],
+)
+def test_status_ttl_boundaries_are_deterministic(
+    state: str, seconds: float | None, expected: str
+) -> None:
+    assert _cli._status_ttl({"state": state, "remaining_seconds": seconds}) == expected
+
+
+def test_status_ttl_column_requires_a_positive_active_or_expiring_value() -> None:
+    sessions = [
+        {
+            "location": "default",
+            "profile": state,
+            "state": state,
+            "expires_at": "present",
+            "remaining_seconds": 3600,
+        }
+        for state in (
+            "expired",
+            "invalid",
+            "logout-residue",
+            "ecr-only",
+            "missing",
+            "drifted",
+            "legacy-unverified",
+            "future",
+        )
+    ]
+    sessions.append(
+        {
+            "location": "default",
+            "profile": "zero",
+            "state": "active",
+            "expires_at": "present",
+            "remaining_seconds": 0,
+        }
+    )
+    rendered = _cli._status_text({"sessions": sessions})
+    assert "TTL" not in rendered.splitlines()[0]
+    assert rendered.endswith(
+        "State: 1 🟢active | 1 🔴expired | 1 ⚠️drifted | "
+        "1 ⚠️legacy-unverified | 1 ❌missing | 1 ❌invalid | "
+        "1 🧹logout-residue | 1 🧹ECR-only | 1 ❔unknown/inconclusive"
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "role", "expected"),
+    [
+        ("browser-native", None, "web"),
+        ("browser-boundary", "role", "web→role"),
+        ("mfa", None, "mfa"),
+        ("mfa", "role", "mfa→role"),
+        ("assume-role", "role", "role"),
+        ("legacy-mfa", None, "legacy"),
+        ("new-method", None, "unknown"),
+    ],
+)
+def test_status_auth_mapping_is_stable(
+    method: str, role: str | None, expected: str
+) -> None:
+    assert _cli._status_auth({"auth_method": method, "role": role})[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("active", "🟢"),
+        ("expiring", "🟡"),
+        ("expired", "🔴"),
+        ("drifted", "⚠️"),
+        ("legacy-unverified", "⚠️"),
+        ("missing", "❌"),
+        ("invalid", "❌"),
+        ("logout-residue", "🧹"),
+        ("ecr-only", "🧹"),
+        ("future-state", "❔"),
+    ],
+)
+def test_status_state_mapping_is_stable(state: str, expected: str) -> None:
+    assert _cli._status_state({"state": state})[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("account-login", "account login"),
+        ("mfa-session", "MFA session"),
+        ("ecr-only", "ECR only"),
+        ("logout-residue", "logout residue"),
+        ("legacy-unknown", "unknown (legacy)"),
+        ("unknown", "unknown session"),
+        ("future-kind", "unknown session"),
+    ],
+)
+def test_status_scope_non_role_kinds_are_honest(kind: str, expected: str) -> None:
+    assert (
+        _cli._status_scope(
+            {
+                "effective_scope": {
+                    "kind": kind,
+                    "role_label": None,
+                    "policy_label": None,
+                }
+            }
+        )
+        == expected
+    )
+
+
+def test_status_scope_has_honest_malformed_role_fallback() -> None:
+    assert (
+        _cli._status_scope(
+            {
+                "effective_scope": {
+                    "kind": "role-session",
+                    "role_label": None,
+                    "policy_label": "session policy",
+                }
+            }
+        )
+        == "role session → session policy"
+    )
+
+
+def test_status_scope_distinguishes_iam_role_from_hacksaws_boundary() -> None:
+    item = {
+        "effective_scope": {
+            "kind": "role-session",
+            "role_label": "AgentSession",
+            "boundary_label": "Guardrail",
+            "policy_label": "ReadLogs",
+        }
+    }
+    assert _cli._status_scope(item) == "AgentSession (@Guardrail) → ReadLogs"
+    rendered = _cli._status_text(
+        {
+            "sessions": [
+                {
+                    **item,
+                    "location": "default",
+                    "profile": "agent",
+                    "state": "active",
+                    "auth_method": "assume-role",
+                    "target_account": "123456789012",
+                }
+            ]
+        }
+    )
+    assert "AgentSession (@Guardrail) → ReadLogs" in rendered
+    assert "@name = Hacksaws boundary preset" not in rendered
+    assert "→ = restrictive session policy" not in rendered
+    assert rendered.endswith("State: 1 🟢active")
+
+
+def test_status_scope_supports_legacy_records_without_leaking_arns() -> None:
+    assert (
+        _cli._status_scope(
+            {
+                "boundary": None,
+                "role": "arn:aws:iam::123456789012:role/team/Agent",
+                "policy": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+            }
+        )
+        == "team/Agent → ReadOnlyAccess"
+    )
+
+
+def test_status_text_sanitizes_hostile_untrusted_cells_before_layout() -> None:
+    escape = "\x1b"
+    rendered = _cli._status_text(
+        {
+            "sessions": [
+                {
+                    "location": f"{escape}]0;owned\x07horizon\rnext",
+                    "profile": f"{escape}[31mprod{escape}[0m\nforged\tcell\u202e",
+                    "state": "active",
+                    "auth_method": "assume-role",
+                    "target_account": "123456789012\x00",
+                    "effective_scope": {
+                        "kind": "role-session",
+                        "role_label": "界e\u0301Agent\x00",
+                        "boundary_label": f"Guard{escape}[2J",
+                        "policy_label": (
+                            f"Read{escape}]8;;https://invalid.example\x07Logs"
+                            f"{escape}]8;;\x07\nInjected"
+                        ),
+                    },
+                }
+            ]
+        }
+    )
+    assert "\x1b" not in rendered
+    assert "\x00" not in rendered
+    assert "\u202e" not in rendered
+    assert "https://invalid.example" not in rendered
+    assert "horizon next" in rendered
+    assert "prod forged cell" in rendered
+    assert "界e\u0301Agent (@Guard) → ReadLogs Injected" in rendered
+    assert len(rendered.splitlines()) == 5
+    assert _cli._safe_terminal_text("safe\x1b]0;unterminated") == "safe"
+    assert _cli._safe_terminal_text("safe\x9d0;owned\x9ctext") == "safetext"
+
+
+def test_status_verification_uses_only_meaningful_results() -> None:
+    assert _cli._status_verification({"verification": {"status": "error"}}) == "error"
+    assert (
+        _cli._status_verification({"verification": {"status": "mismatch"}})
+        == "mismatch (unknown)"
+    )
+    assert _cli._status_verification({"verification": {"status": "skipped"}}) == ""
+    assert _cli._status_verification({}) == ""
+
+
+def test_status_verification_distinguishes_match_mismatch_and_error() -> None:
+    base = {
+        "location": "default",
+        "state": "active",
+        "auth_method": "browser-native",
+        "target_account": "123456789012",
+        "effective_scope": {
+            "kind": "account-login",
+            "role_label": None,
+            "boundary_label": None,
+            "policy_label": None,
+        },
+    }
+    rendered = _cli._status_text(
+        {
+            "sessions": [
+                {
+                    **base,
+                    "profile": "matched",
+                    "verification": {"status": "verified"},
+                },
+                {
+                    **base,
+                    "profile": "mismatch\nforged",
+                    "verification": {
+                        "status": "mismatch",
+                        "expected_account": "123456789012",
+                        "actual_account": "210987654321\x1b[31m",
+                    },
+                },
+                {
+                    **base,
+                    "profile": "error",
+                    "verification": {"status": "error", "message": "denied"},
+                },
+                {
+                    **base,
+                    "profile": "not-applicable",
+                    "verification": {"status": "skipped"},
+                },
+            ]
+        }
+    )
+    assert "verified" in rendered
+    assert "mismatch" in rendered
+    assert "error" in rendered
+    assert "skipped" not in rendered
+    assert "mismatch (210987654321)" in rendered
+    assert "Verify  " not in rendered
+    assert "mismatch forged" in rendered
+    assert rendered.endswith("State: 4 🟢active")
+    assert "\x1b" not in rendered
+
+
+def test_text_table_aligns_terminal_cells_and_strips_controls() -> None:
+    rendered = _cli._text_table(
+        ["STATE", "VALUE"],
+        [
+            ["🟢", "emoji"],
+            ["界", "wide"],
+            ["e\u0301", "combining"],
+            ["\x1b[31mred\x1b[0m", "ansi"],
+        ],
+    )
+    expected_column = None
+    for line, value in zip(
+        rendered.splitlines()[2:], ["emoji", "wide", "combining", "ansi"], strict=True
+    ):
+        plain = Text.from_ansi(line).plain
+        offset = Text(plain[: plain.index(value)]).cell_len
+        expected_column = expected_column or offset
+        assert offset == expected_column
+    assert "\x1b" not in rendered
+    assert "red" in rendered
 
 
 def test_json_prescan_wraps_every_early_exit_once_and_preserves_human_help(

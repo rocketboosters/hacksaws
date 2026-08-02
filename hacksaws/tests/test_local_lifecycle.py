@@ -356,9 +356,9 @@ def test_status_classifies_conservative_local_states_and_filters(
             "expires_at": (now + timedelta(minutes=5)).isoformat(),
             "section_backup": stable,
         },
-        "active": {
+        "invalid": {
             "destination": str(destination),
-            "profile": "active",
+            "profile": "invalid",
             "expires_at": "not-a-date",
             "section_backup": stable,
         },
@@ -372,10 +372,10 @@ def test_status_classifies_conservative_local_states_and_filters(
         "drifted": "drifted",
         "expired": "expired",
         "expiring": "expiring",
-        "active": "active",
+        "invalid": "invalid",
     }
     assert all(item["location"] == "horizon" for item in states.values())
-    assert _sessions.status_report(profile="active")["counts"] == {"active": 1}
+    assert _sessions.status_report(profile="invalid")["counts"] == {"invalid": 1}
     assert _sessions.status_report(location="horizon")["sessions"]
     assert _sessions.status_report(directory=destination)["sessions"]
 
@@ -397,7 +397,13 @@ def test_status_verification_skips_unsafe_state_and_reports_success_or_error(
         ),
     ):
         verified = _sessions._verify_status(
-            {"state": "active", "destination": str(destination), "profile": "dev"}
+            {
+                "state": "active",
+                "destination": str(destination),
+                "profile": "dev",
+                "target_account": "123456789012",
+                "target_partition": "aws",
+            }
         )
     assert verified["status"] == "verified"
     with (
@@ -408,7 +414,13 @@ def test_status_verification_skips_unsafe_state_and_reports_success_or_error(
         ),
     ):
         failed = _sessions._verify_status(
-            {"state": "active", "destination": str(destination), "profile": "dev"}
+            {
+                "state": "active",
+                "destination": str(destination),
+                "profile": "dev",
+                "target_account": "123456789012",
+                "target_partition": "aws",
+            }
         )
     assert failed == {"status": "error", "message": "expired"}
 

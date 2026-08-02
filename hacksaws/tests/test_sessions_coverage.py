@@ -413,6 +413,9 @@ def test_assume_builds_policy_request_and_verifies_final_identity(
         document='{"Version":"2012-10-17","Statement":[]}' if document_policy else None,
         identity="Read",
         provenance="stored",
+        origin="stored",
+        cached=document_policy,
+        source_arn=(None if document_policy else f"arn:aws:iam::{ACCOUNT}:policy/Read"),
     )
     final = MagicMock()
     with (
@@ -436,6 +439,13 @@ def test_assume_builds_policy_request_and_verifies_final_identity(
     assert request["ExternalId"] == "external"
     assert credentials == response["Credentials"]
     assert metadata["policy_provenance"] == "stored"
+    assert metadata["policy_reference"] == "Read"
+    assert metadata["policy_origin"] == "stored"
+    assert metadata["policy_arn"] == resolved.source_arn
+    assert metadata["policy_cached"] is document_policy
+    assert metadata["policy_display"] == "Read"
+    assert metadata["session_schema_version"] == 2
+    assert metadata["target_partition"] == "aws"
     assert factory.call_args.kwargs["aws_access_key_id"] == "ASIAFINAL"
 
 
@@ -1014,6 +1024,469 @@ def test_status_is_secret_free_and_handles_expiry_values(
     assert "backup" not in result[0]
     assert result[0]["remaining_seconds"] > 0
     assert result[1]["remaining_seconds"] is None
+    assert result[1]["state"] == "legacy-unverified"
+    assert result[1]["warnings"] == [
+        {
+            "code": "INVALID_EXPIRY",
+            "source": "expires_at",
+            "message": "Session expiry metadata is invalid.",
+        }
+    ]
+
+
+def test_status_scope_uses_validated_cache_and_safe_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    document = {
+        "Version": "2012-10-17",
+        "Statement": [{"Resource": "POLICY-DOCUMENT-SENTINEL"}],
+    }
+    arn = "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess"
+    identity = _policies._cache_identity(arn, account=ACCOUNT, partition="aws")
+    _policies.cache_write(
+        identity,
+        document,
+        origin="aws-managed",
+        resolver="arn",
+        source_identity=arn,
+    )
+    local_source = str((tmp_path / "policies" / "debug.yaml").absolute())
+    local_identity = "local-" + _state.digest(local_source.casefold().encode())[:24]
+    _policies.cache_write(
+        local_identity,
+        document,
+        origin="local",
+        resolver="file",
+        source_identity=local_source,
+    )
+    customer_arn = f"arn:aws:iam::{ACCOUNT}:policy/team/CustomerDebug"
+    customer_identity = _policies._cache_identity(
+        "name:CustomerDebug", account=ACCOUNT, partition="aws"
+    )
+    _policies.cache_write(
+        customer_identity,
+        document,
+        origin="remote-customer",
+        resolver="name",
+        source_identity=customer_arn,
+    )
+    wrong_arn = f"arn:aws:iam::{OTHER_ACCOUNT}:policy/CustomerDebug"
+    wrong_identity = _policies._cache_identity(
+        "name:CustomerDebug", account=OTHER_ACCOUNT, partition="aws"
+    )
+    _policies.cache_write(
+        wrong_identity,
+        document,
+        origin="remote-customer",
+        resolver="name",
+        source_identity=wrong_arn,
+    )
+    corrupt_identity = "local-" + _state.digest(b"c:/policies/debug.yaml")[:24]
+    _policies.cache_write(
+        corrupt_identity,
+        document,
+        origin="local",
+        resolver="file",
+        source_identity="c:/policies/debug.yaml",
+    )
+    corrupt_path = _policies.cache_root() / f"{corrupt_identity}.json"
+    corrupt = json.loads(corrupt_path.read_text(encoding="utf-8"))
+    corrupt["digest"] = "corrupt"
+    corrupt_path.write_text(json.dumps(corrupt), encoding="utf-8")
+    base = {
+        "destination": str(tmp_path / "aws"),
+        "auth_method": "assume-role",
+        "target_account": ACCOUNT,
+        "role": f"arn:aws:iam::{ACCOUNT}:role/team/AgentSession",
+        "backup": ["BACKUP-SECRET-SENTINEL"],
+        "login_cache_files": ["BROWSER-BYTES-SENTINEL"],
+    }
+    _state.save_sessions(
+        {
+            "valid": {**base, "profile": "valid", "policy": identity},
+            "local": {**base, "profile": "local", "policy": local_identity},
+            "stored": {
+                **base,
+                "profile": "stored",
+                "policy": "Investigate",
+                "policy_provenance": "stored policy Investigate",
+            },
+            "customer": {
+                **base,
+                "profile": "customer",
+                "policy": customer_identity,
+            },
+            "missing": {**base, "profile": "missing", "policy": "missing-cache"},
+            "corrupt": {
+                **base,
+                "profile": "corrupt",
+                "policy": corrupt_identity,
+            },
+            "mismatch": {
+                **base,
+                "profile": "mismatch",
+                "policy": wrong_identity,
+            },
+        }
+    )
+    report = _sessions.status_report()
+    sessions = {item["profile"]: item for item in report["sessions"]}
+    valid = sessions["valid"]["effective_scope"]
+    assert valid == {
+        "kind": "role-session",
+        "role_label": "team/AgentSession",
+        "boundary_label": None,
+        "policy_label": "CloudWatchReadOnlyAccess",
+        "policy_source": {
+            "origin": "aws-managed",
+            "reference": arn,
+            "arn": arn,
+            "cached": True,
+        },
+        "policy_known": True,
+    }
+    expected_cache_labels = {
+        "local": ("debug.yaml", "local"),
+        "stored": ("Investigate", "stored"),
+        "customer": ("team/CustomerDebug", "remote-customer"),
+    }
+    for name, (label, origin) in expected_cache_labels.items():
+        scope = sessions[name]["effective_scope"]
+        assert scope["policy_label"] == label
+        assert scope["policy_source"]["origin"] == origin
+        assert scope["policy_known"] is True
+    for name in ("missing", "corrupt", "mismatch"):
+        scope = sessions[name]["effective_scope"]
+        assert scope["policy_label"] == "session policy"
+        assert scope["policy_source"] is None
+        assert scope["policy_known"] is False
+    serialized = json.dumps(report)
+    for sentinel in (
+        "POLICY-DOCUMENT-SENTINEL",
+        "BACKUP-SECRET-SENTINEL",
+        "BROWSER-BYTES-SENTINEL",
+    ):
+        assert sentinel not in serialized
+
+
+def test_status_scope_kinds_and_fractional_expiry_are_honest() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    cases: dict[str, tuple[dict[str, object], str]] = {
+        "browser": ({"auth_method": "browser-native", "policy": None}, "account-login"),
+        "mfa": ({"auth_method": "mfa", "policy": None}, "mfa-session"),
+        "ecr": ({"auth_method": "ecr-only"}, "ecr-only"),
+        "residue": ({"auth_method": "browser-cache-residue"}, "logout-residue"),
+        "legacy": ({}, "legacy-unknown"),
+    }
+    for session, expected in cases.values():
+        public = _sessions._public_session(session, now=now)
+        assert public["effective_scope"]["kind"] == expected
+    fractional = _sessions._public_session(
+        {
+            "auth_method": "mfa",
+            "policy": None,
+            "expires_at": (now + timedelta(microseconds=1)).isoformat(),
+        },
+        now=now,
+    )
+    assert fractional["remaining_seconds"] == 1
+
+
+def test_scope_projection_covers_persisted_metadata_and_rejects_bad_cache_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    persisted = _sessions._effective_scope(
+        {
+            "auth_method": "assume-role",
+            "role": ROLE,
+            "boundary": "Guardrail",
+            "policy": "opaque",
+            "policy_display": "ReadLogs",
+            "policy_origin": "stored",
+            "policy_reference": "ReadLogs",
+            "policy_cached": False,
+        }
+    )
+    assert persisted["role_label"] == "Guard"
+    assert persisted["boundary_label"] == "Guardrail"
+    assert persisted["policy_label"] == "ReadLogs"
+    assert persisted["policy_source"] == {
+        "origin": "stored",
+        "reference": "ReadLogs",
+        "arn": None,
+        "cached": False,
+    }
+    explicit = _sessions._policy_scope(
+        {"policy": f"arn:aws:iam::{ACCOUNT}:policy/team/Direct"}
+    )
+    assert explicit["label"] == "team/Direct"
+    assert explicit["source"]["origin"] == "remote-customer"
+    assert _sessions._role_display_name("Guard") == "Guard"
+    assert (
+        _sessions._role_display_name("arn:aws:iam::123456789012:user/not-role") is None
+    )
+
+    document = {"Version": "2012-10-17", "Statement": []}
+    _policies.cache_write(
+        "stored-debug",
+        document,
+        origin="stored",
+        resolver="stored",
+        source_identity="Debug",
+    )
+    assert _sessions._cached_policy_source("stored-debug", target_account=ACCOUNT) == {
+        "origin": "stored",
+        "reference": "Debug",
+        "arn": None,
+        "cached": True,
+        "display": "Debug",
+    }
+    _policies.cache_write(
+        "stored-wrong",
+        document,
+        origin="stored",
+        resolver="stored",
+        source_identity="Debug",
+    )
+    assert (
+        _sessions._cached_policy_source("stored-wrong", target_account=ACCOUNT) is None
+    )
+    _policies.cache_write(
+        "invalid-source",
+        document,
+        origin="aws-managed",
+        resolver="arn",
+        source_identity="not-an-arn",
+    )
+    assert (
+        _sessions._cached_policy_source("invalid-source", target_account=ACCOUNT)
+        is None
+    )
+
+    naive_expiry = _sessions._public_session(
+        {
+            "auth_method": "mfa",
+            "policy": None,
+            "expires_at": "2026-01-01T01:00:00",
+        },
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert naive_expiry["remaining_seconds"] is None
+    assert naive_expiry["warnings"][0]["source"] == "expires_at"
+
+
+def test_public_status_allowlist_rejects_hostile_top_level_and_nested_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    sentinels = {
+        "ACCESS-KEY-SENTINEL",
+        "SECRET-KEY-SENTINEL",
+        "TOKEN-SENTINEL",
+        "PASSWORD-SENTINEL",
+        "PRIVATE-KEY-SENTINEL",
+        "POLICY-DOCUMENT-SENTINEL",
+    }
+    _state.save_sessions(
+        {
+            "hostile": {
+                "destination": str(tmp_path / "aws"),
+                "profile": "safe",
+                "auth_method": "assume-role",
+                "target_account": ACCOUNT,
+                "target_partition": "aws",
+                "aws_access_key_id": "ACCESS-KEY-SENTINEL",
+                "aws_secret_access_key": "SECRET-KEY-SENTINEL",
+                "aws_session_token": "TOKEN-SENTINEL",
+                "password": "PASSWORD-SENTINEL",
+                "metadata": {"private_key": "PRIVATE-KEY-SENTINEL"},
+                "policy_document": {"Statement": "POLICY-DOCUMENT-SENTINEL"},
+                "role": {"password": "PASSWORD-SENTINEL"},
+                "boundary": {"token": "TOKEN-SENTINEL"},
+                "policy": {"document": "POLICY-DOCUMENT-SENTINEL"},
+                "policy_reference": {"secret": "SECRET-KEY-SENTINEL"},
+                "ecr": ["safe", {"password": "PASSWORD-SENTINEL"}],
+                "backup": [{"token": "TOKEN-SENTINEL"}],
+                "section_backup": {
+                    "credentials": {"private_key": "PRIVATE-KEY-SENTINEL"}
+                },
+            }
+        }
+    )
+    report = _sessions.status_report()
+    public = report["sessions"][0]
+    assert public["profile"] == "safe"
+    assert public["target_account"] == ACCOUNT
+    assert public["target_partition"] == "aws"
+    assert public["effective_scope"]["policy_label"] == "session policy"
+    serialized = json.dumps(report)
+    assert all(sentinel not in serialized for sentinel in sentinels)
+
+
+def test_public_status_preserves_documented_raw_scalar_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    destination = str((tmp_path / "aws").absolute())
+    raw = {
+        "session_schema_version": 2,
+        "source_account": OTHER_ACCOUNT,
+        "source_partition": "aws",
+        "target_account": ACCOUNT,
+        "target_partition": "aws",
+        "role": ROLE,
+        "boundary": "Guardrail",
+        "policy": "Investigate",
+        "policy_provenance": "stored policy Investigate",
+        "policy_reference": "Investigate",
+        "policy_origin": "stored",
+        "policy_arn": None,
+        "policy_cached": False,
+        "policy_display": "Investigate",
+        "expires_at": None,
+        "target": "prod",
+        "destination": destination,
+        "profile": "debug",
+        "auth_method": "assume-role",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "ecr": ["123456789012.dkr.ecr.us-east-1.amazonaws.com"],
+        "ecr_engine": "docker",
+        "source_profile": "admin",
+        "source_destination": str(tmp_path / "source"),
+        "source_auth_method": "mfa",
+        "source_logged_out": True,
+        "cache_cleanup_incomplete": True,
+        "login_cache_residue": [
+            {"path": str(tmp_path / "cache.json"), "reason": "outside cache root"}
+        ],
+    }
+    public = _sessions._public_session(raw, now=datetime(2026, 1, 1, tzinfo=UTC))
+    for key, value in raw.items():
+        assert public[key] == value
+    assert public["effective_scope"]["role_label"] == "Guard"
+    assert public["effective_scope"]["boundary_label"] == "Guardrail"
+
+
+def test_public_status_sanitizes_login_cache_residue_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    session = {
+        "profile": "debug",
+        "cache_cleanup_incomplete": True,
+        "login_cache_residue": [
+            {
+                "path": "safe-cache.json",
+                "reason": "file changed",
+                "password": "PASSWORD-SENTINEL",
+                "nested": {"token": "TOKEN-SENTINEL"},
+            },
+            {
+                "path": {"private_key": "PRIVATE-KEY-SENTINEL"},
+                "reason": "invalid path",
+            },
+            {
+                "path": "invalid-reason.json",
+                "reason": {"policy_document": "POLICY-DOCUMENT-SENTINEL"},
+            },
+            "ACCESS-KEY-SENTINEL",
+        ],
+    }
+    public = _sessions._public_session(session, now=datetime(2026, 1, 1, tzinfo=UTC))
+    assert public["cache_cleanup_incomplete"] is True
+    assert public["login_cache_residue"] == [
+        {"path": "safe-cache.json", "reason": "file changed"}
+    ]
+    serialized = json.dumps(public)
+    for sentinel in (
+        "PASSWORD-SENTINEL",
+        "TOKEN-SENTINEL",
+        "PRIVATE-KEY-SENTINEL",
+        "POLICY-DOCUMENT-SENTINEL",
+        "ACCESS-KEY-SENTINEL",
+    ):
+        assert sentinel not in serialized
+
+
+def test_status_verification_fails_closed_on_identity_mismatch_and_bad_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    base = {
+        "state": "active",
+        "destination": str(tmp_path / "aws"),
+        "profile": "debug",
+        "target_account": ACCOUNT,
+        "target_partition": "aws",
+    }
+    with (
+        patch("hacksaws._sessions.boto3.Session"),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(
+                OTHER_ACCOUNT,
+                "aws-us-gov",
+                f"arn:aws-us-gov:iam::{OTHER_ACCOUNT}:user/debug",
+            ),
+        ),
+    ):
+        mismatch = _sessions._verify_status(base)
+    assert mismatch == {
+        "status": "mismatch",
+        "reason": "account, partition mismatch",
+        "expected_account": ACCOUNT,
+        "actual_account": OTHER_ACCOUNT,
+        "expected_partition": "aws",
+        "actual_partition": "aws-us-gov",
+        "actual_arn": f"arn:aws-us-gov:iam::{OTHER_ACCOUNT}:user/debug",
+    }
+
+    role_item = {
+        **base,
+        "role": f"arn:aws:iam::{ACCOUNT}:role/team/AgentSession",
+    }
+    with (
+        patch("hacksaws._sessions.boto3.Session"),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(
+                ACCOUNT,
+                "aws",
+                f"arn:aws:sts::{ACCOUNT}:assumed-role/OtherRole/status",
+            ),
+        ),
+    ):
+        role_mismatch = _sessions._verify_status(role_item)
+    assert role_mismatch["status"] == "mismatch"
+    assert role_mismatch["reason"] == "role mismatch"
+    assert role_mismatch["expected_role"] == "AgentSession"
+    assert role_mismatch["actual_role"] == "OtherRole"
+
+    assert _sessions._verify_status(
+        {"state": "active", "destination": str(tmp_path), "profile": "legacy"}
+    ) == {
+        "status": "error",
+        "message": (
+            "Session metadata does not contain a consistent expected AWS account "
+            "and partition."
+        ),
+    }
+    with (
+        patch("hacksaws._sessions.boto3.Session"),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT, "aws", f"arn:aws:iam::{ACCOUNT}:user/bad?TOKEN"),
+        ),
+    ):
+        unsafe_arn = _sessions._verify_status(base)
+    assert unsafe_arn == {
+        "status": "error",
+        "message": "AWS returned an invalid caller ARN during status verification.",
+        "actual_account": ACCOUNT,
+        "actual_partition": "aws",
+    }
 
 
 def test_explain_target_resolves_locations_defaults_and_boundary(

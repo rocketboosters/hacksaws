@@ -185,6 +185,22 @@ hacksaws config export [ARCHIVE.zip]
 hacksaws config import ARCHIVE.zip [--replace] [--yes]
 ```
 
+Human `status` output is a compact, dynamic table. `LOCATION` is hidden when all
+rows use the default location; `TTL` is hidden when no displayed session has a
+meaningful expiry; and `VERIFY` is hidden unless `--verify` returns a useful STS
+result. After one blank line, a single filtered-row summary reports state counts
+in stable order, for example `State: 1 🟢active | 1 🔴expired`. Auth and scope
+meanings/examples live in `hacksaws status --help`. Scopes use friendly labels:
+`Role (@Preset) → Policy` shows the actual IAM role, an optional Hacksaws
+boundary preset, and its restrictive session policy. TTL is populated only for
+active/expiring rows with a positive meaningful expiry; all other rows are
+blank, and the column disappears when every row is blank. `verified` means STS
+returned the recorded account/partition/role; `mismatch` and `error` are
+distinct. Untrusted names and AWS diagnostics cannot inject ANSI or terminal
+controls. Use `--json` for stable raw lifecycle fields such as
+`remaining_seconds` and IAM references; human symbols and key text never enter
+JSON.
+
 Durations: `45m`, `1.5hours`, `90sec`; `--htl 1.5`, `--mtl 90`, and `--stl 5400`
 are equivalent duration forms. Boundary sessions require at least 900 seconds;
 role chaining caps them at 3,600 seconds. `cache set max-age 0s` disables cache

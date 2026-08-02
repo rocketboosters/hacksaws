@@ -10,6 +10,7 @@ import fnmatch
 import getpass
 import importlib
 import json
+import math
 import os
 import re
 import shutil
@@ -604,6 +605,21 @@ def _duration_for(args: Any, target: dict[str, Any], *, chained: bool) -> int:
     return duration
 
 
+def _policy_display_name(
+    reference: str, origin: str, source_arn: str | None = None
+) -> str:
+    """Return a compact, non-secret policy label without embedding an ARN."""
+    arn_match = _policies.POLICY_ARN.fullmatch(source_arn or reference)
+    if arn_match:
+        return arn_match.group(3)
+    if origin == "local":
+        return Path(reference).name or "session policy"
+    value = reference.strip()
+    if not value or value.casefold().startswith("arn:"):
+        return "session policy"
+    return value
+
+
 def _assume(
     session: Any,
     role: str,
@@ -661,11 +677,22 @@ def _assume(
             f"Boundary identity mismatch: expected {match.group(1)}:{match.group(2)}, got {final_partition}:{account}."
         )
     metadata = {
+        "session_schema_version": 2,
         "target_account": account,
+        "target_partition": final_partition,
         "role": role,
         "boundary": boundary_name,
         "policy": resolved.identity if resolved else None,
         "policy_provenance": resolved.provenance if resolved else None,
+        "policy_reference": policy if resolved else None,
+        "policy_origin": resolved.origin if resolved else None,
+        "policy_arn": resolved.source_arn if resolved else None,
+        "policy_cached": resolved.cached if resolved else False,
+        "policy_display": (
+            _policy_display_name(policy, resolved.origin, resolved.source_arn)
+            if resolved and policy
+            else None
+        ),
         "expires_at": response["Credentials"]["Expiration"].astimezone(UTC).isoformat(),
     }
     return response["Credentials"], metadata
@@ -998,6 +1025,7 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
             args.region,
         )
         metadata["source_account"] = source_account
+        metadata["source_partition"] = partition
         metadata["target"] = target.get("target_name")
         _record(
             destination_dir,
@@ -1185,7 +1213,9 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 destination_profile,
                 {
                     "source_account": account,
+                    "source_partition": partition,
                     "target_account": account,
+                    "target_partition": partition,
                     "target": target.get("target_name"),
                     "role": None,
                     "boundary": None,
@@ -1290,7 +1320,11 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         if section in config:
             config[section].pop("login_session", None)
             _write_ini(destination_dir / "config", config)
-        metadata.update(source_account=source_account, target=target.get("target_name"))
+        metadata.update(
+            source_account=source_account,
+            source_partition=partition,
+            target=target.get("target_name"),
+        )
         _record(
             destination_dir,
             destination_profile,
@@ -2449,30 +2483,297 @@ def _managed_section_state(session: dict[str, Any]) -> str | None:
     return "missing" if missing else None
 
 
-def _public_session(session: dict[str, Any], *, now: datetime) -> dict[str, Any]:
-    hidden = {
-        "backup",
-        "section_backup",
-        "login_cache_files",
-        "login_cache_directories",
-        "login_cache_fingerprints",
+def _role_display_name(value: object) -> str | None:
+    """Shorten a role ARN while preserving its full IAM path."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    role = value.strip()
+    match = re.fullmatch(r"arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/(.+)", role)
+    if match:
+        return match.group(1)
+    if role.casefold().startswith("arn:"):
+        return None
+    return role
+
+
+def _cached_policy_source(  # noqa: PLR0911
+    identity: str, *, target_account: object
+) -> dict[str, Any] | None:
+    """Recover display-only policy metadata from a validated local cache entry."""
+    try:
+        entry = _policies.cache_show(identity)
+    except _configs.OperationalError:
+        return None
+    values = (
+        entry.get("origin"),
+        entry.get("resolver"),
+        entry.get("source_identity"),
+    )
+    if not all(isinstance(value, str) and value for value in values):
+        return None
+    origin, resolver, source = (
+        str(values[0]),
+        str(values[1]),
+        str(values[2]),
+    )
+    display: str | None = None
+    arn: str | None = None
+    if origin == "local" and resolver == "file":
+        expected = "local-" + _state.digest(source.casefold().encode())[:24]
+        if identity != expected:
+            return None
+        display = Path(source).name
+    elif origin == "stored" and resolver == "stored":
+        if identity != f"stored-{source.casefold()}":
+            return None
+        display = source
+    elif origin in {"aws-managed", "remote-customer"}:
+        match = _policies.POLICY_ARN.fullmatch(source)
+        if not match:
+            return None
+        partition, account, resource = match.groups()
+        target = str(target_account or "")
+        if origin == "aws-managed":
+            if resolver != "arn" or account != "aws" or not target:
+                return None
+            expected = _policies._cache_identity(
+                source, account=target, partition=partition
+            )
+        else:
+            if resolver != "name" or account == "aws" or account != target:
+                return None
+            expected = _policies._cache_identity(
+                f"name:{resource.rsplit('/', 1)[-1]}",
+                account=account,
+                partition=partition,
+            )
+        if identity != expected:
+            return None
+        display = resource
+        arn = source
+    if not display:
+        return None
+    return {
+        "origin": origin,
+        "reference": source,
+        "arn": arn,
+        "cached": True,
+        "display": display,
     }
-    public = {key: value for key, value in session.items() if key not in hidden}
-    destination = Path(str(public.get("destination", Path.home() / ".aws"))).absolute()
+
+
+def _policy_scope(session: dict[str, Any]) -> dict[str, Any]:
+    """Project persisted policy metadata without resolving anything over the network."""
+    policy = session.get("policy")
+    if not isinstance(policy, str) or not policy:
+        unknown_policy = bool(policy)
+        return {
+            "label": "session policy" if unknown_policy else None,
+            "known": False if unknown_policy else "policy" in session,
+            "source": None,
+        }
+    persisted_display = session.get("policy_display")
+    origin = (
+        session["policy_origin"]
+        if isinstance(session.get("policy_origin"), str)
+        else "unknown"
+    )
+    reference = (
+        session["policy_reference"]
+        if isinstance(session.get("policy_reference"), str)
+        else None
+    )
+    source_arn = (
+        session["policy_arn"] if isinstance(session.get("policy_arn"), str) else None
+    )
+    if isinstance(persisted_display, str) and persisted_display.strip():
+        label = _policy_display_name(
+            persisted_display,
+            origin,
+            source_arn,
+        )
+        return {
+            "label": label,
+            "known": label != "session policy",
+            "source": {
+                "origin": origin,
+                "reference": reference,
+                "arn": source_arn,
+                "cached": bool(session.get("policy_cached", False)),
+            },
+        }
+    policy_text = policy
+    provenance = session.get("policy_provenance")
+    match = _policies.POLICY_ARN.fullmatch(policy_text)
+    if match:
+        return {
+            "label": match.group(3),
+            "known": True,
+            "source": {
+                "origin": "aws-managed"
+                if match.group(2) == "aws"
+                else "remote-customer",
+                "reference": policy_text,
+                "arn": policy_text,
+                "cached": False,
+            },
+        }
+    if (
+        isinstance(provenance, str)
+        and provenance.startswith("stored policy ")
+        and provenance.removeprefix("stored policy ") == policy_text
+    ):
+        return {
+            "label": policy_text,
+            "known": True,
+            "source": {
+                "origin": "stored",
+                "reference": policy_text,
+                "arn": None,
+                "cached": False,
+            },
+        }
+    cached = _cached_policy_source(
+        policy_text, target_account=session.get("target_account")
+    )
+    if cached:
+        return {
+            "label": cached.pop("display"),
+            "known": True,
+            "source": cached,
+        }
+    return {
+        "label": "session policy",
+        "known": False,
+        "source": None,
+    }
+
+
+def _effective_scope(session: dict[str, Any]) -> dict[str, Any]:
+    """Describe the credential restriction inputs without claiming IAM evaluation."""
+    method = session.get("auth_method")
+    policy = _policy_scope(session)
+    boundary = _role_display_name(session.get("boundary"))
+    role = _role_display_name(session.get("role"))
+    if method == "ecr-only":
+        kind = "ecr-only"
+    elif method in {"browser-cache-residue", "logout-residue"}:
+        kind = "logout-residue"
+    elif role or method in {"browser-boundary", "assume-role"}:
+        kind = "role-session"
+    elif method == "browser-native":
+        kind = "account-login"
+    elif method == "mfa":
+        kind = "mfa-session"
+    elif not session.get("section_backup"):
+        kind = "legacy-unknown"
+    else:
+        kind = "unknown"
+    return {
+        "kind": kind,
+        "role_label": role,
+        "boundary_label": boundary,
+        "policy_label": policy["label"],
+        "policy_source": policy["source"],
+        "policy_known": policy["known"],
+    }
+
+
+_PUBLIC_SESSION_STRING_FIELDS = {
+    "source_account",
+    "source_partition",
+    "target_account",
+    "target_partition",
+    "role",
+    "boundary",
+    "policy",
+    "policy_provenance",
+    "policy_reference",
+    "policy_origin",
+    "policy_arn",
+    "policy_display",
+    "expires_at",
+    "target",
+    "profile",
+    "auth_method",
+    "started_at",
+    "ecr_engine",
+    "source_profile",
+    "source_destination",
+    "source_auth_method",
+}
+_PUBLIC_SESSION_BOOL_FIELDS = {
+    "cache_cleanup_incomplete",
+    "policy_cached",
+    "source_logged_out",
+}
+_PUBLIC_SESSION_INT_FIELDS = {"session_schema_version"}
+
+
+def _public_session_fields(session: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the documented scalar/list session status contract."""
+    public: dict[str, Any] = {}
+    for key in _PUBLIC_SESSION_STRING_FIELDS:
+        if key in session and (session[key] is None or isinstance(session[key], str)):
+            public[key] = session[key]
+    for key in _PUBLIC_SESSION_BOOL_FIELDS:
+        if key in session and isinstance(session[key], bool):
+            public[key] = session[key]
+    for key in _PUBLIC_SESSION_INT_FIELDS:
+        value = session.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            public[key] = value
+    ecr = session.get("ecr")
+    if isinstance(ecr, list) and all(isinstance(item, str) for item in ecr):
+        public["ecr"] = list(ecr)
+    residue = session.get("login_cache_residue")
+    if isinstance(residue, list):
+        public["login_cache_residue"] = [
+            {"path": item["path"], "reason": item["reason"]}
+            for item in residue
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("reason"), str)
+        ]
+    return public
+
+
+def _public_session(session: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    public = _public_session_fields(session)
+    raw_destination = session.get("destination")
+    destination = (
+        Path(raw_destination).absolute()
+        if isinstance(raw_destination, str)
+        else (Path.home() / ".aws").absolute()
+    )
     public["destination"] = str(destination)
     public["location"] = _location_for_directory(destination)
     public["managed"] = True
+    effective_scope = _effective_scope(session)
+    public["effective_scope"] = effective_scope
     drift = _managed_section_state(session)
     expiry = public.get("expires_at")
     remaining: int | None = None
+    expiry_invalid = False
     if expiry:
         try:
-            remaining = max(
-                0, int((datetime.fromisoformat(str(expiry)) - now).total_seconds())
-            )
-        except ValueError:
+            parsed_expiry = datetime.fromisoformat(str(expiry))
+            if parsed_expiry.tzinfo is not None:
+                remaining = max(0, math.ceil((parsed_expiry - now).total_seconds()))
+            else:
+                expiry_invalid = True
+        except (TypeError, ValueError):
             remaining = None
+            expiry_invalid = True
     public["remaining_seconds"] = remaining
+    if expiry_invalid:
+        public["warnings"] = [
+            {
+                "code": "INVALID_EXPIRY",
+                "source": "expires_at",
+                "message": "Session expiry metadata is invalid.",
+            }
+        ]
     if public.get("auth_method") in {"browser-cache-residue", "logout-residue"}:
         state = "logout-residue"
     elif public.get("auth_method") == "ecr-only":
@@ -2481,6 +2782,8 @@ def _public_session(session: dict[str, Any], *, now: datetime) -> dict[str, Any]
         state = drift
     elif not session.get("section_backup"):
         state = "legacy-unverified"
+    elif expiry_invalid:
+        state = "invalid"
     elif remaining == 0 and expiry:
         state = "expired"
     elif remaining is not None and remaining <= 900:
@@ -2500,9 +2803,67 @@ def status() -> list[dict[str, Any]]:
     )
 
 
+def _verification_expectations(
+    item: dict[str, Any],
+) -> tuple[str, str, str | None] | None:
+    """Return internally consistent expected account, partition, and role name."""
+    account = item.get("target_account") or item.get("source_account")
+    if not isinstance(account, str) or not re.fullmatch(r"\d{12}", account):
+        return None
+    partition_value = item.get("target_partition") or item.get("source_partition")
+    partition = (
+        partition_value
+        if isinstance(partition_value, str) and partition_value in _state.PARTITIONS
+        else None
+    )
+    role_name: str | None = None
+    role = item.get("role")
+    if isinstance(role, str):
+        match = re.fullmatch(
+            r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/(.+)", role
+        )
+        if match:
+            if match.group(2) != account or (
+                partition is not None and match.group(1) != partition
+            ):
+                return None
+            partition = match.group(1)
+            role_name = match.group(3).rsplit("/", 1)[-1]
+    if partition is None:
+        return None
+    return account, partition, role_name
+
+
+def _safe_caller_arn(arn: str, *, account: str, partition: str) -> str | None:
+    """Return an identity ARN only when it matches the verified account envelope."""
+    if re.fullmatch(
+        rf"arn:{re.escape(partition)}:(?:iam|sts)::"
+        rf"{re.escape(account)}:[A-Za-z0-9+=,.@_:/-]+",
+        arn,
+    ):
+        return arn
+    return None
+
+
 def _verify_status(item: dict[str, Any]) -> dict[str, Any]:
-    if item.get("state") in {"ecr-only", "missing", "drifted"}:
+    if item.get("state") in {
+        "ecr-only",
+        "logout-residue",
+        "missing",
+        "drifted",
+        "invalid",
+    }:
         return {"status": "skipped", "reason": f"local state is {item['state']}"}
+    expected = _verification_expectations(item)
+    if expected is None:
+        return {
+            "status": "error",
+            "message": (
+                "Session metadata does not contain a consistent expected AWS account "
+                "and partition."
+            ),
+        }
+    expected_account, expected_partition, expected_role = expected
     directory = Path(str(item["destination"]))
     profile = str(item.get("profile", "default"))
     try:
@@ -2514,6 +2875,43 @@ def _verify_status(item: dict[str, Any]) -> dict[str, Any]:
             )
     except _configs.OperationalError as error:
         return {"status": "error", "message": str(error)}
+    actual_arn = _safe_caller_arn(arn, account=account, partition=partition)
+    if actual_arn is None:
+        return {
+            "status": "error",
+            "message": "AWS returned an invalid caller ARN during status verification.",
+            "actual_account": account,
+            "actual_partition": partition,
+        }
+    mismatches = []
+    if account != expected_account:
+        mismatches.append("account")
+    if partition != expected_partition:
+        mismatches.append("partition")
+    actual_role: str | None = None
+    if expected_role is not None:
+        assumed = re.fullmatch(
+            rf"arn:{re.escape(partition)}:sts::{re.escape(account)}:"
+            r"assumed-role/([^/]+)/[^/]+",
+            actual_arn,
+        )
+        actual_role = assumed.group(1) if assumed else None
+        if actual_role != expected_role:
+            mismatches.append("role")
+    if mismatches:
+        mismatch: dict[str, Any] = {
+            "status": "mismatch",
+            "reason": f"{', '.join(mismatches)} mismatch",
+            "expected_account": expected_account,
+            "actual_account": account,
+            "expected_partition": expected_partition,
+            "actual_partition": partition,
+            "actual_arn": actual_arn,
+        }
+        if expected_role is not None:
+            mismatch["expected_role"] = expected_role
+            mismatch["actual_role"] = actual_role
+        return mismatch
     return {
         "status": "verified",
         "account": account,

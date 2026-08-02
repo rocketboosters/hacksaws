@@ -10,6 +10,9 @@ import json
 import os
 import re
 import sys
+import unicodedata
+from decimal import ROUND_HALF_UP
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -18,6 +21,7 @@ from typing import cast
 import boto3
 from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
+from rich.text import Text
 
 from hacksaws import _aws
 from hacksaws import _configs
@@ -477,7 +481,30 @@ def _create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _assume_arguments(assume)
-    status = types.add_parser("status", help="Show Hacksaws-managed login sessions.")
+    status = types.add_parser(
+        "status",
+        help="Show Hacksaws-managed login sessions.",
+        description="Show a compact, secret-free view of managed login sessions.",
+        epilog=(
+            "AUTH values:\n"
+            "  web        AWS browser/passkey login\n"
+            "  web→role   browser/passkey login followed by an assumed role\n"
+            "  mfa        MFA-authenticated session\n"
+            "  mfa→role   MFA authentication followed by an assumed role\n"
+            "  role       direct assumed-role handoff\n"
+            "  legacy     legacy MFA tracking\n"
+            "  unknown    unclassified login metadata\n\n"
+            "SCOPE examples:\n"
+            "  AgentSession                         IAM role\n"
+            "  AgentSession (@Guardrail)            role plus Hacksaws boundary preset\n"
+            "  AgentSession (@Guardrail) → ReadLogs role restricted by a session policy\n\n"
+            "Examples:\n"
+            "  hacksaws status\n"
+            "  hacksaws status --verify\n"
+            "  hacksaws status --profile agent --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     status.add_argument("--profile", help="Filter by destination profile.")
     status_location = status.add_mutually_exclusive_group()
     status_location.add_argument("--location", help="Filter by logical AWS location.")
@@ -487,7 +514,9 @@ def _create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to STS verification for each eligible session.",
     )
-    status.add_argument("--json", action="store_true")
+    status.add_argument(
+        "--json", action="store_true", help="Emit stable raw lifecycle JSON."
+    )
 
     profile = types.add_parser("profile", help="Inspect local AWS profiles safely.")
     profile_actions = profile.add_subparsers(dest="profile_action")
@@ -1175,54 +1204,248 @@ def _json_or_text(value: object, use_json: bool) -> str:
     return str(value)
 
 
-def _text_table(columns: list[str], rows: list[list[object]]) -> str:
+_TERMINAL_STRING_CONTROL = re.compile(
+    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)|"
+    r"(?:\x1b[P_^X]|[\x90\x98\x9e\x9f]).*?(?:\x1b\\|\x9c|$)",
+    re.DOTALL,
+)
+
+
+def _safe_terminal_text(value: object) -> str:
+    """Return single-line printable text with terminal controls removed."""
+    decoded = Text.from_ansi(_TERMINAL_STRING_CONTROL.sub("", str(value))).plain
+    safe = []
+    for character in decoded:
+        if character in "\r\n\t":
+            safe.append(" ")
+        elif unicodedata.category(character) not in {"Cc", "Cf", "Cs"}:
+            safe.append(character)
+    return "".join(safe)
+
+
+def _text_table(columns: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
     if not rows:
         return "(none)"
+    rendered_columns = [_safe_terminal_text(column) for column in columns]
     rendered = [
-        [str(value) if value is not None else "-" for value in row] for row in rows
+        [_safe_terminal_text(value) if value is not None else "-" for value in row]
+        for row in rows
     ]
+
+    def display_width(value: str) -> int:
+        return Text(value).cell_len
+
     widths = [
-        max(len(column), *(len(row[index]) for row in rendered))
-        for index, column in enumerate(columns)
+        max(display_width(column), *(display_width(row[index]) for row in rendered))
+        for index, column in enumerate(rendered_columns)
     ]
+
+    def pad(value: str, width: int) -> str:
+        return value + " " * (width - display_width(value))
+
     header = "  ".join(
-        column.ljust(widths[index]) for index, column in enumerate(columns)
-    )
+        pad(column, widths[index]) for index, column in enumerate(rendered_columns)
+    ).rstrip()
     divider = "  ".join("-" * width for width in widths)
     body = [
-        "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+        "  ".join(pad(value, widths[index]) for index, value in enumerate(row)).rstrip()
         for row in rendered
     ]
     return "\n".join([header, divider, *body])
 
 
-def _status_text(report: dict[str, Any]) -> str:
-    rows = [
-        [
-            item.get("location") or item.get("destination"),
-            item.get("profile", "default"),
-            item.get("state"),
-            item.get("auth_method"),
-            item.get("target_account") or item.get("source_account"),
-            item.get("boundary") or item.get("role"),
-            item.get("remaining_seconds"),
-            (item.get("verification") or {}).get("status"),
-        ]
-        for item in report["sessions"]
+_STATUS_STATES = {
+    "active": ("🟢", "active"),
+    "expiring": ("🟡", "expiring"),
+    "expired": ("🔴", "expired"),
+    "drifted": ("⚠️", "drifted/legacy-unverified"),
+    "legacy-unverified": ("⚠️", "drifted/legacy-unverified"),
+    "missing": ("❌", "missing/invalid"),
+    "invalid": ("❌", "missing/invalid"),
+    "logout-residue": ("🧹", "logout/ECR residue"),
+    "ecr-only": ("🧹", "logout/ECR residue"),
+}
+_UNKNOWN_STATUS_STATE = ("❔", "unknown/inconclusive")
+_STATUS_AUTH = {
+    "browser-native": ("web", "AWS browser/passkey login"),
+    "browser-boundary": ("web→role", "browser/passkey login, then role"),
+    "assume-role": ("role", "assumed-role handoff"),
+    "legacy-mfa": ("legacy", "legacy MFA tracking"),
+    "browser-cache-residue": ("web", "AWS browser/passkey login"),
+}
+_UNKNOWN_STATUS_AUTH = ("unknown", "unclassified login")
+_STATUS_VERIFICATIONS = {
+    "verified": "verified",
+    "mismatch": "mismatch",
+    "error": "error",
+}
+_IAM_SCOPE_ARN = re.compile(r"arn:[^:\s]+:iam::(?:aws|\d{12}):(?:role|policy)/([^\s]+)")
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
+
+
+def _status_state(item: dict[str, Any]) -> tuple[str, str]:
+    return _STATUS_STATES.get(str(item.get("state")), _UNKNOWN_STATUS_STATE)
+
+
+def _status_auth(item: dict[str, Any]) -> tuple[str, str]:
+    method = str(item.get("auth_method") or "")
+    if method == "mfa":
+        return (
+            ("mfa→role", "MFA login, then role")
+            if item.get("role")
+            else ("mfa", "MFA login")
+        )
+    return _STATUS_AUTH.get(method, _UNKNOWN_STATUS_AUTH)
+
+
+def _short_scope(value: object) -> str:
+    if not value:
+        return ""
+    return _IAM_SCOPE_ARN.sub(lambda match: match.group(1), str(value))
+
+
+def _status_scope(item: dict[str, Any]) -> str:
+    effective = item.get("effective_scope")
+    if isinstance(effective, dict):
+        kind = str(effective.get("kind") or "unknown")
+        role = effective.get("role_label")
+        boundary = effective.get("boundary_label")
+        policy = effective.get("policy_label")
+        if kind != "role-session":
+            return {
+                "ecr-only": "ECR only",
+                "logout-residue": "logout residue",
+                "account-login": "account login",
+                "mfa-session": "MFA session",
+                "legacy-unknown": "unknown (legacy)",
+                "unknown": "unknown session",
+            }.get(kind, "unknown session")
+        if not role:
+            role = "role session"
+        if boundary:
+            role = f"{role} (@{boundary})"
+    else:
+        role = item.get("role")
+        boundary = item.get("boundary")
+        if boundary:
+            role = f"{_short_scope(role) or 'role session'} (@{_short_scope(boundary)})"
+        policy = item.get("policy")
+    label = _short_scope(role)
+    restriction = _short_scope(policy)
+    if label and restriction:
+        return f"{label} → {restriction}"
+    return label or restriction
+
+
+def _status_ttl(item: dict[str, Any]) -> str:
+    state = str(item.get("state") or "")
+    if state not in {"active", "expiring"}:
+        return ""
+    raw = item.get("remaining_seconds")
+    if raw is None:
+        return ""
+    try:
+        seconds = Decimal(str(raw))
+    except ArithmeticError:
+        return ""
+    if seconds <= 0:
+        return ""
+    if seconds < _SECONDS_PER_MINUTE:
+        return "<1m"
+    if seconds < 2 * _SECONDS_PER_HOUR:
+        minutes = (seconds / _SECONDS_PER_MINUTE).quantize(
+            Decimal(1), rounding=ROUND_HALF_UP
+        )
+        return f"{minutes}m"
+    hours = (seconds / _SECONDS_PER_HOUR).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    return f"{hours}h"
+
+
+def _status_verification(item: dict[str, Any]) -> str:
+    verification = item.get("verification")
+    if not isinstance(verification, dict):
+        return ""
+    status = verification.get("status")
+    rendered = _STATUS_VERIFICATIONS.get(str(status), "")
+    if rendered != "mismatch":
+        return rendered
+    if verification.get("expected_role") is not None:
+        return f"mismatch (role {verification.get('actual_role') or 'unknown'})"
+    return f"mismatch ({verification.get('actual_account') or 'unknown'})"
+
+
+_STATUS_SUMMARY_ORDER = [
+    ("active", "🟢", "active"),
+    ("expiring", "🟡", "expiring"),
+    ("expired", "🔴", "expired"),
+    ("drifted", "⚠️", "drifted"),
+    ("legacy-unverified", "⚠️", "legacy-unverified"),
+    ("missing", "❌", "missing"),
+    ("invalid", "❌", "invalid"),
+    ("logout-residue", "🧹", "logout-residue"),
+    ("ecr-only", "🧹", "ECR-only"),
+]
+
+
+def _status_summary(sessions: Sequence[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    unknown = 0
+    known = {state for state, _symbol, _label in _STATUS_SUMMARY_ORDER}
+    for item in sessions:
+        state = str(item.get("state") or "")
+        if state in known:
+            counts[state] = counts.get(state, 0) + 1
+        else:
+            unknown += 1
+    entries = [
+        f"{counts[state]} {symbol}{label}"
+        for state, symbol, label in _STATUS_SUMMARY_ORDER
+        if counts.get(state)
     ]
-    return _text_table(
-        [
-            "LOCATION",
-            "PROFILE",
-            "STATE",
-            "AUTH",
-            "ACCOUNT",
-            "SCOPE",
-            "REMAINING",
-            "VERIFY",
-        ],
-        rows,
-    )
+    if unknown:
+        entries.append(f"{unknown} ❔unknown/inconclusive")
+    return _safe_terminal_text(f"State: {' | '.join(entries)}")
+
+
+def _status_text(report: dict[str, Any]) -> str:
+    sessions = report["sessions"]
+    if not sessions:
+        return "(none)"
+    show_location = not all(item.get("location") == "default" for item in sessions)
+    ttls = [_status_ttl(item) for item in sessions]
+    show_ttl = any(ttls)
+    verifications = [_status_verification(item) for item in sessions]
+    show_verification = any(verifications)
+    states = [_status_state(item) for item in sessions]
+    auth = [_status_auth(item) for item in sessions]
+
+    columns = ["PROFILE", "STATE", "AUTH", "ACCOUNT", "SCOPE"]
+    if show_location:
+        columns.insert(0, "LOCATION")
+    if show_ttl:
+        columns.append("TTL")
+    if show_verification:
+        columns.append("VERIFY")
+
+    rows = []
+    for index, item in enumerate(sessions):
+        row = [
+            str(item.get("profile") or "default"),
+            states[index][0],
+            auth[index][0],
+            str(item.get("target_account") or item.get("source_account") or ""),
+            _status_scope(item),
+        ]
+        if show_location:
+            row.insert(0, str(item.get("location") or item.get("destination") or ""))
+        if show_ttl:
+            row.append(ttls[index])
+        if show_verification:
+            row.append(verifications[index])
+        rows.append(row)
+
+    return f"{_text_table(columns, rows)}\n\n{_status_summary(sessions)}"
 
 
 def _profile_list_text(report: dict[str, Any], *, wide: bool = False) -> str:

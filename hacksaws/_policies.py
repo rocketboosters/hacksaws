@@ -36,6 +36,7 @@ class ResolvedPolicy:
     arn: str | None = None
     document: str | None = None
     cached: bool = False
+    source_arn: str | None = None
 
 
 def _validate_document(value: object) -> dict[str, Any]:
@@ -398,7 +399,13 @@ def resolve(
                 "A customer-managed session policy must belong to the target role account."
             )
         if policy_account != "aws":
-            return ResolvedPolicy(value, "remote-customer", "explicit ARN", arn=value)
+            return ResolvedPolicy(
+                value,
+                "remote-customer",
+                "explicit ARN",
+                arn=value,
+                source_arn=value,
+            )
         return _fetch_aws_managed(
             value,
             account_id=account_id,
@@ -511,6 +518,7 @@ def _fetch_aws_managed(
             f"cached policy ({cached[1]:.0f}s old)",
             document=compact,
             cached=True,
+            source_arn=arn,
         )
     try:
         client = (session or boto3.Session(profile_name=profile)).client("iam")
@@ -530,7 +538,9 @@ def _fetch_aws_managed(
         identity, document, origin="aws-managed", resolver="arn", source_identity=arn
     )
     enforce_inline_limit(compact)
-    return ResolvedPolicy(identity, "aws-managed", arn, document=compact)
+    return ResolvedPolicy(
+        identity, "aws-managed", arn, document=compact, source_arn=arn
+    )
 
 
 def _resolve_remote_name(
@@ -574,6 +584,7 @@ def _resolve_remote_name(
             f"cached policy ({cached[1]:.0f}s old)",
             arn=cached_arn,
             cached=True,
+            source_arn=cached_arn,
         )
     resolution_session = session or boto3.Session(profile_name=profile)
     try:
@@ -612,6 +623,7 @@ def _resolve_remote_name(
             "remote-customer",
             f"unverified constructed ARN after list failure: {error}",
             arn=arn,
+            source_arn=arn,
         )
     if local and aws:
         raise OperationalError(
@@ -636,7 +648,11 @@ def _resolve_remote_name(
                 f"Unable to inspect customer-managed policy {arn}: {error}"
             ) from error
         return ResolvedPolicy(
-            identity, "remote-customer", "verified remote name", arn=arn
+            identity,
+            "remote-customer",
+            "verified remote name",
+            arn=arn,
+            source_arn=arn,
         )
     return _fetch_aws_managed(
         arn,
