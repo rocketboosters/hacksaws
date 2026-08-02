@@ -9,6 +9,7 @@ would prompt require explicit `--yes`; create collisions additionally require
 hacksaws --json iam policy create agent.yaml --profile admin --dry-run
 hacksaws iam list --profile admin --json
 hacksaws cleanup --all --profile admin --dry-run --json
+hacksaws assume admin --role AgentSession --to default:agent --yes --json
 ```
 
 Global color controls are `--color auto|always|never` and `--no-color`.
@@ -23,3 +24,8 @@ create no journal and make no AWS or local mutation. They can therefore fail
 when credentials, account assertions, references, validation, or dependencies
 are invalid. Recovery `continue` and `rollback` resume an existing journal and
 do not offer dry-run mode.
+
+`hacksaws assume` always performs a secret-free preflight. JSON and other
+noninteractive invocations require `--yes` before `AssumeRole` or local
+mutation; the envelope contains endpoint, identity, role, account, partition,
+and lifecycle metadata but never credentials, backups, or policy documents.

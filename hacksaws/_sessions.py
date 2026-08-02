@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import configparser
 import copy
+import dataclasses
 import fnmatch
 import getpass
 import importlib
@@ -22,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NoReturn
 from typing import cast
 
 import boto3
@@ -50,6 +52,19 @@ _CONFLICTING_ENV = {
     "AWS_CONFIG_FILE",
     "AWS_LOGIN_CACHE_DIRECTORY",
 }
+
+
+class AssumePlanChanged(_configs.OperationalError):
+    """Raised when local state no longer matches a confirmed AssumeRole preview."""
+
+
+@dataclasses.dataclass
+class AssumeRolePlan:
+    """Opaque prepared AssumeRole operation; callers may expose only its preview."""
+
+    _data: dict[str, Any] = dataclasses.field(repr=False)
+    _arguments_fingerprint: str = dataclasses.field(repr=False)
+    _consumed: bool = dataclasses.field(default=False, repr=False)
 
 
 def is_expanded_login(args: Any) -> bool:
@@ -228,6 +243,9 @@ def recover_journal() -> None:
         raise _configs.OperationalError(
             f"An unreadable transaction journal remains at {path}; preserve it and restore affected AWS files manually: {error}"
         ) from error
+    if journal.get("kind") == "assume-role":
+        _recover_assume_journal(journal)
+        return
     if not journal.get("safe_to_rollback") or not isinstance(
         journal.get("files"), list
     ):
@@ -470,9 +488,9 @@ def _role_details(
         account_id = source_account
         role_partition = partition
         if account_name:
-            data = _state.load_config()
-            _, account = _state.get_resource(data, "account", account_name)
-            account_id, role_partition = account["id"], account["partition"]
+            account_id, role_partition = _role_account_assertion(
+                str(account_name), partition
+            )
         role = f"arn:{role_partition}:iam::{account_id}:role/{role}"
     if role:
         match = re.fullmatch(
@@ -481,11 +499,12 @@ def _role_details(
         if not match:
             raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
         if account_name:
-            data = _state.load_config()
-            _, selected = _state.get_resource(data, "account", account_name)
+            asserted_account, asserted_partition = _role_account_assertion(
+                str(account_name), partition
+            )
             if (
-                match.group(1) != selected["partition"]
-                or match.group(2) != selected["id"]
+                match.group(1) != asserted_partition
+                or match.group(2) != asserted_account
             ):
                 raise _configs.OperationalError(
                     "Explicit role ARN account/partition conflicts with --account."
@@ -501,6 +520,15 @@ def _role_details(
                     "Boundary role account/partition conflicts with its configured account."
                 )
     return role, policy, external_id, target.get("boundary_name")
+
+
+def _role_account_assertion(value: str, caller_partition: str) -> tuple[str, str]:
+    """Resolve a configured account name or a raw ID in the caller partition."""
+    if re.fullmatch(r"\d{12}", value):
+        return value, caller_partition
+    data = _state.load_config()
+    _, account = _state.get_resource(data, "account", value)
+    return str(account["id"]), str(account["partition"])
 
 
 def _require_concrete_role(args: Any, role: str | None) -> None:
@@ -586,41 +614,30 @@ def _assume(
     target: dict[str, Any],
     external_id: str | None,
     boundary_name: str | None,
+    effective_duration: int | None = None,
+    resolved_policy: _policies.ResolvedPolicy | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     match = re.fullmatch(r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/.+", role)
     if not match:
         raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
-    credentials = session.get_credentials()
-    chained = bool(credentials and credentials.token)
-    duration = _duration_for(args, target, chained=chained)
-    role_name = role.split("role/", 1)[-1]
-    try:
-        maximum = int(
-            session.client("iam").get_role(RoleName=role_name)["Role"][
-                "MaxSessionDuration"
-            ]
-        )
-    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
-        maximum = None
-    if maximum is not None and duration > maximum:
-        raise _configs.OperationalError(
-            f"Requested boundary duration {duration} seconds exceeds role "
-            f"MaxSessionDuration {maximum} seconds."
-        )
+    duration = effective_duration or _effective_assume_duration(
+        session, role, args=args, target=target
+    )
     request: dict[str, Any] = {
         "RoleArn": role,
         "RoleSessionName": _session_name(role, boundary_name, args.session_name),
         "DurationSeconds": duration,
     }
-    resolved = None
+    resolved = resolved_policy
     if policy:
-        resolved = _policies.resolve(
-            policy,
-            account_id=match.group(2),
-            partition=match.group(1),
-            profile=source_profile,
-            session=session,
-        )
+        if resolved is None:
+            resolved = _policies.resolve(
+                policy,
+                account_id=match.group(2),
+                partition=match.group(1),
+                profile=source_profile,
+                session=session,
+            )
         if resolved.arn:
             request["PolicyArns"] = [{"arn": resolved.arn}]
         elif resolved.document:
@@ -652,6 +669,30 @@ def _assume(
         "expires_at": response["Credentials"]["Expiration"].astimezone(UTC).isoformat(),
     }
     return response["Credentials"], metadata
+
+
+def _effective_assume_duration(
+    session: Any, role: str, *, args: Any, target: dict[str, Any]
+) -> int:
+    """Resolve role-chaining and configured-role duration limits before preview."""
+    credentials = session.get_credentials()
+    chained = bool(credentials and credentials.token)
+    duration = _duration_for(args, target, chained=chained)
+    role_name = role.split("role/", 1)[-1]
+    try:
+        maximum = int(
+            session.client("iam").get_role(RoleName=role_name)["Role"][
+                "MaxSessionDuration"
+            ]
+        )
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError):
+        maximum = None
+    if maximum is not None and duration > maximum:
+        raise _configs.OperationalError(
+            f"Requested boundary duration {duration} seconds exceeds role "
+            f"MaxSessionDuration {maximum} seconds."
+        )
+    return duration
 
 
 def _save_credentials(path: Path, profile: str, credentials: dict[str, Any]) -> None:
@@ -697,22 +738,43 @@ def _record(
     method: str,
     ecr: list[str] | None = None,
     ecr_engine: str | None = None,
+    previous_override: dict[str, Any] | None = None,
+    inherit_runtime_state: bool = True,
+    retain_file_backup: bool = True,
 ) -> None:
     sessions = _state.load_sessions()
     key = f"{destination.absolute()}::{profile}"
-    previous = sessions.get(key)
-    original_backup = (
-        previous.get("backup") or journal["files"] if previous else journal["files"]
+    previous = previous_override or sessions.get(key)
+    destination_paths = {
+        (destination / "credentials").absolute(),
+        (destination / "config").absolute(),
+    }
+    destination_backup = [
+        item
+        for item in journal["files"]
+        if Path(str(item.get("path", ""))).absolute() in destination_paths
+    ]
+    if previous:
+        original_backup = previous.get("backup") or (
+            destination_backup if retain_file_backup else []
+        )
+    else:
+        original_backup = destination_backup if retain_file_backup else []
+    previous_ecr = previous.get("ecr", []) if previous and inherit_runtime_state else []
+    previous_cache = (
+        previous.get("login_cache_files", [])
+        if previous and inherit_runtime_state
+        else []
     )
-    previous_ecr = previous.get("ecr", []) if previous else []
-    previous_cache = previous.get("login_cache_files", []) if previous else []
     current_cache = metadata.get("login_cache_files", [])
     if previous_cache or current_cache:
         metadata["login_cache_files"] = list(
             dict.fromkeys([*previous_cache, *current_cache])
         )
     previous_cache_directories = (
-        previous.get("login_cache_directories", []) if previous else []
+        previous.get("login_cache_directories", [])
+        if previous and inherit_runtime_state
+        else []
     )
     current_cache_directories = metadata.get("login_cache_directories", [])
     if previous_cache_directories or current_cache_directories:
@@ -720,7 +782,9 @@ def _record(
             dict.fromkeys([*previous_cache_directories, *current_cache_directories])
         )
     previous_fingerprints = (
-        previous.get("login_cache_fingerprints", {}) if previous else {}
+        previous.get("login_cache_fingerprints", {})
+        if previous and inherit_runtime_state
+        else {}
     )
     current_fingerprints = metadata.get("login_cache_fingerprints", {})
     if previous_fingerprints or current_fingerprints:
@@ -749,6 +813,30 @@ def _original_file(path: Path, profile: str) -> bytes | None:
     key = f"{path.parent.absolute()}::{profile}"
     session = _state.load_sessions().get(key)
     if session:
+        kind = "config" if path.name == "config" else "credentials"
+        section_item = session.get("section_backup", {}).get(kind)
+        if isinstance(section_item, dict) and isinstance(
+            section_item.get("original"), dict
+        ):
+            original = section_item["original"]
+            parser = _read_ini(path)
+            section = _section(profile, config=kind == "config")
+            if original.get("exists"):
+                values = original.get("values")
+                if not isinstance(values, dict):
+                    raise _configs.OperationalError(
+                        "Managed session original section values are invalid."
+                    )
+                parser[section] = {
+                    str(name): str(value) for name, value in values.items()
+                }
+            else:
+                parser.remove_section(section)
+            import io
+
+            stream = io.StringIO()
+            parser.write(stream)
+            return stream.getvalue().encode()
         for snapshot in session.get("backup", []):
             if Path(snapshot["path"]).absolute() == path.absolute():
                 return (
@@ -1226,6 +1314,1106 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     return _configs.Result(
         "BROWSER_LOGIN",
         f"Bounded browser login active for profile {destination_profile}.",
+    )
+
+
+def _profile_exists(directory: Path, profile: str) -> bool:
+    """Return whether either AWS file already contains a profile section."""
+    credentials = _read_ini(directory / "credentials")
+    config = _read_ini(directory / "config")
+    return profile in credentials or _section(profile, config=True) in config
+
+
+def _legacy_source_backup(
+    directory: Path, profile: str
+) -> tuple[Path, dict[str, str]] | None:
+    """Read the persistent credential tier behind a legacy MFA login."""
+    path = directory / f"{profile}.store.credentials"
+    if not path.exists():
+        return None
+    parser = _read_ini(path)
+    if profile not in parser:
+        raise _configs.OperationalError(
+            f"Legacy credential backup {path} has no profile {profile!r}."
+        )
+    values = dict(parser[profile].items())
+    if not {"aws_access_key_id", "aws_secret_access_key"} <= values.keys():
+        raise _configs.OperationalError(
+            f"Legacy credential backup {path} has incomplete persistent credentials."
+        )
+    return path, values
+
+
+def _region_values(directory: Path, profile: str) -> dict[str, str]:
+    """Capture only non-secret regional settings from an authenticated source."""
+    parser = _read_ini(directory / "config")
+    section = _section(profile, config=True)
+    if section not in parser:
+        return {}
+    return {
+        key: parser[section][key]
+        for key in ("region", "output")
+        if key in parser[section]
+    }
+
+
+def _apply_region_values(
+    destination: Path,
+    profile: str,
+    values: dict[str, str],
+    explicit: str | None,
+) -> None:
+    """Apply login-compatible region/output inheritance to one profile section."""
+    parser = _read_ini(destination / "config")
+    section = _section(profile, config=True)
+    if section not in parser:
+        parser.add_section(section)
+    if explicit:
+        parser[section]["region"] = explicit
+    else:
+        for key, value in values.items():
+            if key not in parser[section]:
+                parser[section][key] = value
+    parser[section].pop("login_session", None)
+    _write_ini(destination / "config", parser)
+
+
+def _session_is_usable_source(session: dict[str, Any]) -> None:
+    """Reject managed records that no longer represent usable AWS credentials."""
+    method = session.get("auth_method")
+    if method in {"ecr-only", "browser-cache-residue", "logout-residue"}:
+        raise _configs.OperationalError(
+            f"Managed source session is {method}; log in again before assuming a role."
+        )
+    expires_at = session.get("expires_at")
+    if expires_at:
+        try:
+            expired = datetime.fromisoformat(str(expires_at)) <= datetime.now(UTC)
+        except (TypeError, ValueError) as error:
+            raise _configs.OperationalError(
+                "Managed source session has an invalid expiration timestamp."
+            ) from error
+        if expired:
+            raise _configs.OperationalError(
+                "Managed source session has expired; log in again before assuming a role."
+            )
+
+
+def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
+    """Resolve and validate an already-authenticated AssumeRole handoff."""
+    args = context.args
+    source, source_profile, destination, destination_profile = _paths(args)
+    if (
+        getattr(args, "to_profile", None)
+        and not getattr(args, "to_directory", None)
+        and not getattr(args, "to", None)
+    ):
+        destination = source
+        destination_profile = _normalize_profile(args.to_profile)
+    source = source.absolute()
+    destination = destination.absolute()
+    source_key = f"{source}::{source_profile}"
+    destination_key = f"{destination}::{destination_profile}"
+    same_key = source_key == destination_key
+    explicit_self = bool(getattr(args, "self_destination", False))
+    verbose_self = (
+        bool(getattr(args, "to", None))
+        or bool(getattr(args, "to_directory", None))
+        or bool(getattr(args, "to_profile", None))
+    )
+    if same_key and not (explicit_self or verbose_self):
+        raise _configs.OperationalError(
+            "Source and destination are the same profile. Use --self or explicitly "
+            "repeat the destination with --to LOCATION:PROFILE."
+        )
+    if explicit_self and not same_key:
+        raise _configs.OperationalError("--self must resolve to the source profile.")
+    if same_key and bool(getattr(args, "keep_source", False)):
+        raise _configs.OperationalError("--keep-source cannot be combined with --self.")
+
+    sessions = _state.load_sessions()
+    source_record = sessions.get(source_key)
+    legacy = None if source_record else _legacy_source_backup(source, source_profile)
+    keep_source = bool(getattr(args, "keep_source", False))
+    if source_record:
+        _session_is_usable_source(source_record)
+    elif legacy is None and not keep_source:
+        raise _configs.OperationalError(
+            "The source profile is not a Hacksaws-managed login. Retry with "
+            "--keep-source to leave the source untouched."
+        )
+    force = bool(getattr(args, "force", False))
+    source_plans: list[tuple[Path, str, dict[str, Any]]] = []
+    source_cache: tuple[list[Path], list[Path], list[dict[str, str]]] = ([], [], [])
+    if source_record and not keep_source:
+        source_plans = _profile_section_plans(
+            source_record, source, source_profile, force=force
+        )
+        source_cache = _tracked_login_cache_plan(source_record, source, force=force)
+
+    destination_record = sessions.get(destination_key)
+    destination_cache: tuple[list[Path], list[Path], list[dict[str, str]]] = (
+        [],
+        [],
+        [],
+    )
+    if destination_record and not same_key:
+        _profile_section_plans(
+            destination_record, destination, destination_profile, force=False
+        )
+        destination_cache = _tracked_login_cache_plan(
+            destination_record, destination, force=False
+        )
+    destination_exists = _profile_exists(destination, destination_profile)
+    if (
+        not same_key
+        and destination_record is None
+        and destination_exists
+        and not bool(getattr(args, "replace", False))
+    ):
+        raise _configs.OperationalError(
+            f"Destination profile {destination_profile!r} already exists outside "
+            "Hacksaws management; retry with --replace after reviewing it."
+        )
+
+    if source_record:
+        configured = source_record.get("login_cache_directories", [])
+        source_login_cache = (
+            Path(str(configured[0])).absolute() if configured else _native_login_cache()
+        )
+    else:
+        source_login_cache = _native_login_cache()
+    with _aws_environment(
+        source / "config", source / "credentials", source_login_cache
+    ):
+        authenticated = boto3.Session(profile_name=source_profile)
+        source_account, partition, source_arn = _identity(
+            authenticated, label="authenticated assume-role source"
+        )
+    target = _target_details(args, source_account, partition)
+    role, policy, external_id, boundary_name = _role_details(
+        args, target, source_account, partition
+    )
+    if role is None:
+        raise _configs.OperationalError(
+            "hacksaws assume requires a concrete --role, --boundary/--as, or bounded target."
+        )
+    return {
+        "source": source,
+        "source_profile": source_profile,
+        "source_key": source_key,
+        "source_record": source_record,
+        "source_plans": source_plans,
+        "source_cache": source_cache,
+        "legacy": legacy,
+        "destination": destination,
+        "destination_profile": destination_profile,
+        "destination_key": destination_key,
+        "destination_record": destination_record,
+        "destination_cache": destination_cache,
+        "same_key": same_key,
+        "explicit_self": explicit_self,
+        "keep_source": keep_source,
+        "keep_ecr": bool(getattr(args, "keep_ecr", False)),
+        "replace": bool(getattr(args, "replace", False)),
+        "destination_exists": destination_exists,
+        "authenticated": authenticated,
+        "source_account": source_account,
+        "source_partition": partition,
+        "source_arn": source_arn,
+        "target": target,
+        "role": role,
+        "policy": policy,
+        "external_id": external_id,
+        "boundary_name": boundary_name,
+        "region_values": _region_values(source, source_profile),
+    }
+
+
+def _assume_public_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Return a stable, secret-free preview of an AssumeRole handoff."""
+    source_record = plan.get("source_record") or {}
+    warnings = []
+    if plan["same_key"] and not plan["explicit_self"]:
+        warnings.append(
+            "The explicit destination resolves to the source profile; the source "
+            "credentials will be replaced in place."
+        )
+    if plan["same_key"]:
+        destination_action = "replace-source-in-place"
+    elif plan.get("destination_record") is not None:
+        destination_action = "replace-managed"
+    elif plan["destination_exists"]:
+        destination_action = "replace-unmanaged"
+    else:
+        destination_action = "create"
+    return {
+        "source": {
+            "directory": str(plan["source"]),
+            "profile": plan["source_profile"],
+            "account": plan["source_account"],
+            "partition": plan["source_partition"],
+            "principal": plan["source_arn"],
+            "authMethod": source_record.get("auth_method", "unmanaged"),
+            "willLogout": not plan["keep_source"],
+        },
+        "destination": {
+            "directory": str(plan["destination"]),
+            "profile": plan["destination_profile"],
+            "sameAsSource": plan["same_key"],
+            "replacesManaged": plan.get("destination_record") is not None,
+        },
+        "role": plan["role"],
+        "policy": plan["policy"],
+        "boundary": plan["boundary_name"],
+        "target": plan["target"].get("target_name"),
+        "durationSeconds": plan["effective_duration"],
+        "keepSource": plan["keep_source"],
+        "keepEcr": plan["keep_ecr"],
+        "replace": plan["replace"],
+        "lifecycle": {
+            "source": "keep" if plan["keep_source"] else "logout",
+            "destination": destination_action,
+            "ecr": "keep" if plan["keep_ecr"] else "logout-after-commit",
+            "replaceApproved": plan["replace"],
+        },
+        "warnings": warnings,
+    }
+
+
+def _assume_arguments_fingerprint(args: Any) -> str:
+    """Bind execution to the security-relevant arguments used for its preview."""
+    names = (
+        "profile",
+        "directory",
+        "aws_account_name",
+        "target",
+        "to",
+        "to_directory",
+        "to_profile",
+        "self_destination",
+        "role",
+        "boundary",
+        "policy",
+        "external_id",
+        "account",
+        "session_name",
+        "region",
+        "duration",
+        "htl",
+        "mtl",
+        "stl",
+        "keep_source",
+        "keep_ecr",
+        "replace",
+        "force",
+    )
+    encoded = json.dumps(
+        {name: getattr(args, name, None) for name in names},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return _state.digest(encoded)
+
+
+def _owned_cache_state(plan: dict[str, Any]) -> dict[str, str | None]:
+    paths = [*plan["source_cache"][1], *plan["destination_cache"][1]]
+    result: dict[str, str | None] = {}
+    for path in paths:
+        absolute = path.absolute()
+        result[str(absolute)] = (
+            _state.digest(absolute.read_bytes()) if absolute.exists() else None
+        )
+    return result
+
+
+def _file_fingerprint(path: Path) -> str | None:
+    return _state.digest(path.read_bytes()) if path.exists() else None
+
+
+def _session_record_state(record: object) -> dict[str, Any]:
+    """Fingerprint one sessions.json key without embedding its record in a journal."""
+    if not isinstance(record, dict):
+        return {"exists": False, "fingerprint": None}
+    encoded = json.dumps(
+        record, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return {"exists": True, "fingerprint": _state.digest(encoded)}
+
+
+def _session_final_state(record: dict[str, Any] | None) -> dict[str, Any]:
+    state = _session_record_state(record)
+    if record is not None:
+        state["values"] = copy.deepcopy(record)
+    return state
+
+
+def _current_session_state(key: str) -> dict[str, Any]:
+    return _session_record_state(_state.load_sessions().get(key))
+
+
+def prepare_assume_role(context: _configs.Context) -> AssumeRolePlan:
+    """Freeze a secret-safe AssumeRole plan for preview and later execution."""
+    data = _assume_preflight(context)
+    role = str(data["role"])
+    match = re.fullmatch(r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/.+", role)
+    if match is None:
+        raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
+    data["effective_duration"] = _effective_assume_duration(
+        data["authenticated"], role, args=context.args, target=data["target"]
+    )
+    data["resolved_policy"] = (
+        _policies.resolve(
+            data["policy"],
+            account_id=match.group(2),
+            partition=match.group(1),
+            profile=data["source_profile"],
+            session=data["authenticated"],
+        )
+        if data["policy"]
+        else None
+    )
+    data["hacksaws_config_expected"] = _file_fingerprint(_state.root() / "config.json")
+    data["policy_source_expected"] = None
+    resolved = data["resolved_policy"]
+    if resolved and resolved.origin == "local":
+        policy_path = Path(resolved.provenance).expanduser().absolute()
+        data["policy_source_expected"] = {
+            "path": str(policy_path),
+            "fingerprint": _file_fingerprint(policy_path),
+        }
+    elif resolved and resolved.origin == "stored":
+        policy_path = (
+            _policies.stored_directory() / f"{resolved.identity}.yaml"
+        ).absolute()
+        data["policy_source_expected"] = {
+            "path": str(policy_path),
+            "fingerprint": _file_fingerprint(policy_path),
+        }
+    data["source_expected"] = {
+        "credentials": _section_state(
+            data["source"] / "credentials", data["source_profile"]
+        ),
+        "config": _section_state(
+            data["source"] / "config",
+            _section(data["source_profile"], config=True),
+        ),
+    }
+    data["destination_expected"] = {
+        "credentials": _section_state(
+            data["destination"] / "credentials", data["destination_profile"]
+        ),
+        "config": _section_state(
+            data["destination"] / "config",
+            _section(data["destination_profile"], config=True),
+        ),
+    }
+    sessions = _state.load_sessions()
+    source_session = _session_record_state(sessions.get(data["source_key"]))
+    destination_session = _session_record_state(sessions.get(data["destination_key"]))
+    if source_session != _session_record_state(data["source_record"]) or (
+        destination_session != _session_record_state(data["destination_record"])
+    ):
+        raise _configs.OperationalError(
+            "Managed session metadata changed during AssumeRole preparation; retry."
+        )
+    data["source_session_expected"] = source_session
+    data["destination_session_expected"] = destination_session
+    data["cache_expected"] = _owned_cache_state(data)
+    return AssumeRolePlan(data, _assume_arguments_fingerprint(context.args))
+
+
+def assume_role_preview(plan: AssumeRolePlan) -> dict[str, Any]:
+    """Return the public, secret-free view of one frozen AssumeRole plan."""
+    if not isinstance(plan, AssumeRolePlan):
+        raise TypeError("assume_role_preview requires prepare_assume_role output")
+    return _assume_public_plan(plan._data)
+
+
+def _cleanup_assume_ecr(
+    owners: dict[str, tuple[str, list[str]]],
+) -> list[dict[str, str]]:
+    """Remove post-commit ECR state and retain precise local residue on failure."""
+    failures: list[dict[str, str]] = []
+    operations: dict[tuple[str, str], set[str]] = {}
+    for key, (engine, registries) in owners.items():
+        for registry in registries:
+            operations.setdefault((engine, registry), set()).add(key)
+    for (engine_name, registry), keys in operations.items():
+        engine = cast("_configs.ContainerEngine", engine_name)
+        try:
+            _ecr._run_container_engine(engine, [engine, "logout", registry])
+        except _configs.OperationalError as error:
+            failures.append({"registry": registry, "message": str(error)})
+            continue
+        sessions = _state.load_sessions()
+        for key in keys:
+            session = sessions.get(key)
+            if not session:
+                continue
+            remaining = [value for value in session.get("ecr", []) if value != registry]
+            if remaining:
+                session["ecr"] = remaining
+            elif session.get("auth_method") == "ecr-only":
+                sessions.pop(key, None)
+            else:
+                session["ecr"] = []
+        _state.save_sessions(sessions)
+    return failures
+
+
+def _assume_original_section(
+    data: dict[str, Any], *, source: bool, kind: str
+) -> dict[str, Any]:
+    """Return only the authorized persistent section used after logout."""
+    record = data["source_record"] if source else data["destination_record"]
+    if record:
+        item = record.get("section_backup", {}).get(kind)
+        if not isinstance(item, dict) or not isinstance(item.get("original"), dict):
+            raise _configs.OperationalError(
+                "Managed AssumeRole endpoint has no safe original section state."
+            )
+        return copy.deepcopy(item["original"])
+    directory = cast("Path", data["source"] if source else data["destination"])
+    profile = str(data["source_profile"] if source else data["destination_profile"])
+    if source and data["legacy"] and kind == "credentials":
+        return {"exists": True, "values": dict(data["legacy"][1])}
+    parser = _read_ini(directory / kind)
+    section = _section(profile, config=kind == "config")
+    values = _section_values(parser, section)
+    return {"exists": values is not None, "values": values or {}}
+
+
+def _write_section(path: Path, section: str, state: dict[str, Any]) -> None:
+    parser = _read_ini(path)
+    if state.get("exists"):
+        values = state.get("values")
+        if not isinstance(values, dict):
+            raise _configs.OperationalError("AssumeRole journal section is invalid.")
+        parser[section] = {str(key): str(value) for key, value in values.items()}
+    else:
+        parser.remove_section(section)
+    _write_ini(path, parser)
+
+
+def _planned_destination_config(data: dict[str, Any], args: Any) -> dict[str, str]:
+    destination = cast("Path", data["destination"])
+    profile = str(data["destination_profile"])
+    parser = _read_ini(destination / "config")
+    section = _section(profile, config=True)
+    values = dict(parser[section].items()) if section in parser else {}
+    if getattr(args, "region", None):
+        values["region"] = str(args.region)
+    else:
+        for key, value in data["region_values"].items():
+            values.setdefault(key, value)
+    values.pop("login_session", None)
+    return values
+
+
+def _revalidate_assume_plan(
+    context: _configs.Context, prepared: AssumeRolePlan
+) -> None:
+    data = prepared._data
+    changed = prepared._consumed or (
+        prepared._arguments_fingerprint != _assume_arguments_fingerprint(context.args)
+    )
+    for prefix, directory_key, profile_key in (
+        ("source", "source", "source_profile"),
+        ("destination", "destination", "destination_profile"),
+    ):
+        directory = cast("Path", data[directory_key])
+        profile = str(data[profile_key])
+        current = {
+            "credentials": _section_state(directory / "credentials", profile),
+            "config": _section_state(
+                directory / "config", _section(profile, config=True)
+            ),
+        }
+        changed = changed or current != data[f"{prefix}_expected"]
+    changed = changed or _owned_cache_state(data) != data["cache_expected"]
+    changed = (
+        changed
+        or _file_fingerprint(_state.root() / "config.json")
+        != data["hacksaws_config_expected"]
+    )
+    policy_source = data.get("policy_source_expected")
+    if policy_source:
+        changed = (
+            changed
+            or _file_fingerprint(Path(policy_source["path"]))
+            != policy_source["fingerprint"]
+        )
+    sessions = _state.load_sessions()
+    changed = (
+        changed
+        or _session_record_state(sessions.get(data["source_key"]))
+        != data["source_session_expected"]
+    )
+    changed = (
+        changed
+        or _session_record_state(sessions.get(data["destination_key"]))
+        != data["destination_session_expected"]
+    )
+    if changed:
+        raise AssumePlanChanged(
+            "AssumeRole plan changed after preview; no local credential changes were "
+            "made. Review a fresh preview and retry."
+        )
+
+
+def _write_assume_journal(journal: dict[str, Any]) -> None:
+    _state.atomic_write(
+        _journal_path(), (json.dumps(journal, indent=2, default=str) + "\n").encode()
+    )
+
+
+def _build_assume_journal(
+    data: dict[str, Any],
+    args: Any,
+    credentials: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    source = cast("Path", data["source"])
+    destination = cast("Path", data["destination"])
+    source_profile = str(data["source_profile"])
+    destination_profile = str(data["destination_profile"])
+    credential_values = {
+        "aws_access_key_id": credentials["AccessKeyId"],
+        "aws_secret_access_key": credentials["SecretAccessKey"],
+        "aws_session_token": credentials["SessionToken"],
+    }
+    config_values = _planned_destination_config(data, args)
+    source_original = (
+        {
+            kind: _assume_original_section(data, source=True, kind=kind)
+            for kind in ("credentials", "config")
+        }
+        if not data["keep_source"]
+        else {}
+    )
+    destination_original = (
+        copy.deepcopy(source_original)
+        if data["same_key"]
+        else {
+            kind: _assume_original_section(data, source=False, kind=kind)
+            for kind in ("credentials", "config")
+        }
+    )
+    runtime_record = (
+        data["source_record"] if data["same_key"] else data["destination_record"]
+    ) or {}
+    inherited_ecr = list(runtime_record.get("ecr", []))
+    inherited_engine = str(runtime_record.get("ecr_engine") or "docker")
+    metadata.update(
+        source_account=data["source_account"],
+        source_partition=data["source_partition"],
+        source_profile=source_profile,
+        source_destination=str(source),
+        source_auth_method=(data["source_record"] or {}).get(
+            "auth_method", "legacy-mfa" if data["legacy"] else "unmanaged"
+        ),
+        source_logged_out=not data["keep_source"],
+        target=data["target"].get("target_name"),
+    )
+    section_backup = {
+        "credentials": {
+            "path": str((destination / "credentials").absolute()),
+            "section": destination_profile,
+            "original": destination_original["credentials"],
+            "installed": {
+                "exists": True,
+                "fingerprint": _section_fingerprint(credential_values),
+            },
+        },
+        "config": {
+            "path": str((destination / "config").absolute()),
+            "section": _section(destination_profile, config=True),
+            "original": destination_original["config"],
+            "installed": {
+                "exists": True,
+                "fingerprint": _section_fingerprint(config_values),
+            },
+        },
+    }
+    previous_backup = (
+        data["destination_record"].get("backup", [])
+        if data["destination_record"]
+        else []
+    )
+    destination_session = {
+        **metadata,
+        "destination": str(destination),
+        "profile": destination_profile,
+        "auth_method": "assume-role",
+        "started_at": _state.iso_now(),
+        "backup": previous_backup,
+        "section_backup": section_backup,
+        "ecr": inherited_ecr,
+        "ecr_engine": inherited_engine if inherited_ecr else None,
+    }
+    cache = [
+        {"path": path, "fingerprint": fingerprint}
+        for path, fingerprint in data["cache_expected"].items()
+    ]
+    source_record = data["source_record"] or {}
+    source_runtime = {
+        "started_at": source_record.get("started_at"),
+        "ecr": list(source_record.get("ecr", [])),
+        "ecr_engine": source_record.get("ecr_engine"),
+    }
+    if data["same_key"]:
+        source_session_final = _session_final_state(destination_session)
+    elif data["keep_source"]:
+        source_session_final = copy.deepcopy(data["source_session_expected"])
+    elif source_runtime["ecr"]:
+        source_session_final = _session_final_state(
+            {
+                "destination": str(source),
+                "profile": source_profile,
+                "auth_method": "ecr-only",
+                "started_at": source_runtime["started_at"],
+                "backup": [],
+                "section_backup": {},
+                "ecr": source_runtime["ecr"],
+                "ecr_engine": source_runtime["ecr_engine"],
+            }
+        )
+    else:
+        source_session_final = _session_final_state(None)
+    legacy_backup = None
+    if data["legacy"]:
+        legacy_path = Path(data["legacy"][0]).absolute()
+        legacy_backup = {
+            "path": str(legacy_path),
+            "fingerprint": _file_fingerprint(legacy_path),
+        }
+    return {
+        "schema_version": 2,
+        "kind": "assume-role",
+        "phase": "prepared",
+        "source": {
+            "directory": str(source),
+            "profile": source_profile,
+            "key": data["source_key"],
+            "same_key": data["same_key"],
+            "keep": data["keep_source"],
+            "original": source_original,
+            "expected": data["source_expected"],
+            "session_expected": data["source_session_expected"],
+            "session_final": source_session_final,
+            "legacy_backup": legacy_backup,
+            "runtime": source_runtime,
+        },
+        "destination": {
+            "directory": str(destination),
+            "profile": destination_profile,
+            "key": data["destination_key"],
+            "original": destination_original,
+            "expected": data["destination_expected"],
+            "session_expected": data["destination_session_expected"],
+            "final": {
+                "credentials": section_backup["credentials"]["installed"],
+                "config": section_backup["config"]["installed"],
+                "config_values": config_values,
+            },
+            "session": destination_session,
+            "session_final": _session_final_state(destination_session),
+        },
+        "cache": cache,
+        "ecr_owners": {},
+    }
+
+
+def _original_section_state(original: dict[str, Any]) -> dict[str, Any]:
+    exists = bool(original.get("exists"))
+    values = original.get("values", {})
+    return {
+        "exists": exists,
+        "fingerprint": _section_fingerprint(values if exists else None),
+    }
+
+
+def _assume_recovery_error(label: str) -> NoReturn:
+    raise _configs.OperationalError(
+        f"AssumeRole recovery stopped because {label} changed outside the prepared "
+        "transaction. The recovery journal was retained for manual review."
+    )
+
+
+def _require_assume_state(
+    label: str, current: dict[str, Any], *allowed: dict[str, Any]
+) -> None:
+    identity = (current.get("exists"), current.get("fingerprint"))
+    if not any(
+        identity == (state.get("exists"), state.get("fingerprint")) for state in allowed
+    ):
+        _assume_recovery_error(label)
+
+
+def _validate_assume_cache(journal: dict[str, Any], *, allow_missing: bool) -> None:
+    for item in journal.get("cache", []):
+        path = Path(str(item["path"])).absolute()
+        if not path.exists():
+            if allow_missing:
+                continue
+            _assume_recovery_error(f"browser login cache {path}")
+        try:
+            current = _state.digest(path.read_bytes())
+        except OSError:
+            _assume_recovery_error(f"browser login cache {path}")
+        if current != item.get("fingerprint"):
+            _assume_recovery_error(f"browser login cache {path}")
+
+
+def _validate_assume_legacy(journal: dict[str, Any], *, allow_missing: bool) -> None:
+    item = journal["source"].get("legacy_backup")
+    if not item:
+        return
+    path = Path(str(item["path"])).absolute()
+    if not path.exists():
+        if allow_missing:
+            return
+        _assume_recovery_error(f"legacy credential backup {path}")
+    if _file_fingerprint(path) != item.get("fingerprint"):
+        _assume_recovery_error(f"legacy credential backup {path}")
+
+
+def _validate_assume_recovery(journal: dict[str, Any], *, roll_forward: bool) -> None:
+    source = journal["source"]
+    destination = journal["destination"]
+    destination_directory = Path(destination["directory"])
+    destination_profile = str(destination["profile"])
+    destination_credentials = _section_state(
+        destination_directory / "credentials", destination_profile
+    )
+    _require_assume_state(
+        "destination credential section",
+        destination_credentials,
+        destination["final"]["credentials"]
+        if roll_forward
+        else destination["expected"]["credentials"],
+    )
+    destination_config = _section_state(
+        destination_directory / "config",
+        _section(destination_profile, config=True),
+    )
+    if roll_forward:
+        _require_assume_state(
+            "destination config section",
+            destination_config,
+            destination["expected"]["config"],
+            destination["final"]["config"],
+        )
+    else:
+        _require_assume_state(
+            "destination config section",
+            destination_config,
+            destination["expected"]["config"],
+        )
+
+    sessions = _state.load_sessions()
+    destination_session = _session_record_state(sessions.get(destination["key"]))
+    source_session = _session_record_state(sessions.get(source["key"]))
+    if roll_forward:
+        _require_assume_state(
+            "destination session metadata",
+            destination_session,
+            destination["session_expected"],
+            destination["session_final"],
+        )
+        _require_assume_state(
+            "source session metadata",
+            source_session,
+            source["session_expected"],
+            source["session_final"],
+        )
+    else:
+        _require_assume_state(
+            "destination session metadata",
+            destination_session,
+            destination["session_expected"],
+        )
+        _require_assume_state(
+            "source session metadata",
+            source_session,
+            source["session_expected"],
+        )
+
+    if not source["same_key"]:
+        source_directory = Path(source["directory"])
+        source_profile = str(source["profile"])
+        for kind in ("credentials", "config"):
+            current = _section_state(
+                source_directory / kind,
+                _section(source_profile, config=kind == "config"),
+            )
+            allowed = [source["expected"][kind]]
+            if roll_forward and not source["keep"]:
+                allowed.append(_original_section_state(source["original"][kind]))
+            _require_assume_state(f"source {kind} section", current, *allowed)
+    _validate_assume_cache(journal, allow_missing=roll_forward)
+    _validate_assume_legacy(journal, allow_missing=roll_forward)
+
+
+def _remove_assume_cache(
+    journal: dict[str, Any], *, strict: bool = False
+) -> list[dict[str, str]]:
+    residue = []
+    for item in journal.get("cache", []):
+        path = Path(str(item["path"])).absolute()
+        if not path.exists():
+            continue
+        try:
+            current = _state.digest(path.read_bytes())
+        except OSError as error:
+            if strict:
+                _assume_recovery_error(f"browser login cache {path}")
+            residue.append({"path": str(path), "reason": f"unreadable: {error}"})
+            continue
+        if current != item.get("fingerprint"):
+            if strict:
+                _assume_recovery_error(f"browser login cache {path}")
+            residue.append({"path": str(path), "reason": "fingerprint changed"})
+            continue
+        try:
+            path.unlink()
+        except OSError as error:
+            if strict:
+                raise _configs.OperationalError(
+                    f"Unable to remove owned browser login cache {path}; the "
+                    "AssumeRole recovery journal was retained: {error}"
+                ) from error
+            residue.append({"path": str(path), "reason": f"remove failed: {error}"})
+    return residue
+
+
+def _write_section_cas(
+    path: Path,
+    section: str,
+    *,
+    expected: dict[str, Any],
+    final: dict[str, Any],
+    values: dict[str, Any],
+    label: str,
+) -> None:
+    current = _section_state(path, section)
+    if current == final:
+        return
+    _require_assume_state(label, current, expected)
+    _write_section(path, section, values)
+    _require_assume_state(label, _section_state(path, section), final)
+
+
+def _write_session_cas(
+    key: str,
+    *,
+    expected: dict[str, Any],
+    final: dict[str, Any],
+    label: str,
+) -> None:
+    sessions = _state.load_sessions()
+    current = _session_record_state(sessions.get(key))
+    if (current.get("exists"), current.get("fingerprint")) == (
+        final.get("exists"),
+        final.get("fingerprint"),
+    ):
+        return
+    _require_assume_state(label, current, expected)
+    if final.get("exists"):
+        values = final.get("values")
+        if not isinstance(values, dict):
+            raise _configs.OperationalError(
+                "AssumeRole journal final session metadata is invalid."
+            )
+        sessions[key] = copy.deepcopy(values)
+    else:
+        sessions.pop(key, None)
+    _state.save_sessions(sessions)
+    _require_assume_state(label, _current_session_state(key), final)
+
+
+def _install_assume_destination(journal: dict[str, Any]) -> None:
+    _validate_assume_recovery(journal, roll_forward=True)
+    destination = journal["destination"]
+    directory = Path(destination["directory"])
+    profile = str(destination["profile"])
+    _write_section_cas(
+        directory / "config",
+        _section(profile, config=True),
+        expected=destination["expected"]["config"],
+        final=destination["final"]["config"],
+        values={"exists": True, "values": destination["final"]["config_values"]},
+        label="destination config section",
+    )
+    _require_assume_state(
+        "destination credential section",
+        _section_state(directory / "credentials", profile),
+        destination["final"]["credentials"],
+    )
+    _write_session_cas(
+        destination["key"],
+        expected=destination["session_expected"],
+        final=destination["session_final"],
+        label="destination session metadata",
+    )
+
+
+def _finish_assume_source(journal: dict[str, Any]) -> None:
+    _validate_assume_recovery(journal, roll_forward=True)
+    source = journal["source"]
+    same_key = bool(source["same_key"])
+    if not source["keep"] and not same_key:
+        directory = Path(source["directory"])
+        profile = str(source["profile"])
+        for kind in ("credentials", "config"):
+            final_values = source["original"][kind]
+            _write_section_cas(
+                directory / kind,
+                _section(profile, config=kind == "config"),
+                expected=source["expected"][kind],
+                final=_original_section_state(final_values),
+                values=final_values,
+                label=f"source {kind} section",
+            )
+    legacy = source.get("legacy_backup")
+    if legacy and not source["keep"]:
+        path = Path(str(legacy["path"])).absolute()
+        if path.exists():
+            if _file_fingerprint(path) != legacy.get("fingerprint"):
+                _assume_recovery_error(f"legacy credential backup {path}")
+            path.unlink()
+    _remove_assume_cache(journal, strict=True)
+    if not same_key:
+        _write_session_cas(
+            source["key"],
+            expected=source["session_expected"],
+            final=source["session_final"],
+            label="source session metadata",
+        )
+
+
+def _recover_assume_journal(journal: dict[str, Any]) -> None:
+    """Recover by finishing restriction/logout, never restoring expanded source auth."""
+    if journal.get("schema_version") != 2:
+        raise _configs.OperationalError("Unsupported AssumeRole transaction journal.")
+    destination = journal["destination"]
+    directory = Path(destination["directory"])
+    profile = str(destination["profile"])
+    credentials = _section_state(directory / "credentials", profile)
+    installed = credentials == destination["final"]["credentials"]
+    prepared = journal.get("phase") == "prepared"
+    if not installed and not (
+        prepared and credentials == destination["expected"]["credentials"]
+    ):
+        _assume_recovery_error("destination credential section")
+    _validate_assume_recovery(journal, roll_forward=installed)
+    if installed:
+        _install_assume_destination(journal)
+        _finish_assume_source(journal)
+    _commit()
+
+
+def assume_role(
+    context: _configs.Context, prepared: AssumeRolePlan | None = None
+) -> _configs.Result:
+    """Execute one prepared AssumeRole plan with secret-free roll-forward recovery."""
+    plan = prepared or prepare_assume_role(context)
+    if not isinstance(plan, AssumeRolePlan):
+        raise TypeError("assume_role requires prepare_assume_role output")
+    data = plan._data
+    if plan._consumed:
+        raise AssumePlanChanged(
+            "AssumeRole plan has already been consumed; prepare again."
+        )
+    if plan._arguments_fingerprint != _assume_arguments_fingerprint(context.args):
+        raise AssumePlanChanged(
+            "AssumeRole plan changed after preview; no local credential changes were "
+            "made. Review a fresh preview and retry."
+        )
+    plan._consumed = True
+    credentials, metadata = _assume(
+        data["authenticated"],
+        data["role"],
+        policy=data["policy"],
+        source_profile=data["source_profile"],
+        args=context.args,
+        target=data["target"],
+        external_id=data["external_id"],
+        boundary_name=data["boundary_name"],
+        effective_duration=data["effective_duration"],
+        resolved_policy=data["resolved_policy"],
+    )
+    plan._consumed = False
+    _revalidate_assume_plan(context, plan)
+    plan._consumed = True
+    journal = _build_assume_journal(data, context.args, credentials, metadata)
+    _write_assume_journal(journal)
+    try:
+        destination = cast("Path", data["destination"])
+        credential_values = {
+            "aws_access_key_id": credentials["AccessKeyId"],
+            "aws_secret_access_key": credentials["SecretAccessKey"],
+            "aws_session_token": credentials["SessionToken"],
+        }
+        _write_section_cas(
+            destination / "credentials",
+            str(data["destination_profile"]),
+            expected=journal["destination"]["expected"]["credentials"],
+            final=journal["destination"]["final"]["credentials"],
+            values={"exists": True, "values": credential_values},
+            label="destination credential section",
+        )
+        _install_assume_destination(journal)
+        journal["phase"] = "destination-installed"
+        _write_assume_journal(journal)
+        _finish_assume_source(journal)
+        journal["phase"] = "source-removed"
+        _write_assume_journal(journal)
+        _commit()
+    except Exception:
+        persisted = json.loads(_journal_path().read_text(encoding="utf-8"))
+        _recover_assume_journal(persisted)
+        raise
+
+    ecr_owners: dict[str, tuple[str, list[str]]] = {}
+    source_runtime = journal["source"]["runtime"]
+    if source_runtime.get("ecr") and not data["same_key"]:
+        ecr_owners[data["source_key"]] = (
+            str(source_runtime.get("ecr_engine") or "docker"),
+            list(source_runtime["ecr"]),
+        )
+    destination_session = journal["destination"]["session"]
+    if destination_session.get("ecr"):
+        ecr_owners[data["destination_key"]] = (
+            str(destination_session.get("ecr_engine") or "docker"),
+            list(destination_session["ecr"]),
+        )
+    failures = []
+    if ecr_owners and not bool(getattr(context.args, "keep_ecr", False)):
+        failures = _cleanup_assume_ecr(ecr_owners)
+    public = _assume_public_plan(data)
+    public.update(
+        targetAccount=metadata["target_account"],
+        expiresAt=metadata["expires_at"],
+        policyProvenance=metadata.get("policy_provenance"),
+        ecrResidue=failures,
+    )
+    if failures:
+        return _configs.Result(
+            "ASSUME_ROLE_ECR_RESIDUE",
+            "Role credentials were installed and the local credential handoff "
+            "completed, but one or more ECR logouts failed; tracked residue remains.",
+            1,
+            "stderr",
+            public,
+            kind="warning",
+        )
+    return _configs.Result(
+        "ASSUME_ROLE",
+        f"Assumed {data['role']} into profile {data['destination_profile']}.",
+        data=public,
     )
 
 

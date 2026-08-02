@@ -23,3 +23,15 @@ when ownership cannot be proven.
 Logout never preserves intermediate authenticated credentials. It edits only the
 managed profile section using fingerprints and leaves unrelated file data
 untouched.
+
+Standalone role assumption follows the same contract. The assumed credentials
+are obtained before the local transaction begins; then the destination is
+installed and the managed source is removed unless `--keep-source` was explicit.
+In-place `--self` retains only the pre-login backup required by logout, not a
+second copy of the broader authenticated session. Preview and JSON surfaces omit
+credential values, backups, and policy documents.
+
+An assumption confirmation is bound to one immutable prepared plan. Hacksaws
+does not re-resolve a target, boundary, role, policy, duration, or endpoint
+after approval, and it aborts if source, destination, cache, or configuration
+state changes before the credential transaction begins.

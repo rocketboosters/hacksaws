@@ -11,7 +11,7 @@ account-scoped, previewed, and recoverable where AWS permits it.
 
 ## Install and run
 
-Python 3.12 or newer is required. Run the published CLI without installing it:
+Python 3.13 or newer is required. Run the published CLI without installing it:
 
 ```shell
 uvx hacksaws --help
@@ -98,6 +98,20 @@ hacksaws web in --target hacw
 Durations accept forms such as `15m`, `15minutes`, `1h`, `hour`, `600s`, and
 `600seconds`. Rigid aliases `--htl`, `--mtl`, and `--stl` accept floating-point
 hours, minutes, and seconds; sub-second results round to whole seconds.
+
+If credentials are already logged in, constrain them without repeating the
+authentication step:
+
+```shell
+hacksaws assume admin --name horizon \
+  --role AgentSession --policy CloudWatchReadOnlyAccess \
+  --to default:agent
+```
+
+The destination is always explicit. The source is removed after a successful
+handoff unless `--keep-source` is deliberate; use `--self` for an intentional
+in-place replacement. See [Assume a role](docs/assume-role.md) for destination,
+confirmation, ECR, and automation safeguards.
 
 ## Inspect before acting
 
@@ -222,6 +236,7 @@ models.
 
 - [Command cheat sheet](CHEATSHEET.md)
 - [Login pathways](docs/login.md)
+- [Assume a role from an existing session](docs/assume-role.md)
 - [Profiles, status, and logout](docs/profiles-and-sessions.md)
 - [IAM policies](docs/iam-policies.md)
 - [IAM roles and trust](docs/iam-roles-and-trust.md)

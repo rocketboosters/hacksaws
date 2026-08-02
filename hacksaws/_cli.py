@@ -188,6 +188,105 @@ def _logout_arguments(parser: argparse.ArgumentParser) -> None:
     _ecr_arguments(parser)
 
 
+def _assume_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the explicit role-assumption workflow without login-only flags."""
+    parser.add_argument(
+        "profile",
+        nargs="?",
+        metavar="SOURCE",
+        help=(
+            "Source AWS profile. A leading non-alphanumeric character selects a "
+            "saved target; +TARGET is the documented form."
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        "--account-name",
+        dest="aws_account_name",
+        help="Source location name, selecting ~/.aws-NAME (default: ~/.aws).",
+    )
+    parser.add_argument(
+        "--target",
+        help="Saved target supplying source and destination endpoints.",
+    )
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
+        "--self",
+        dest="self_destination",
+        action="store_true",
+        help="Explicitly replace the source endpoint with assumed-role credentials.",
+    )
+    destination.add_argument(
+        "--to",
+        metavar="LOCATION:PROFILE",
+        help="Write assumed credentials to this logical location and profile.",
+    )
+    parser.add_argument(
+        "--to-directory",
+        metavar="PATH",
+        help="Write to an explicit AWS directory; requires --to-profile.",
+    )
+    parser.add_argument(
+        "--to-profile",
+        metavar="PROFILE",
+        help="Write to PROFILE in the source AWS location.",
+    )
+    role = parser.add_mutually_exclusive_group()
+    role.add_argument("--role", help="Concrete IAM role name or ARN to assume.")
+    role.add_argument(
+        "--boundary",
+        "--as",
+        dest="boundary",
+        help="Saved boundary supplying the concrete role and optional policy.",
+    )
+    parser.add_argument(
+        "--policy",
+        help="Optional session policy name, ARN, stored name, or local file.",
+    )
+    parser.add_argument("--external-id", help="External ID supplied to AssumeRole.")
+    parser.add_argument(
+        "--account", help="Configured account name or ID asserted for the role target."
+    )
+    parser.add_argument(
+        "--session-name", help="Assumed-role session name shown in AWS audit records."
+    )
+    parser.add_argument(
+        "--region", help="AWS region used for credential resolution and console links."
+    )
+    _duration_arguments(parser)
+    parser.add_argument(
+        "--keep-source",
+        action="store_true",
+        help="Leave live source credentials in place after writing the destination.",
+    )
+    parser.add_argument(
+        "--keep-ecr",
+        action="store_true",
+        help="Preserve Hacksaws-tracked ECR authorization while clearing the source.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Allow replacement of a destination that already contains credentials.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Approve the displayed assumption plan without prompting.",
+    )
+    parser.set_defaults(
+        action="assume",
+        directory="~/.aws",
+        force=False,
+        ecr=False,
+        podman=False,
+        ecr_region=[],
+        remote=False,
+        mfa_code=None,
+    )
+
+
 def _credential_selector(parser: argparse.ArgumentParser) -> None:
     selector = parser.add_mutually_exclusive_group()
     selector.add_argument(
@@ -355,6 +454,29 @@ def _create_parser() -> argparse.ArgumentParser:
 
     logout = types.add_parser("logout", help="Remove local Hacksaws login state.")
     _logout_arguments(logout)
+    assume = types.add_parser(
+        "assume",
+        help="Assume a role from existing temporary credentials.",
+        description=(
+            "Assume a concrete IAM role from an existing AWS profile, write the "
+            "result to an explicit destination, and optionally clear the source."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  hacksaws assume admin --name horizon --role AgentSession --to agent:default\n"
+            "  hacksaws assume admin --role AgentSession --to-directory ./agent-aws --to-profile debug\n"
+            "  hacksaws assume admin --boundary logs-read --to-profile agent\n"
+            "  hacksaws assume +prod-agent\n"
+            "  hacksaws assume debug --role AgentSession --self\n\n"
+            "Use --self only for deliberate in-place replacement. Writing the same "
+            "endpoint with --to is supported but emits an additional warning.\n"
+            "Saved targets own their source and destination and therefore reject "
+            "--self and other endpoint overrides. An unbounded target may add only "
+            "one saved --boundary/--as plus duration and lifecycle controls."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _assume_arguments(assume)
     status = types.add_parser("status", help="Show Hacksaws-managed login sessions.")
     status.add_argument("--profile", help="Filter by destination profile.")
     status_location = status.add_mutually_exclusive_group()
@@ -692,6 +814,210 @@ def _validate_login(namespace: argparse.Namespace) -> None:
             raise _configs.OperationalError(
                 "A saved target is a secure preset; source, destination, role, and policy cannot be overridden."
             )
+
+
+def _validate_assume(namespace: argparse.Namespace) -> None:
+    """Validate assume-only grammar before AWS discovery or confirmation."""
+    profile = getattr(namespace, "profile", None)
+    if profile in {".", "default"}:
+        namespace.profile = "default"
+        profile = "default"
+    if profile and not profile[0].isalnum():
+        if namespace.target:
+            raise _configs.OperationalError("Specify a saved target only once.")
+        if len(profile) == 1:
+            raise _configs.OperationalError("A target shorthand requires a name.")
+        namespace.target = "+" + profile[1:]
+        namespace.profile = None
+        profile = None
+    if namespace.target and not namespace.target.startswith("+"):
+        namespace.target = "+" + namespace.target
+    if not (profile or namespace.target):
+        raise _configs.OperationalError(
+            "Assume requires a source profile or saved target."
+        )
+    if namespace.self_destination and namespace.keep_source:
+        raise _configs.OperationalError("--self cannot be combined with --keep-source.")
+    if namespace.self_destination and (namespace.to_directory or namespace.to_profile):
+        raise _configs.OperationalError(
+            "--self is mutually exclusive with --to-directory/--to-profile."
+        )
+    if namespace.to and (namespace.to_directory or namespace.to_profile):
+        raise _configs.OperationalError(
+            "--to is mutually exclusive with --to-directory/--to-profile."
+        )
+    if namespace.to_directory and not namespace.to_profile:
+        raise _configs.OperationalError("--to-directory requires --to-profile.")
+    if namespace.to:
+        location, separator, destination_profile = namespace.to.partition(":")
+        if not separator or not location or not destination_profile:
+            raise _configs.OperationalError("--to must be LOCATION:PROFILE.")
+    data = _state.load_config()
+    target: dict[str, Any] | None = None
+    if namespace.target:
+        _, target = _state.get_resource(data, "target", namespace.target.lstrip("+"))
+        if namespace.self_destination:
+            raise _configs.OperationalError(
+                "A saved target owns its destination and cannot be combined with --self."
+            )
+        if namespace.aws_account_name:
+            raise _configs.OperationalError(
+                "A saved target supplies its source location; omit --name."
+            )
+        if namespace.to or namespace.to_directory or namespace.to_profile:
+            raise _configs.OperationalError(
+                "A saved target supplies its destination; use --self for an explicit "
+                "in-place assumption."
+            )
+        saved_boundary = target.get("boundary")
+        if saved_boundary:
+            overrides = [
+                option
+                for option, value in (
+                    ("--role", namespace.role),
+                    ("--boundary/--as", namespace.boundary),
+                    ("--policy", namespace.policy),
+                    ("--account", namespace.account),
+                    ("--external-id", namespace.external_id),
+                    ("--session-name", namespace.session_name),
+                )
+                if value
+            ]
+            if overrides:
+                raise _configs.OperationalError(
+                    "A bounded target supplies its role contract and cannot be "
+                    "combined with " + ", ".join(overrides) + "."
+                )
+        else:
+            overrides = [
+                option
+                for option, value in (
+                    ("--role", namespace.role),
+                    ("--policy", namespace.policy),
+                    ("--account", namespace.account),
+                    ("--external-id", namespace.external_id),
+                    ("--session-name", namespace.session_name),
+                    ("--region", namespace.region),
+                )
+                if value
+            ]
+            if overrides:
+                raise _configs.OperationalError(
+                    "An unbounded target may add one saved --boundary/--as, not "
+                    + ", ".join(overrides)
+                    + "."
+                )
+        if not (
+            target.get("destination_location")
+            or target.get("destination_directory")
+            or target.get("destination_profile")
+        ):
+            raise _configs.OperationalError(
+                "Saved target has no destination; update it or use --self."
+            )
+    elif not (
+        namespace.self_destination
+        or namespace.to
+        or namespace.to_directory
+        or namespace.to_profile
+    ):
+        raise _configs.OperationalError(
+            "Assume requires --self, --to LOCATION:PROFILE, --to-profile PROFILE, "
+            "or a saved target destination."
+        )
+    concrete_boundary = namespace.boundary or (target or {}).get("boundary")
+    if not (namespace.role or concrete_boundary):
+        raise _configs.OperationalError(
+            "Assume requires a concrete --role, saved --boundary/--as, or bounded "
+            "target."
+        )
+    if namespace.boundary:
+        _state.get_resource(data, "boundary", namespace.boundary)
+
+
+def _assume_preview_text(preview: dict[str, Any]) -> str:
+    """Render a secret-free assume plan in a stable, reviewable layout."""
+    preferred = (
+        ("source", "Source"),
+        ("destination", "Destination"),
+        ("role", "Role"),
+        ("policy", "Session policy"),
+        ("duration", "Duration"),
+        ("durationSeconds", "Duration (seconds)"),
+        ("account", "Account"),
+        ("partition", "Partition"),
+        ("keepSource", "Keep source"),
+        ("keepEcr", "Keep ECR"),
+        ("replace", "Replace destination"),
+    )
+    lines = ["Assume role plan:"]
+    rendered: set[str] = set()
+    for key, label in preferred:
+        if key not in preview:
+            continue
+        value = preview[key]
+        text = (
+            json.dumps(value, sort_keys=True)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        lines.append(f"  {label}: {text}")
+        rendered.add(key)
+    for key, value in preview.items():
+        if key in rendered or key == "warnings":
+            continue
+        text = (
+            json.dumps(value, sort_keys=True)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        lines.append(f"  {key}: {text}")
+    warnings = preview.get("warnings", [])
+    if isinstance(warnings, list):
+        lines.extend(f"WARNING: {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def _run_assume(context: _configs.Context) -> _configs.Result:
+    """Preview, confirm, then execute one source-to-destination assumption."""
+    _validate_assume(context.args)
+    plan = _sessions.prepare_assume_role(context)
+    preview = _sessions.assume_role_preview(plan)
+    rendered = _assume_preview_text(preview)
+    if not bool(context.args.yes):
+        if _configs.json_output_enabled() or not sys.stdin.isatty():
+            return _configs.Result(
+                "ASSUME_CONFIRMATION_REQUIRED",
+                "Assume role requires --yes in non-interactive or JSON mode.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                data={"preview": preview},
+                kind="warning",
+            )
+        prompt = f"{rendered}\nType exactly 'yes' to apply this plan:\n> "
+        if input(prompt).strip() != "yes":
+            return _configs.Result(
+                "ASSUME_CANCELLED",
+                "Assume role cancelled; no credentials were changed.",
+                _configs.EXIT_CANCELLED,
+                "stderr",
+                data={"preview": preview},
+                kind="warning",
+            )
+        context.args.yes = True
+    result = _sessions.assume_role(context, plan)
+    data = dict(result.data) if isinstance(result.data, dict) else {}
+    data.setdefault("preview", preview)
+    return _configs.Result(
+        result.code,
+        result.message,
+        result.exit_code,
+        result.stream,
+        data=data,
+        details=result.details,
+        repairs=result.repairs,
+        kind=result.kind,
+    )
 
 
 def _run_mfa(context: _configs.Context) -> _configs.Result:
@@ -1851,6 +2177,8 @@ def _console_main_invocation(arguments: Sequence[str] | None = None) -> _configs
                 result = _run_mfa(_configs.Context(args=namespace))
             elif namespace.access_type in {"pk", "web"}:
                 result = _run_browser(_configs.Context(args=namespace))
+            elif namespace.access_type == "assume":
+                result = _run_assume(_configs.Context(args=namespace))
             elif namespace.access_type in {"iam", "remote"}:
                 result = _iam_cli.dispatch(namespace)
             elif namespace.access_type == "cleanup":

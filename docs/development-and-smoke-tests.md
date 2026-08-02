@@ -14,7 +14,9 @@ layout follows Camber Ops conventions and works with `mpx --me check`.
 Live IAM smoke tests are explicit and never run in ordinary CI. They require an
 account/target guard, create a tagged role and customer-managed policy under
 `/hacksaws-test/`, exercise trust/inline/managed attachment/version behavior,
-then run cleanup dry-run, cleanup, and absence verification.
+assume the unique role with a restrictive local session policy into an isolated
+temporary profile, verify and log out that profile without changing the guarded
+source, then run cleanup dry-run, cleanup, and absence verification.
 
 Set all four guards explicitly before invoking the live marker:
 
@@ -23,7 +25,7 @@ HACKSAWS_LIVE_AWS=1 \
 HACKSAWS_LIVE_AWS_CLEANUP=1 \
 HACKSAWS_LIVE_AWS_ACCOUNT_ID=123456789012 \
 HACKSAWS_LIVE_AWS_TARGET=smoke-admin \
-uv run pytest -m live_aws
+uv run python hacksaws/tests/scripts/live_iam_smoke.py
 ```
 
 The account ID must exactly match the target's caller identity. The target must

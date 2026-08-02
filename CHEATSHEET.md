@@ -67,6 +67,46 @@ named `--boundary`/`--as`.
 character selects target `NAME`; choose a prefix that is convenient in your
 shell. `--target NAME` is always the unambiguous flag form.
 
+## Assume from an existing session
+
+```shell
+hacksaws assume SOURCE --role ROLE_OR_ARN \
+  (--self | --to LOCATION:PROFILE | --to-profile PROFILE | \
+   --to-directory PATH --to-profile PROFILE) [OPTIONS]
+hacksaws assume SOURCE --boundary NAME (--self | --to ... | --to-profile ...)
+hacksaws assume +TARGET [OPTIONS]
+hacksaws assume --target TARGET [OPTIONS]
+```
+
+Common options:
+
+```text
+-n, --name LOCATION           source ~/.aws-LOCATION
+--policy VALUE                ARN, path, stored name, or remote policy name
+--external-id VALUE           role trust external ID
+--account NAME_OR_ID          assert target account
+--session-name NAME           CloudTrail-visible role session name
+--region REGION               credential resolution and installed region
+--to-directory PATH           explicit directory; requires --to-profile
+--duration/--ttl, --htl/--mtl/--stl
+--keep-source                 retain the live source after successful handoff
+--keep-ecr                    retain tracked ECR authorization
+--replace                     allow an existing unmanaged destination
+--yes                         approve the secret-free plan noninteractively
+```
+
+The destination is mandatory. `--self` is explicit in-place replacement and
+conflicts with `--keep-source`; spelling the same endpoint with `--to` emits an
+extra warning. Managed sources are cleared by default. Unmanaged sources require
+`--keep-source` and cannot be used in place. There is no assume `--force`.
+
+Saved targets reject source and destination overrides, including `--self`.
+Bounded targets also reject role/policy/account overrides. An unbounded target
+may add a saved `--boundary`/`--as`, but no direct role, policy, account,
+external ID, session name, or region. Duration and lifecycle controls remain
+available. Noninteractive and JSON executions require `--yes`. AWS requires a
+minimum 900-second session; role chaining caps duration at 3,600 seconds.
+
 ## Named resources
 
 All of account, boundary, and target support:

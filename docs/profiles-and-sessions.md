@@ -28,3 +28,8 @@ hacksaws logout --all --except "horizon:prod*" --except "+hacw"
 
 `--except` requires `--all`. Patterns match canonical `location:profile` names
 and target aliases. Tracked ECR logins are removed unless `--keep-ecr` is used.
+
+`hacksaws assume` normally clears its managed source after installing the role
+credentials at the destination. `--keep-source` deliberately retains both;
+`--self` performs an in-place handoff and therefore cannot keep a second live
+source. See [Assume a role](assume-role.md).

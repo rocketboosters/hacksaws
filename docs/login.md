@@ -45,6 +45,10 @@ characters are the target name.
 ECR login deliberately uses the intermediate authenticated credentials before
 the final boundary credentials replace them.
 
+To constrain credentials that are already logged in without repeating MFA or
+browser authentication, use the standalone [`hacksaws assume`](assume-role.md)
+workflow.
+
 ## Destination aliases
 
 `.` and `default` mean `~/.aws` when used as locations and the `default` profile
