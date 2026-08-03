@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import fnmatch
 import json
@@ -17,6 +18,7 @@ from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import TypedDict
 
 from hacksaws import _audit
@@ -26,11 +28,11 @@ from hacksaws._duration import parse_count
 from hacksaws._duration import parse_duration
 
 if TYPE_CHECKING:
-    import argparse
     from collections.abc import Iterator
 
-SCHEMA_VERSION = 1
-REDACTION_VERSION = 1
+SCHEMA_VERSION = 2
+REDACTION_VERSION = 2
+EVENT_SCHEMA_VERSION = 1
 DEFAULT_MAX_AGE = 90 * 24 * 60 * 60
 DEFAULT_MAX_ENTRIES = 10_000
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
@@ -49,6 +51,66 @@ _current: ContextVar[str | None] = ContextVar("hacksaws_history_id", default=Non
 _suspended: ContextVar[bool] = ContextVar("hacksaws_history_suspended", default=False)
 _initialization_lock = threading.Lock()
 _initialized_databases: set[Path] = set()
+
+_SECRET_DESTS = {"external_id", "mfa_code"}
+_PATH_DESTS = {
+    "directory",
+    "file",
+    "metadata_file",
+    "output",
+    "source_directory",
+    "to_directory",
+    "trust_policy",
+    "zip",
+}
+_IDENTIFIER_DESTS = {
+    "account",
+    "aws_account_name",
+    "boundary",
+    "destination",
+    "location",
+    "policy",
+    "profile",
+    "region",
+    "resource_name",
+    "role",
+    "save_boundary",
+    "save_name",
+    "save_role_account",
+    "save_source_account",
+    "source_account",
+    "source_profile",
+    "store_policy_as",
+    "target",
+    "target_role",
+    "to",
+    "to_profile",
+}
+_DURATION_DESTS = {"duration", "htl", "lifespan", "mtl", "stl"}
+_SAFE_FORMATS = {"json", "yaml", "yml", "toml", "zip"}
+_MAX_OBSERVED_ITEMS = 64
+_MAX_OPAQUE_COUNT = 255
+_MAX_EVENT_BYTES = 4096
+_MAX_REGISTERED_ACCOUNTS = 2
+PARSE_FAILURE_KINDS = (
+    "unknown-command",
+    "unknown-subcommand",
+    "unknown-option",
+    "misplaced-option",
+    "missing-command",
+    "missing-subcommand",
+    "missing-required-option",
+    "missing-option-value",
+    "invalid-choice",
+    "invalid-value",
+    "extra-positional",
+    "mutually-exclusive",
+    "duplicate-option",
+    "conflicting-option",
+    "invalid-combination",
+    "invalid-syntax",
+)
+PARSE_PHASES = ("global", "selector", "argparse", "semantic")
 
 
 class HistoryError(RuntimeError):
@@ -209,7 +271,15 @@ def _migrate(connection: sqlite3.Connection) -> None:
                 "CREATE INDEX invocation_outcome "
                 "ON invocations(outcome, started_at DESC)"
             )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.execute("PRAGMA user_version = 1")
+        version = 1
+    if version == 1:
+        with connection:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS event_invocation_kind "
+                "ON events(invocation_id, kind, occurred_at, id)"
+            )
+            connection.execute("PRAGMA user_version = 2")
 
 
 def _schema_too_new_message(version: int) -> str:
@@ -247,6 +317,418 @@ def _canonical_command(args: argparse.Namespace) -> tuple[str, str | None]:
         if _COMMAND_SEGMENT.fullmatch(segment) and segment not in parts:
             parts.append(segment)
     return ".".join(parts), alias
+
+
+def _parser_children(
+    parser: argparse.ArgumentParser,
+) -> tuple[argparse._SubParsersAction[Any] | None, dict[str, argparse.ArgumentParser]]:
+    for action in parser._actions:  # noqa: SLF001 - argparse exposes no public tree API
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return action, dict(action.choices)
+    return None, {}
+
+
+def _option_catalog(
+    parser: argparse.ArgumentParser,
+) -> dict[str, tuple[argparse.Action, str]]:
+    """Return every registered spelling with a stable canonical long name."""
+    catalog: dict[str, tuple[argparse.Action, str]] = {}
+    seen: set[int] = set()
+    pending = [parser]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for action in current._actions:  # noqa: SLF001
+            if action.option_strings:
+                canonical = next(
+                    (
+                        value
+                        for value in action.option_strings
+                        if value.startswith("--")
+                    ),
+                    action.option_strings[0],
+                ).lstrip("-")
+                for spelling in action.option_strings:
+                    catalog.setdefault(spelling, (action, canonical))
+            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+                pending.extend(action.choices.values())
+    return catalog
+
+
+def _active_options(
+    parsers: list[argparse.ArgumentParser],
+) -> dict[str, tuple[argparse.Action, str]]:
+    result: dict[str, tuple[argparse.Action, str]] = {}
+    for parser in parsers:
+        for action in parser._actions:  # noqa: SLF001
+            if not action.option_strings:
+                continue
+            canonical = next(
+                (value for value in action.option_strings if value.startswith("--")),
+                action.option_strings[0],
+            ).lstrip("-")
+            for spelling in action.option_strings:
+                result[spelling] = (action, canonical)
+    return result
+
+
+def _value_class(action: argparse.Action) -> str:
+    if action.dest in _SECRET_DESTS:
+        return "secret"
+    if action.dest in _PATH_DESTS:
+        return "path"
+    if action.choices is not None:
+        return "enum"
+    if action.dest in _DURATION_DESTS:
+        return "duration"
+    if action.dest in _IDENTIFIER_DESTS:
+        return "identifier"
+    return "value"
+
+
+def _takes_value(action: argparse.Action) -> bool:
+    return action.nargs != 0
+
+
+def _safe_format(value: str) -> str | None:
+    suffix = Path(value).suffix.casefold().removeprefix(".")
+    return suffix if suffix in _SAFE_FORMATS else ("other" if suffix else None)
+
+
+def _canonical_choice(
+    choices: dict[str, argparse.ArgumentParser], value: str
+) -> tuple[str, argparse.ArgumentParser] | None:
+    selected = choices.get(value)
+    if selected is None:
+        return None
+    canonical = next(
+        (name for name, parser in choices.items() if parser is selected), value
+    )
+    return canonical, selected
+
+
+def observe_arguments(  # noqa: C901, PLR0912, PLR0915
+    parser: argparse.ArgumentParser, arguments: list[str]
+) -> dict[str, object]:
+    """Build a bounded grammar-only observation without retaining raw values."""
+    catalog = _option_catalog(parser)
+    catalog.update(
+        {
+            "--json": (argparse.Action([], "json", nargs=0), "json"),
+            "--no-color": (argparse.Action([], "color", nargs=0), "no-color"),
+            "--color": (argparse.Action([], "color", nargs=None), "color"),
+        }
+    )
+    parsers = [parser]
+    current = parser
+    command: list[str] = []
+    aliases: list[str] = []
+    options: dict[str, dict[str, object]] = {}
+    positionals: list[dict[str, object]] = []
+    positional_index = 0
+    opaque_options = 0
+    opaque_positionals = 0
+    opaque_tail = 0
+    misplaced: list[str] = []
+    missing_values: list[str] = []
+    truncated = False
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":  # noqa: S105
+            opaque_tail = min(len(arguments) - index - 1, _MAX_OPAQUE_COUNT)
+            truncated = truncated or len(arguments) - index - 1 > _MAX_OPAQUE_COUNT
+            break
+        spelling, equals, attached = token.partition("=")
+        if token.startswith("-"):
+            active = _active_options(parsers)
+            found = active.get(spelling)
+            misplaced_option = False
+            if found is None:
+                found = catalog.get(spelling)
+                misplaced_option = found is not None
+            if found is None:
+                opaque_options = min(opaque_options + 1, _MAX_OPAQUE_COUNT)
+                truncated = truncated or opaque_options == _MAX_OPAQUE_COUNT
+                index += 1
+                continue
+            action, canonical = found
+            if misplaced_option and len(misplaced) < _MAX_OBSERVED_ITEMS:
+                misplaced.append(canonical)
+            item = options.setdefault(
+                canonical,
+                {
+                    "name": canonical,
+                    "count": 0,
+                    "valueClass": _value_class(action),
+                    "valueState": "none" if not _takes_value(action) else "missing",
+                },
+            )
+            previous_count = item.get("count")
+            count = previous_count if isinstance(previous_count, int) else 0
+            item["count"] = min(count + 1, _MAX_OPAQUE_COUNT)
+            if _takes_value(action):
+                value: str | None = attached if equals else None
+                if value is None and index + 1 < len(arguments):
+                    candidate = arguments[index + 1]
+                    if candidate != "--" and not candidate.startswith("-"):
+                        value = candidate
+                        index += 1
+                if value is None or value == "":
+                    if canonical not in missing_values:
+                        missing_values.append(canonical)
+                else:
+                    item["valueState"] = "present"
+                    if action.choices is not None:
+                        item["valueState"] = (
+                            "valid" if value in action.choices else "invalid"
+                        )
+                    if item["valueClass"] == "path":
+                        format_name = _safe_format(value)
+                        if format_name:
+                            item["format"] = format_name
+            index += 1
+            continue
+        subparsers, choices = _parser_children(current)
+        if subparsers is not None:
+            choice = _canonical_choice(choices, token)
+            if choice is not None:
+                canonical, selected = choice
+                command.append(canonical)
+                if canonical != token:
+                    aliases.append(token)
+                elif len(command) == 1 and token == "web":  # noqa: S105
+                    command[-1] = "pk"
+                    aliases.append("web")
+                current = selected
+                parsers.append(selected)
+                positional_index = 0
+                index += 1
+                continue
+            opaque_positionals = min(opaque_positionals + 1, _MAX_OPAQUE_COUNT)
+            index += 1
+            continue
+        positional_actions = [
+            action
+            for action in current._actions  # noqa: SLF001
+            if not action.option_strings
+            and not isinstance(action, argparse._SubParsersAction)  # noqa: SLF001
+            and action.dest != argparse.SUPPRESS
+        ]
+        if positional_index < len(positional_actions):
+            action = positional_actions[positional_index]
+            if len(positionals) < _MAX_OBSERVED_ITEMS:
+                positionals.append(
+                    {
+                        "role": action.dest.replace("_", "-"),
+                        "valueClass": _value_class(action),
+                        "present": True,
+                    }
+                )
+            if action.nargs not in {"*", "+"}:
+                positional_index += 1
+        else:
+            opaque_positionals = min(opaque_positionals + 1, _MAX_OPAQUE_COUNT)
+        index += 1
+    if not command and opaque_positionals:
+        inferred = "unknown-command"
+    elif missing_values:
+        inferred = "missing-option-value"
+    elif misplaced:
+        inferred = "misplaced-option"
+    elif opaque_options:
+        inferred = "unknown-option"
+    elif opaque_positionals:
+        inferred = "extra-positional"
+    else:
+        inferred = "invalid-syntax"
+    canonical_command = ".".join(command) if command else "unknown"
+    help_command = "hacksaws " + canonical_command.replace(".", " ")
+    if canonical_command != "unknown":
+        help_command += " --help"
+    return {
+        "command": canonical_command,
+        "alias": ".".join(aliases) or None,
+        "options": list(options.values())[:_MAX_OBSERVED_ITEMS],
+        "positionals": positionals,
+        "opaque": {
+            "options": opaque_options,
+            "positionals": opaque_positionals,
+            "tail": opaque_tail,
+            "truncated": truncated,
+        },
+        "misplacedOptions": sorted(set(misplaced)),
+        "missingValues": missing_values[:_MAX_OBSERVED_ITEMS],
+        "inferredKind": inferred,
+        "helpCommand": help_command,
+    }
+
+
+def observe_arguments_safely(
+    parser: argparse.ArgumentParser, arguments: list[str]
+) -> dict[str, object]:
+    """Isolate history observation failures from command execution."""
+    try:
+        return observe_arguments(parser, arguments)
+    except Exception:  # noqa: BLE001 - telemetry must never change CLI behavior.
+        return {
+            "command": "unknown",
+            "alias": None,
+            "options": [],
+            "positionals": [],
+            "opaque": {
+                "options": 0,
+                "positionals": 0,
+                "tail": 0,
+                "truncated": True,
+            },
+            "misplacedOptions": [],
+            "missingValues": [],
+            "inferredKind": "invalid-syntax",
+            "helpCommand": "hacksaws --help",
+        }
+
+
+def note_parse_failure(
+    handle: HistoryHandle,
+    observation: dict[str, object],
+    *,
+    phase: str,
+    kind: str | None = None,
+) -> None:
+    """Persist one bounded parse event without raw argv or error text."""
+    if not handle.enabled or handle.id is None:
+        return
+    selected_kind = kind or str(observation.get("inferredKind") or "invalid-syntax")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", selected_kind):
+        selected_kind = "invalid-syntax"
+    safe_phase = (
+        phase if phase in {"global", "selector", "argparse", "semantic"} else "argparse"
+    )
+    payload = {
+        "eventSchemaVersion": EVENT_SCHEMA_VERSION,
+        "redactionVersion": REDACTION_VERSION,
+        "phase": safe_phase,
+        "command": observation.get("command", "unknown"),
+        "alias": observation.get("alias"),
+        "structure": {
+            key: observation.get(key)
+            for key in (
+                "options",
+                "positionals",
+                "opaque",
+                "misplacedOptions",
+                "missingValues",
+            )
+        },
+        "repair": {"helpCommand": observation.get("helpCommand", "hacksaws --help")},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _MAX_EVENT_BYTES:
+        payload["structure"] = {
+            "opaque": observation.get("opaque", {}),
+            "truncated": True,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    try:
+        with _database() as connection:
+            connection.execute(
+                "UPDATE invocations SET command = ?, "
+                "alias_used = COALESCE(?, alias_used), updated_at = ? WHERE id = ?",
+                (
+                    observation.get("command", "unknown"),
+                    observation.get("alias"),
+                    _now(),
+                    handle.id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO events (invocation_id, occurred_at, kind, data_json) "
+                "VALUES (?, ?, ?, ?)",
+                (handle.id, _now(), f"parse.{selected_kind}", encoded),
+            )
+    except (OSError, sqlite3.Error, HistoryError):
+        return
+
+
+def note_session_save(
+    *,
+    status: str,
+    target: object = None,
+    boundary: object = None,
+    requested: bool,
+    credentials_active: bool,
+) -> None:
+    """Record only the safe outcome of a post-credential configuration save."""
+    if status not in {"saved", "noop", "failed", "cancelled"}:
+        return
+    identifier = _current.get()
+    if identifier is None:
+        return
+    payload = {
+        "eventSchemaVersion": EVENT_SCHEMA_VERSION,
+        "redactionVersion": REDACTION_VERSION,
+        "status": status,
+        "target": _safe_identifier(target),
+        "boundary": _safe_identifier(boundary),
+        "requested": requested,
+        "credentialsActive": credentials_active,
+    }
+    try:
+        with _database() as connection:
+            connection.execute(
+                "INSERT INTO events (invocation_id, occurred_at, kind, data_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    identifier,
+                    _now(),
+                    f"session-save.{status}",
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+    except (OSError, sqlite3.Error, HistoryError):
+        return
+
+
+def note_account_registration(
+    *, status: str, created: int, reused: int, refreshed: int
+) -> None:
+    """Record safe account-registration counts separately from bundle saves."""
+    if status not in {"completed", "failed"}:
+        return
+    counts = (created, reused, refreshed)
+    if any(
+        type(value) is not int or not 0 <= value <= _MAX_REGISTERED_ACCOUNTS
+        for value in counts
+    ):
+        return
+    identifier = _current.get()
+    if identifier is None:
+        return
+    payload = {
+        "eventSchemaVersion": EVENT_SCHEMA_VERSION,
+        "redactionVersion": REDACTION_VERSION,
+        "status": status,
+        "created": created,
+        "reused": reused,
+        "refreshed": refreshed,
+    }
+    try:
+        with _database() as connection:
+            connection.execute(
+                "INSERT INTO events (invocation_id, occurred_at, kind, data_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    identifier,
+                    _now(),
+                    f"account-registration.{status}",
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+    except (OSError, sqlite3.Error, HistoryError):
+        return
 
 
 def _safe_identifier(value: object) -> str | None:
@@ -302,12 +784,17 @@ def _safe_namespace(args: argparse.Namespace) -> dict[str, object]:
         value = values.get(key)
         if value is None:
             continue
-        suffix = Path(str(value)).suffix.casefold().removeprefix(".") or "unknown"
-        input_kinds.append({"role": key.replace("_", "-"), "format": suffix})
+        input_kinds.append(
+            {
+                "role": key.replace("_", "-"),
+                "format": _safe_format(str(value)) or "other",
+            }
+        )
     policy = values.get("policy")
     if isinstance(policy, str) and _looks_like_file(policy):
-        suffix = Path(policy).suffix.casefold().removeprefix(".") or "unknown"
-        input_kinds.append({"role": "policy-file", "format": suffix})
+        input_kinds.append(
+            {"role": "policy-file", "format": _safe_format(policy) or "other"}
+        )
     identifiers: dict[str, str] = {}
     for key in (
         "profile",
@@ -577,6 +1064,13 @@ def finish(handle: HistoryHandle, result: object) -> None:
                 and "yes" in flags
             ):
                 confirmation = "yes-flag:bypassed"
+            event_bytes = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(LENGTH(data_json)), 0) FROM events "
+                    "WHERE invocation_id = ?",
+                    (handle.id,),
+                ).fetchone()[0]
+            )
             connection.execute(
                 """
                 UPDATE invocations SET
@@ -602,7 +1096,7 @@ def finish(handle: HistoryHandle, result: object) -> None:
                     selected.get("accountId"),
                     selected.get("partition"),
                     confirmation,
-                    len(encoded.encode("utf-8")) + 512,
+                    len(encoded.encode("utf-8")) + event_bytes + 512,
                     ended,
                     handle.id,
                 ),
@@ -702,7 +1196,38 @@ def _maintain() -> None:
         )
 
 
-def _row_data(row: sqlite3.Row) -> dict[str, object]:
+def _event_data(row: sqlite3.Row) -> dict[str, object]:
+    try:
+        data = json.loads(row["data_json"])
+    except json.JSONDecodeError:
+        data = {"corrupt": True}
+    return {
+        "kind": row["kind"],
+        "occurredAt": row["occurred_at"],
+        "data": data,
+    }
+
+
+def _events_for(
+    connection: sqlite3.Connection, identifiers: list[str]
+) -> dict[str, list[dict[str, object]]]:
+    if not identifiers:
+        return {}
+    placeholders = ",".join("?" for _identifier in identifiers)
+    query = (
+        "SELECT invocation_id, occurred_at, kind, data_json FROM events "  # noqa: S608
+        f"WHERE invocation_id IN ({placeholders}) ORDER BY occurred_at, id"
+    )
+    rows = connection.execute(query, identifiers).fetchall()
+    result: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        result.setdefault(str(row["invocation_id"]), []).append(_event_data(row))
+    return result
+
+
+def _row_data(
+    row: sqlite3.Row, events: list[dict[str, object]] | None = None
+) -> dict[str, object]:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "redactionVersion": REDACTION_VERSION,
@@ -729,11 +1254,12 @@ def _row_data(row: sqlite3.Row) -> dict[str, object]:
         "exitCode": row["exit_code"],
         "durationMs": row["duration_ms"],
         "safe": json.loads(row["safe_json"]),
+        "events": events or [],
         "recoveryUnresolved": bool(row["recovery_unresolved"]),
     }
 
 
-def list_records(  # noqa: PLR0913
+def list_records(  # noqa: C901, PLR0913
     *,
     patterns: tuple[str, ...] = (),
     since: datetime | None = None,
@@ -742,6 +1268,8 @@ def list_records(  # noqa: PLR0913
     outcome: str | None = None,
     account: str | None = None,
     resource: str | None = None,
+    failure: str | None = None,
+    phase: str | None = None,
     limit: int = 50,
     include_running: bool = False,
 ) -> list[dict[str, object]]:
@@ -769,7 +1297,8 @@ def list_records(  # noqa: PLR0913
     if resource:
         clauses.append("(resource_name LIKE ? OR resource_arn LIKE ?)")
         params.extend((f"%{resource}%", f"%{resource}%"))
-    params.append(max(1, min(limit, 10_000)))
+    selected_limit = max(1, min(limit, 10_000))
+    params.append(10_000 if failure or phase else selected_limit)
     try:
         with _database() as connection:
             rows = connection.execute(
@@ -778,9 +1307,34 @@ def list_records(  # noqa: PLR0913
                 + " ORDER BY started_at DESC, id DESC LIMIT ?",
                 params,
             ).fetchall()
+            events = _events_for(connection, [str(row["id"]) for row in rows])
     except (OSError, sqlite3.Error, HistoryError) as error:
         raise OperationalError(_read_error_message(error)) from error
-    values = [_row_data(row) for row in rows]
+    values = [_row_data(row, events.get(str(row["id"]), [])) for row in rows]
+    if failure or phase:
+        filtered: list[dict[str, object]] = []
+        for item in values:
+            item_events = item.get("events")
+            if not isinstance(item_events, list):
+                continue
+            parse_events = [
+                event
+                for event in item_events
+                if isinstance(event, dict)
+                and str(event.get("kind", "")).startswith("parse.")
+            ]
+            if failure and not any(
+                event.get("kind") == f"parse.{failure}" for event in parse_events
+            ):
+                continue
+            if phase and not any(
+                isinstance(event.get("data"), dict)
+                and event["data"].get("phase") == phase
+                for event in parse_events
+            ):
+                continue
+            filtered.append(item)
+        values = filtered[:selected_limit]
     if not patterns:
         return values
     folded = tuple(pattern.casefold() for pattern in patterns)
@@ -799,6 +1353,7 @@ def list_records(  # noqa: PLR0913
                         "resourceArn",
                         "profile",
                         "target",
+                        "events",
                     )
                 ).casefold(),
                 pattern
@@ -822,7 +1377,9 @@ def get_record(identifier: str) -> dict[str, object]:
         raise OperationalError(_missing_id_message(identifier))
     if len(rows) > 1:
         raise OperationalError(_ambiguous_id_message(identifier))
-    return _row_data(rows[0])
+    with _database() as connection:
+        events = _events_for(connection, [str(rows[0]["id"])])
+    return _row_data(rows[0], events.get(str(rows[0]["id"]), []))
 
 
 def command_template(record: dict[str, object]) -> str:
@@ -843,6 +1400,84 @@ def command_template(record: dict[str, object]) -> str:
             parts.extend(("--external-id", "<redacted>"))
         if secret_presence.get("mfaCode") is True:
             parts.append("<mfa-code>")
+    return " ".join(parts)
+
+
+def parse_failure_event(record: dict[str, object]) -> dict[str, object] | None:
+    """Return the first safe parse-failure event attached to one invocation."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        return None
+    return next(
+        (
+            event
+            for event in events
+            if isinstance(event, dict)
+            and str(event.get("kind", "")).startswith("parse.")
+        ),
+        None,
+    )
+
+
+def session_save_event(record: dict[str, object]) -> dict[str, object] | None:
+    """Return the safe post-credential configuration-save event, when present."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        return None
+    return next(
+        (
+            event
+            for event in reversed(events)
+            if isinstance(event, dict)
+            and str(event.get("kind", "")).startswith("session-save.")
+        ),
+        None,
+    )
+
+
+def account_registration_event(
+    record: dict[str, object],
+) -> dict[str, object] | None:
+    """Return the safe automatic account-registration outcome, when present."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        return None
+    return next(
+        (
+            event
+            for event in reversed(events)
+            if isinstance(event, dict)
+            and str(event.get("kind", "")).startswith("account-registration.")
+        ),
+        None,
+    )
+
+
+def parse_template(event: dict[str, object]) -> str:
+    """Render only structural placeholders from one redacted parse event."""
+    data = event.get("data")
+    payload = data if isinstance(data, dict) else {}
+    command = str(payload.get("command") or "unknown").replace(".", " ")
+    parts = ["hacksaws", command]
+    structure = payload.get("structure")
+    safe_structure = structure if isinstance(structure, dict) else {}
+    positionals = safe_structure.get("positionals")
+    if isinstance(positionals, list):
+        parts.extend(
+            f"<{item['role']}>"
+            for item in positionals
+            if isinstance(item, dict) and isinstance(item.get("role"), str)
+        )
+    options = safe_structure.get("options")
+    if isinstance(options, list):
+        for item in options:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                continue
+            parts.append(f"--{item['name']}")
+            if (
+                item.get("valueClass") != "value" or item.get("valueState") != "none"
+            ) and item.get("valueState") != "none":
+                parts.append(f"<{item.get('valueClass') or 'value'}>")
     return " ".join(parts)
 
 
@@ -894,6 +1529,13 @@ def status() -> dict[str, object]:
                 query += " WHERE id != ?"
                 parameters = (current,)
             row = connection.execute(query, parameters).fetchone()
+            event_query = (
+                "SELECT COUNT(*), SUM(kind LIKE 'parse.%'), "
+                "SUM(kind LIKE 'session-save.%'), "
+                "SUM(kind LIKE 'account-registration.%') FROM events "
+                "WHERE invocation_id IS NOT NULL"
+            )
+            event_row = connection.execute(event_query).fetchone()
     except (OSError, sqlite3.Error, HistoryError) as error:
         raise OperationalError(_inspect_error_message(error)) from error
     return {
@@ -904,6 +1546,10 @@ def status() -> dict[str, object]:
         "newest": row[2],
         "running": int(row[3] or 0),
         "logicalBytes": int(row[4]),
+        "events": int(event_row[0] or 0),
+        "parseFailures": int(event_row[1] or 0),
+        "sessionSaves": int(event_row[2] or 0),
+        "accountRegistrations": int(event_row[3] or 0),
         "retention": settings,
     }
 
@@ -953,10 +1599,54 @@ def check() -> dict[str, object]:
                     corrupt += 1
             except json.JSONDecodeError:
                 corrupt += 1
+        corrupt_events = 0
+        for row in connection.execute("SELECT kind, data_json FROM events"):
+            if row["kind"] == "retention":
+                continue
+            try:
+                value = json.loads(row["data_json"])
+            except json.JSONDecodeError:
+                corrupt_events += 1
+                continue
+            kind = str(row["kind"])
+            versioned = (
+                isinstance(value, dict)
+                and value.get("eventSchemaVersion") == EVENT_SCHEMA_VERSION
+                and value.get("redactionVersion") == REDACTION_VERSION
+            )
+            parse_valid = kind.startswith("parse.") and versioned
+            save_status = kind.removeprefix("session-save.")
+            save_valid = (
+                kind.startswith("session-save.")
+                and versioned
+                and save_status in {"saved", "noop", "failed", "cancelled"}
+                and value.get("status") == save_status
+                and type(value.get("requested")) is bool
+                and type(value.get("credentialsActive")) is bool
+                and all(
+                    item is None or _safe_identifier(item) == item
+                    for item in (value.get("target"), value.get("boundary"))
+                )
+            )
+            registration_status = kind.removeprefix("account-registration.")
+            registration_valid = (
+                kind.startswith("account-registration.")
+                and versioned
+                and registration_status in {"completed", "failed"}
+                and value.get("status") == registration_status
+                and all(
+                    type(value.get(field)) is int
+                    and 0 <= value[field] <= _MAX_REGISTERED_ACCOUNTS
+                    for field in ("created", "reused", "refreshed")
+                )
+            )
+            if not (parse_valid or save_valid or registration_valid):
+                corrupt_events += 1
     return {
         **report,
         "corruptRecords": corrupt,
-        "ok": report["integrity"] == "ok" and corrupt == 0,
+        "corruptEvents": corrupt_events,
+        "ok": report["integrity"] == "ok" and corrupt == 0 and corrupt_events == 0,
     }
 
 

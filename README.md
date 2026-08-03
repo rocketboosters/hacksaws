@@ -107,6 +107,20 @@ hacksaws web in +hacw
 hacksaws web in --target hacw
 ```
 
+A successful login can also teach Hacksaws the complete reusable target:
+
+```shell
+hacksaws web in debug --role AgentSession \
+  --policy CloudWatchReadOnlyAccess --save=debug-agent
+hacksaws web in +debug-agent
+```
+
+Use bare `--save` in an interactive terminal to choose the name after the
+credentials are committed. Automation must use `--save=NAME` or
+`--save-name NAME`. See [Saving login workflows](docs/saved-targets.md) for
+account discovery, advanced naming, local-policy storage, and recovery from a
+successful session whose configuration save did not complete.
+
 Durations accept forms such as `15m`, `15minutes`, `1h`, `hour`, `600s`, and
 `600seconds`. Rigid aliases `--htl`, `--mtl`, and `--stl` accept floating-point
 hours, minutes, and seconds; sub-second results round to whole seconds.
@@ -274,6 +288,7 @@ models.
 
 - [Command cheat sheet](CHEATSHEET.md)
 - [Login pathways](docs/login.md)
+- [Saving login workflows](docs/saved-targets.md)
 - [Assume a role from an existing session](docs/assume-role.md)
 - [Profiles, status, and logout](docs/profiles-and-sessions.md)
 - [IAM policies](docs/iam-policies.md)

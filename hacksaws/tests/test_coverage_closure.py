@@ -163,7 +163,11 @@ def test_prettier_wrapper_forwards_paths_without_scanning_ignored_cache() -> Non
     assert ".tmp/" in ignored.splitlines()
 
 
-def test_prettier_wrapper_terminates_options_before_git_filenames() -> None:
+def test_prettier_wrapper_terminates_options_before_git_filenames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "--foo.md").write_text("# Option-like filename\n", encoding="utf-8")
     git_result: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(
         ["git"], 0, b"--foo.md\0"
     )
@@ -176,7 +180,6 @@ def test_prettier_wrapper_terminates_options_before_git_filenames() -> None:
             side_effect=[git_result, prettier_result],
         ) as run,
         patch("scripts.prettier.shutil.which", side_effect=["git", "npx"]),
-        patch("scripts.prettier.os.path.isfile", return_value=True),
     ):
         assert prettier.main(["write", "."]) == 0
 

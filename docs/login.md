@@ -61,6 +61,29 @@ To constrain credentials that are already logged in without repeating MFA or
 browser authentication, use the standalone [`hacksaws assume`](assume-role.md)
 workflow.
 
+## Save a successful workflow
+
+Add `--save=NAME` or `--save-name NAME` to `mfa in`, `web`/`pk in`, or `assume`
+to create the account, optional boundary, and target configuration needed to
+repeat the workflow as `+NAME`:
+
+```shell
+hacksaws web in debug --role AgentSession \
+  --policy CloudWatchReadOnlyAccess --save=debug-agent
+hacksaws web in +debug-agent
+```
+
+Bare `--save` defers the name prompt until after credential commit. It is
+available only in an interactive terminal; JSON and noninteractive execution
+must supply a name and fail before authentication otherwise. The separated form
+`--save NAME` is deliberately rejected as ambiguous.
+
+Authentication and configuration persistence are separate transactions. A
+cancelled or failed post-login save does not discard valid credentials. The
+result clearly reports the partial success and provides a
+`target add --from-session` recovery command. See
+[Saving login workflows](saved-targets.md) for the complete contract.
+
 ## Destination aliases
 
 `.` and `default` mean `~/.aws` when used as locations and the `default` profile

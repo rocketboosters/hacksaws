@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 from copy import deepcopy
 from datetime import UTC
 from datetime import datetime
@@ -21,6 +22,10 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROLE_ARN_RE = re.compile(
     r"^arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/"
     r"((?:[A-Za-z0-9_+=,.@-]+/)*[A-Za-z0-9_+=,.@-]{1,64})$"
+)
+POLICY_ARN_RE = re.compile(
+    r"^arn:(aws|aws-us-gov|aws-cn):iam::(aws|\d{12}):policy/"
+    r"[A-Za-z0-9_+=,.@/-]+$"
 )
 PARTITIONS = {"aws", "aws-us-gov", "aws-cn"}
 TOP_LEVEL = {
@@ -41,6 +46,13 @@ NAMING_FIELDS = {"case", "prefix", "suffix", "enforcement"}
 NAMING_CASES = {"Pascal", "camel", "snake", "kebab"}
 ENFORCEMENT_LEVELS = {"off", "warn", "error"}
 COLOR_MODES = {"auto", "always", "never"}
+ACCOUNT_DISPLAY_SOURCES = {
+    "user",
+    "iam-alias",
+    "account-name",
+    "organizations",
+    "account-id",
+}
 
 
 def collection_name(kind: str) -> str:
@@ -320,11 +332,14 @@ def _validate_resources(data: dict[str, Any]) -> None:
                 raise OperationalError(
                     f"{collection[:-1].title()} {name!r} must be an object."
                 )
+    account_identities: dict[tuple[str, str], str] = {}
     for name, account in data["accounts"].items():
         unknown = set(account) - {
             "id",
             "partition",
             "description",
+            "display_name",
+            "display_source",
             "unverified",
             "credential_target",
             "region",
@@ -342,8 +357,39 @@ def _validate_resources(data: dict[str, Any]) -> None:
             or account["partition"] not in PARTITIONS
         ):
             raise OperationalError(f"Account {name!r} has an unsupported partition.")
+        identity = (account["partition"], account["id"])
+        previous = account_identities.get(identity)
+        if previous is not None:
+            raise OperationalError(
+                f"Accounts {previous!r} and {name!r} have the same AWS identity."
+            )
+        account_identities[identity] = name
         if "description" in account and type(account["description"]) is not str:
             raise OperationalError(f"Account {name!r} description must be text.")
+        display_name = account.get("display_name")
+        display_source = account.get("display_source")
+        if (display_name is None) != (display_source is None):
+            raise OperationalError(
+                f"Account {name!r} display_name and display_source must be set together."
+            )
+        if display_name is not None:
+            if (
+                type(display_name) is not str
+                or not display_name
+                or display_name != display_name.strip()
+                or len(display_name) > 128
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in display_name
+                )
+            ):
+                raise OperationalError(
+                    f"Account {name!r} display_name must be 1-128 safe text characters."
+                )
+            if display_source not in ACCOUNT_DISPLAY_SOURCES:
+                raise OperationalError(
+                    f"Account {name!r} has an unsupported display_source."
+                )
         if "credential_target" in account and (
             type(account["credential_target"]) is not str
             or not account["credential_target"]
@@ -409,6 +455,7 @@ def _validate_resources(data: dict[str, Any]) -> None:
         if (
             policy
             and _find_key(data["policies"], policy) is None
+            and POLICY_ARN_RE.fullmatch(policy) is None
             and policy_path is not None
             and policy_path.suffix.lower() not in {".json", ".yaml", ".yml", ".toml"}
         ):

@@ -38,6 +38,7 @@ from hacksaws import _ecr
 from hacksaws import _history
 from hacksaws import _policies
 from hacksaws import _regions
+from hacksaws import _session_save
 from hacksaws import _state
 
 if TYPE_CHECKING:
@@ -125,9 +126,10 @@ def _restore(snapshot: dict[str, Any]) -> None:
         path.unlink(missing_ok=True)
 
 
-def _begin(paths: list[Path]) -> dict[str, Any]:
+def _begin(paths: list[Path], *, kind: str = "login") -> dict[str, Any]:
     journal = {
         "schema_version": 1,
+        "kind": kind,
         "started_at": _state.iso_now(),
         "files": [_snapshot(path) for path in paths],
         "safe_to_rollback": True,
@@ -171,8 +173,11 @@ def _rollback(journal: dict[str, Any]) -> None:
         except OSError as error:
             failures.append(f"{snapshot['path']}: {error}")
     if failures:
+        operation = (
+            "Configuration save" if journal.get("kind") == "session-save" else "Login"
+        )
         raise _configs.OperationalError(
-            "Login failed and automatic recovery was incomplete. Restore these files "
+            f"{operation} failed and automatic recovery was incomplete. Restore these files "
             f"from {_journal_path()}: {'; '.join(failures)}"
         )
     _journal_path().unlink(missing_ok=True)
@@ -978,6 +983,188 @@ def _save_credentials(path: Path, profile: str, credentials: dict[str, Any]) -> 
     _write_ini(path, parser)
 
 
+def _session_save_plan(
+    args: Any,
+    *,
+    source_directory: Path,
+    source_profile: str,
+    destination_directory: Path,
+    destination_profile: str,
+    region: str,
+) -> _session_save.SavePlan:
+    """Preflight the locally knowable part of a post-login configuration save."""
+    return _session_save.prepare(
+        args,
+        source_directory=source_directory,
+        source_profile=source_profile,
+        destination_directory=destination_directory,
+        destination_profile=destination_profile,
+        region=region,
+    )
+
+
+def _discover_save_accounts(
+    plan: _session_save.SavePlan,
+    session: Any,
+    *,
+    role: str | None,
+    source_account: str,
+    source_partition: str,
+) -> tuple[_session_save.SaveAccounts | None, _configs.OperationalError | None]:
+    """Keep account-discovery trouble out of the credential transaction."""
+    try:
+        return _session_save.discover_accounts(plan, session, role_arn=role), None
+    except _configs.OperationalError:
+        try:
+            fallback = _session_save.accounts_from_identity(
+                plan,
+                source_account=source_account,
+                source_partition=source_partition,
+                role_arn=role,
+            )
+        except _configs.OperationalError as error:
+            return None, error
+        return fallback, None
+
+
+def _finish_session_save(
+    result: _configs.Result,
+    *,
+    plan: _session_save.SavePlan,
+    accounts: _session_save.SaveAccounts | None,
+    discovery_error: _configs.OperationalError | None,
+    destination: Path,
+    profile: str,
+) -> _configs.Result:
+    """Persist reusable configuration after credentials have already committed."""
+    try:
+        outcome = _persist_committed_session_save(
+            plan,
+            accounts,
+            discovery_error,
+            destination,
+            profile,
+        )
+    except _configs.OperationalError as error:
+        _history.note_account_registration(
+            status="failed", created=0, reused=0, refreshed=0
+        )
+        retry = _session_save.retry_command(plan) if plan.requested else None
+        if plan.requested:
+            _history.note_session_save(
+                status=(
+                    "cancelled"
+                    if isinstance(error, _session_save.SaveCancelled)
+                    else "failed"
+                ),
+                target=plan.name,
+                boundary=plan.boundary_name,
+                requested=True,
+                credentials_active=True,
+            )
+        existing = dict(result.data) if isinstance(result.data, dict) else {}
+        failure_data: dict[str, Any] = {
+            **existing,
+            "credentialsActive": True,
+            "credentialResult": result.code,
+            "accountRegistration": {
+                "status": "failed",
+                "created": 0,
+                "reused": 0,
+                "refreshed": 0,
+            },
+            "bundleRequested": plan.requested,
+            "bundleSaved": False,
+        }
+        if retry is not None:
+            failure_data["save"] = {"status": "failed", "retryCommand": retry}
+        subject = (
+            "reusable configuration was not saved"
+            if plan.requested
+            else "automatic account registration did not complete"
+        )
+        return _configs.Result(
+            "PARTIAL_SUCCESS",
+            f"{result.message} Credentials remain active, but {subject}: {error}",
+            _configs.EXIT_ERROR,
+            "stderr",
+            data=failure_data,
+            repairs=(f"Retry without logging in again: {retry}",) if retry else None,
+            kind="warning",
+        )
+    existing = dict(result.data) if isinstance(result.data, dict) else {}
+    summary = _session_save.outcome_data(outcome)
+    registration = cast("dict[str, int]", summary["accountRegistration"])
+    _history.note_account_registration(
+        status="completed",
+        created=registration["created"],
+        reused=registration["reused"],
+        refreshed=registration["refreshed"],
+    )
+    bundle_changed = bool(summary["bundleChanged"])
+    if plan.requested:
+        _history.note_session_save(
+            status="saved" if bundle_changed else "noop",
+            target=outcome.target,
+            boundary=outcome.boundary,
+            requested=True,
+            credentials_active=True,
+        )
+    suffix = (
+        f" Saved target {outcome.target!r}."
+        if outcome.target and bundle_changed
+        else f" Target {outcome.target!r} was already current."
+        if outcome.target
+        else ""
+    )
+    output_data: dict[str, Any] = {
+        **existing,
+        "accountRegistration": registration,
+        "bundleRequested": plan.requested,
+        "bundleSaved": plan.requested,
+    }
+    if plan.requested:
+        output_data["save"] = summary
+    return _configs.Result(
+        result.code,
+        result.message + suffix,
+        result.exit_code,
+        result.stream,
+        data=output_data,
+        details=result.details,
+        repairs=result.repairs,
+        kind=result.kind,
+    )
+
+
+def _persist_committed_session_save(
+    plan: _session_save.SavePlan,
+    accounts: _session_save.SaveAccounts | None,
+    discovery_error: _configs.OperationalError | None,
+    destination: Path,
+    profile: str,
+) -> _session_save.SaveOutcome:
+    if discovery_error is not None:
+        raise discovery_error
+    if accounts is None:
+        raise _configs.OperationalError(
+            "Account discovery did not produce a reusable configuration record."
+        )
+    session = _state.load_sessions().get(f"{destination.absolute()}::{profile}")
+    if not isinstance(session, dict):
+        raise _configs.OperationalError(
+            "The committed credential session could not be found for saving."
+        )
+    return _session_save.persist(
+        plan,
+        accounts,
+        session,
+        begin=lambda paths: _begin(paths, kind="session-save"),
+        commit=_commit,
+        rollback=_rollback,
+    )
+
+
 def _copy_region(
     source_config: Path,
     source_profile: str,
@@ -1208,6 +1395,14 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
         destination_directory=destination_dir,
         destination_profile=destination_profile,
     )
+    save_plan = _session_save_plan(
+        args,
+        source_directory=source_dir,
+        source_profile=source_profile,
+        destination_directory=destination_dir,
+        destination_profile=destination_profile,
+        region=region.canonical,
+    )
     raw, source_config = _persistent_source(
         source_dir, source_profile, region_name=region.canonical
     )
@@ -1224,6 +1419,13 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
         args.mfa_code,
         args.lifespan,
         region_name=region.canonical,
+    )
+    save_accounts, save_discovery_error = _discover_save_accounts(
+        save_plan,
+        intermediate,
+        role=role,
+        source_account=source_account,
+        source_partition=partition,
     )
     journal = _begin(
         [
@@ -1290,6 +1492,8 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
         metadata.update(_region_metadata(region))
         metadata["source_account"] = source_account
         metadata["source_partition"] = partition
+        metadata["source_profile"] = source_profile
+        metadata["source_destination"] = str(source_dir.absolute())
         metadata["target"] = target.get("target_name")
         _record(
             destination_dir,
@@ -1304,7 +1508,14 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
     except Exception:
         _rollback(journal)
         raise
-    return _configs.Result("MFA_LOGIN", f"Logged into profile {destination_profile}")
+    return _finish_session_save(
+        _configs.Result("MFA_LOGIN", f"Logged into profile {destination_profile}"),
+        plan=save_plan,
+        accounts=save_accounts,
+        discovery_error=save_discovery_error,
+        destination=destination_dir,
+        profile=destination_profile,
+    )
 
 
 def _aws_cli_version() -> tuple[int, int, int]:
@@ -1446,6 +1657,14 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         "signin",
         allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
     )
+    save_plan = _session_save_plan(
+        args,
+        source_directory=source_dir,
+        source_profile=source_profile,
+        destination_directory=destination_dir,
+        destination_profile=destination_profile,
+        region=region.canonical,
+    )
     if not has_boundary:
         native_cache = _native_login_cache()
         journal = _begin(
@@ -1491,6 +1710,13 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                     profile_name=destination_profile, region_name=region.canonical
                 )
                 account, partition, principal = _identity(native, label="browser login")
+                save_accounts, save_discovery_error = _discover_save_accounts(
+                    save_plan,
+                    native,
+                    role=None,
+                    source_account=account,
+                    source_partition=partition,
+                )
             lineage = _browser_cache_lineage(
                 destination_dir / "config",
                 destination_profile,
@@ -1525,6 +1751,8 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 {
                     "source_account": account,
                     "source_partition": partition,
+                    "source_profile": source_profile,
+                    "source_destination": str(source_dir.absolute()),
                     "target_account": account,
                     "target_partition": partition,
                     "target": target.get("target_name"),
@@ -1550,9 +1778,16 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                     f"{destination_profile!r} were rolled back."
                 ) from error
             raise
-        return _configs.Result(
-            "BROWSER_LOGIN",
-            f"AWS-native browser login active for profile {destination_profile}.",
+        return _finish_session_save(
+            _configs.Result(
+                "BROWSER_LOGIN",
+                f"AWS-native browser login active for profile {destination_profile}.",
+            ),
+            plan=save_plan,
+            accounts=save_accounts,
+            discovery_error=save_discovery_error,
+            destination=destination_dir,
+            profile=destination_profile,
         )
 
     staging = _state.root() / "staging" / uuid.uuid4().hex
@@ -1607,6 +1842,13 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 args, target, source_account, partition
             )
             role = _require_bounded_browser_role(role)
+            save_accounts, save_discovery_error = _discover_save_accounts(
+                save_plan,
+                intermediate,
+                role=role,
+                source_account=source_account,
+                source_partition=partition,
+            )
             if args.ecr:
                 aws_account = _configs.AwsAccount(
                     {
@@ -1652,6 +1894,8 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         metadata.update(
             source_account=source_account,
             source_partition=partition,
+            source_profile=source_profile,
+            source_destination=str(source_dir.absolute()),
             target=target.get("target_name"),
         )
         metadata.update(_region_metadata(region))
@@ -1677,9 +1921,16 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    return _configs.Result(
-        "BROWSER_LOGIN",
-        f"Bounded browser login active for profile {destination_profile}.",
+    return _finish_session_save(
+        _configs.Result(
+            "BROWSER_LOGIN",
+            f"Bounded browser login active for profile {destination_profile}.",
+        ),
+        plan=save_plan,
+        accounts=save_accounts,
+        discovery_error=save_discovery_error,
+        destination=destination_dir,
+        profile=destination_profile,
     )
 
 
@@ -2005,6 +2256,13 @@ def _assume_arguments_fingerprint(args: Any) -> str:
         "htl",
         "mtl",
         "stl",
+        "save",
+        "save_name",
+        "save_source_account",
+        "save_role_account",
+        "save_boundary",
+        "save_external_id",
+        "store_policy_as",
         "keep_source",
         "keep_ecr",
         "replace",
@@ -2074,6 +2332,22 @@ def prepare_assume_role(context: _configs.Context) -> AssumeRolePlan:
     match = re.fullmatch(r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/.+", role)
     if match is None:
         raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
+    preference = cast("_regions.RegionPreference", data["region_preference"])
+    data["save_plan"] = _session_save_plan(
+        context.args,
+        source_directory=cast("Path", data["source"]),
+        source_profile=str(data["source_profile"]),
+        destination_directory=cast("Path", data["destination"]),
+        destination_profile=str(data["destination_profile"]),
+        region=preference.canonical,
+    )
+    data["save_accounts"], data["save_discovery_error"] = _discover_save_accounts(
+        data["save_plan"],
+        data["authenticated"],
+        role=role,
+        source_account=str(data["source_account"]),
+        source_partition=str(data["source_partition"]),
+    )
     data["effective_duration"] = _effective_assume_duration(
         data["authenticated"], role, args=context.args, target=data["target"]
     )
@@ -3006,7 +3280,7 @@ def assume_role(
     )
     if cache_residue:
         public["browserCacheResidue"] = cache_residue
-        return _configs.Result(
+        result = _configs.Result(
             "ASSUME_ROLE_BROWSER_CACHE_RESIDUE",
             "Role credentials were installed and the broad source credentials were "
             "removed, but a browser cache with unknown ownership was preserved.",
@@ -3015,8 +3289,8 @@ def assume_role(
             public,
             kind="warning",
         )
-    if failures:
-        return _configs.Result(
+    elif failures:
+        result = _configs.Result(
             "ASSUME_ROLE_ECR_RESIDUE",
             "Role credentials were installed and the local credential handoff "
             "completed, but one or more ECR logouts failed; tracked residue remains.",
@@ -3025,10 +3299,21 @@ def assume_role(
             public,
             kind="warning",
         )
-    return _configs.Result(
-        "ASSUME_ROLE",
-        f"Assumed {data['role']} into profile {data['destination_profile']}.",
-        data=public,
+    else:
+        result = _configs.Result(
+            "ASSUME_ROLE",
+            f"Assumed {data['role']} into profile {data['destination_profile']}.",
+            data=public,
+        )
+    return _finish_session_save(
+        result,
+        plan=cast("_session_save.SavePlan", data["save_plan"]),
+        accounts=cast("_session_save.SaveAccounts | None", data["save_accounts"]),
+        discovery_error=cast(
+            "_configs.OperationalError | None", data["save_discovery_error"]
+        ),
+        destination=cast("Path", data["destination"]),
+        profile=str(data["destination_profile"]),
     )
 
 
@@ -3544,6 +3829,96 @@ def status_report(
         state = str(item["state"])
         counts[state] = counts.get(state, 0) + 1
     return {"sessions": sessions, "counts": counts, "warnings": []}
+
+
+def save_target_from_session(args: Any) -> _configs.Result:
+    """Idempotently reconstruct one reusable target from a managed session."""
+    profile = _normalize_profile(getattr(args, "from_session", None))
+    directory_value = getattr(args, "directory", None)
+    location = getattr(args, "location", None)
+    if directory_value:
+        directory = Path(str(directory_value)).expanduser().absolute()
+    elif location:
+        directory = _state.aws_directory(str(location)).absolute()
+    else:
+        matches = [
+            Path(str(record.get("destination", ""))).absolute()
+            for record in _state.load_sessions().values()
+            if record.get("profile") == profile and record.get("destination")
+        ]
+        matches = list(dict.fromkeys(matches))
+        if not matches:
+            raise _configs.OperationalError(
+                f"No Hacksaws-managed session exists for profile {profile!r}."
+            )
+        if len(matches) > 1:
+            raise _configs.OperationalError(
+                f"Profile {profile!r} has managed sessions in multiple AWS folders; "
+                "specify --location or --directory."
+            )
+        directory = matches[0]
+    key = f"{directory.absolute()}::{profile}"
+    session = _state.load_sessions().get(key)
+    if not isinstance(session, dict):
+        raise _configs.OperationalError(f"No Hacksaws-managed session exists at {key}.")
+    _session_is_usable_source(session)
+    if bool(getattr(args, "save_external_id", False)) and not getattr(
+        args, "external_id", None
+    ):
+        raise _configs.OperationalError(
+            "--save-external-id requires the recovery-only --external-id value."
+        )
+    plan = _session_save.recovery_plan(args, session, name=str(args.resource_name))
+    accounts = _session_save.accounts_from_session(plan, session)
+    try:
+        outcome = _session_save.persist(
+            plan,
+            accounts,
+            session,
+            begin=lambda paths: _begin(paths, kind="session-save"),
+            commit=_commit,
+            rollback=_rollback,
+        )
+    except _configs.OperationalError:
+        _history.note_account_registration(
+            status="failed", created=0, reused=0, refreshed=0
+        )
+        _history.note_session_save(
+            status="failed",
+            target=plan.name,
+            boundary=plan.boundary_name,
+            requested=True,
+            credentials_active=True,
+        )
+        raise
+    _history.note_account_registration(
+        status="completed",
+        created=outcome.accounts_created,
+        reused=outcome.accounts_reused,
+        refreshed=outcome.accounts_refreshed,
+    )
+    bundle_changed = (
+        outcome.changed if outcome.bundle_changed is None else outcome.bundle_changed
+    )
+    _history.note_session_save(
+        status="saved" if bundle_changed else "noop",
+        target=outcome.target,
+        boundary=outcome.boundary,
+        requested=True,
+        credentials_active=True,
+    )
+    data = _session_save.outcome_data(outcome)
+    data["fromSession"] = {"directory": str(directory), "profile": profile}
+    return _configs.Result(
+        "TARGET_FROM_SESSION",
+        (
+            f"Saved target {outcome.target!r} from active profile {profile!r}."
+            if bundle_changed
+            else f"Target {outcome.target!r} already matches active profile {profile!r}."
+        ),
+        data=data,
+        kind="info" if not bundle_changed else "success",
+    )
 
 
 def _known_directories() -> dict[Path, str | None]:

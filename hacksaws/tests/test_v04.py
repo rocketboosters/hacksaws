@@ -160,7 +160,11 @@ def test_unbounded_target_role_operands_fail_before_browser_auth(
     _minimal_target(tmp_path)
     with patch("hacksaws._sessions._aws_login") as aws_login:
         result = _cli.console_main(["web", "in", "+Prod", flag, value])
-    assert result.exit_code == 1
+    if flag == "--duration":
+        assert result.exit_code == 1
+    else:
+        assert result.code == "ARGUMENT_ERROR"
+        assert result.exit_code == _configs.EXIT_USAGE
     aws_login.assert_not_called()
 
 
@@ -182,7 +186,8 @@ def test_bounded_target_rejects_security_overrides(
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path))
     _minimal_target(tmp_path, boundary=True)
     result = _cli.console_main(["web", "in", "+Prod", *arguments])
-    assert result.exit_code == 1
+    assert result.code == "ARGUMENT_ERROR"
+    assert result.exit_code == _configs.EXIT_USAGE
 
 
 def test_unbounded_target_may_add_named_boundary(
@@ -983,7 +988,8 @@ def test_ecr_region_partition_and_unknown_escape_are_strict(
 
 def test_direct_policy_requires_role(capsys: pytest.CaptureFixture[str]) -> None:
     result = _cli.console_main(["mfa", "in", "dev", "123456", "--policy", "x"])
-    assert result.exit_code == 1
+    assert result.code == "ARGUMENT_ERROR"
+    assert result.exit_code == _configs.EXIT_USAGE
     assert "requires --role" in capsys.readouterr().err
 
 

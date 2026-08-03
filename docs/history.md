@@ -13,6 +13,7 @@ successful parsing, Hacksaws adds only positively allowlisted metadata:
 - validated profile, location, account, target, and IAM resource identifiers;
 - safe booleans and enums such as dry-run, format, and output mode;
 - input roles and formats, never file paths or file contents;
+- automatic account-registration counts, separately from requested target saves;
 - whether an MFA code or external ID was supplied, never its value;
 - semantic confirmation state, outcome, result code, timing, and safe counts;
 - unresolved recovery state, which is protected from automatic retention and
@@ -29,12 +30,27 @@ An invocation begins as `running` and is atomically finalized as completed,
 interrupted, or crashed. A running invocation older than 24 hours is marked
 abandoned during routine maintenance.
 
+Argument failures use versioned `parse.*` events. These events contain only a
+bounded grammar observation: canonical command prefix and recognized alias,
+allowlisted option names and counts, value presence/class (and a safe file
+format where useful), positional roles, capped opaque counts, stable failure
+phase/kind, and a repair help command. They never contain raw or hashed argv,
+unknown option names, identifiers, values, paths, exception text, or anything
+after literal `--`. SQLite database, WAL, and exports follow the same contract.
+
+Post-credential configuration saves use `session-save.saved`, `.noop`,
+`.failed`, or `.cancelled`. Their payload is limited to status, whether saving
+was requested, whether credentials remain active, and validated target/boundary
+names. Retry commands, directories, errors, provider notices, and policy or
+secret inputs are excluded.
+
 ## Inspect history
 
 ```shell
 hacksaws history list
-hacksaws history list --wide --since 7d --outcome operational-error
+hacksaws history list --wide --since 7d --failure unknown-option
 hacksaws history search "*ServiceBuzz*" "*iam.policy*"
+hacksaws history search --phase semantic --failure invalid-combination
 hacksaws history show 12ab34cd
 hacksaws history report --since 30d --account 123456789012
 hacksaws history status
@@ -42,16 +58,23 @@ hacksaws history check
 ```
 
 `list` and `search` default to the 50 newest completed records. Filters include
-`--since`, `--until`, `--command`, `--outcome`, `--account`, `--resource`, and
-`--limit`. Times may be ISO timestamps or durations meaning “that long ago.”
-Duration units accept the same seconds/minutes/hours grammar as session duration
-plus days and weeks, including `600s`, `15minutes`, `24h`, `7d`, and `2weeks`.
-Add `--include-running` when diagnosing an active process.
+`--since`, `--until`, `--command`, `--outcome`, `--account`, `--resource`,
+`--failure`, `--phase`, and `--limit`. Failure categories are stable safe names
+such as `unknown-command`, `unknown-option`, `misplaced-option`,
+`missing-option-value`, `missing-required-option`, and `invalid-combination`.
+Phases are `global`, `selector`, `argparse`, and `semantic`. Times may be ISO
+timestamps or durations meaning “that long ago.” Duration units accept the same
+seconds/minutes/hours grammar as session duration plus days and weeks, including
+`600s`, `15minutes`, `24h`, `7d`, and `2weeks`. Add `--include-running` when
+diagnosing an active process.
 
 `show` accepts a complete history ID or an unambiguous prefix of at least four
 hexadecimal characters. Its human view includes a reconstructed command
 template. File and secret inputs appear only as placeholders, so the template is
-useful for teaching without becoming a credential-recovery mechanism.
+useful for teaching without becoming a credential-recovery mechanism. For parse
+failures, it also displays the safe attempted shape, phase/category, and
+relevant help command. Records written before parse telemetry was available
+remain marked unavailable; no prior raw arguments exist to reconstruct.
 
 Every command accepts global `--json`. Machine mode retains the same single
 Hacksaws result envelope used by the rest of the CLI.

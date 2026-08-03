@@ -11,6 +11,7 @@ hacksaws account list
 hacksaws account rename prod production
 hacksaws boundary add logs AgentSession --account prod --policy LogsRead
 hacksaws target add debug --source-account prod --source-profile admin
+hacksaws target add debug-copy --from-session debug
 hacksaws target update debug --region oregon
 hacksaws config set aws.region us-east-2
 hacksaws config show --account prod
@@ -63,3 +64,9 @@ The limits use seconds, entries, and bytes. See
 
 `config export` creates a portable zip excluding temporary caches.
 `config import` validates the complete archive before replacing state.
+
+Login, browser login, and role assumption can create this graph automatically
+with `--save=NAME`. Account identity is anchored to the verified AWS partition
+and 12-digit account ID; friendly names are discovery metadata, not identity.
+See [Saving login workflows](saved-targets.md) for discovery precedence,
+cross-account behavior, create-only collision rules, and session recovery.

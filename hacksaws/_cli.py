@@ -48,6 +48,64 @@ class _HacksawsArgumentParser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
 
 
+class _UsageError(_configs.OperationalError):
+    """A semantic command-line error discovered after argparse succeeds."""
+
+    def __init__(self, message: str, *, code: str = "ARGUMENT_ERROR") -> None:
+        super().__init__(message)
+        self.code = code
+        self.exit_code = _configs.EXIT_USAGE
+
+
+def _save_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the reusable saved-target controls to one credential workflow."""
+    save = parser.add_mutually_exclusive_group()
+    save.add_argument(
+        "--save",
+        action="store_true",
+        help=(
+            "After credentials are committed, prompt for a reusable target name. "
+            "In automation use --save=NAME or --save-name NAME."
+        ),
+    )
+    save.add_argument(
+        "--save-name",
+        metavar="NAME",
+        help=(
+            "Save the successful credential workflow as +NAME without prompting; "
+            "--save=NAME is equivalent."
+        ),
+    )
+    parser.add_argument(
+        "--save-source-account",
+        metavar="NAME",
+        help="Advanced: name a newly discovered source-account configuration.",
+    )
+    parser.add_argument(
+        "--save-role-account",
+        metavar="NAME",
+        help="Advanced: name a newly discovered role-owning account configuration.",
+    )
+    parser.add_argument(
+        "--save-boundary",
+        metavar="NAME",
+        help="Advanced: name the generated role/policy boundary configuration.",
+    )
+    parser.add_argument(
+        "--save-external-id",
+        action="store_true",
+        help=(
+            "Explicitly allow the supplied --external-id to be stored in the saved "
+            "boundary configuration."
+        ),
+    )
+    parser.add_argument(
+        "--store-policy-as",
+        metavar="NAME",
+        help="Store the resolved session policy locally under this reusable name.",
+    )
+
+
 def _duration_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -112,6 +170,16 @@ def _history_filter_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--account", help="Include only this recorded AWS account.")
     parser.add_argument(
         "--resource", help="Match a recorded resource name or ARN fragment."
+    )
+    parser.add_argument(
+        "--failure",
+        choices=_history.PARSE_FAILURE_KINDS,
+        help="Include only this safe argument-failure category.",
+    )
+    parser.add_argument(
+        "--phase",
+        choices=_history.PARSE_PHASES,
+        help="Include only failures from this parsing or validation phase.",
     )
     parser.add_argument(
         "--limit",
@@ -218,6 +286,7 @@ def _login_arguments(parser: argparse.ArgumentParser, *, browser: bool = False) 
     )
     _duration_arguments(parser)
     _ecr_arguments(parser)
+    _save_arguments(parser)
     if browser:
         parser.add_argument(
             "--remote",
@@ -357,6 +426,7 @@ def _assume_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Approve the displayed assumption plan without prompting.",
     )
+    _save_arguments(parser)
     parser.set_defaults(
         action="assume",
         directory="~/.aws",
@@ -429,27 +499,59 @@ def _resource_parser(parent: argparse._SubParsersAction[Any], kind: str) -> None
         "boundary": "Manage saved role and optional session-policy boundaries.",
         "target": "Manage saved login source, destination, and boundary presets.",
     }
+    plural = {"account": "accounts", "boundary": "boundaries", "target": "targets"}[
+        kind
+    ]
     parser = parent.add_parser(kind, help=purposes[kind], description=purposes[kind])
     actions = parser.add_subparsers(dest="resource_action")
-    add = actions.add_parser("add")
-    add.add_argument("resource_name")
-    add.add_argument("--description")
-    update = actions.add_parser("update")
-    update.add_argument("resource_name")
-    update.add_argument("--description")
-    update.add_argument("--clear-description", action="store_true")
+    add = actions.add_parser(
+        "add", help=f"Add a named {kind}.", description=f"Add a named {kind}."
+    )
+    add.add_argument("resource_name", metavar="NAME", help=f"Name for the new {kind}.")
+    add.add_argument("--description", help=f"Human description of this {kind}.")
+    update = actions.add_parser(
+        "update",
+        help=f"Update a named {kind}.",
+        description=f"Update a named {kind}.",
+    )
+    update.add_argument("resource_name", metavar="NAME", help=f"Existing {kind} name.")
+    update.add_argument("--description", help="Replace the human description.")
+    update.add_argument(
+        "--clear-description",
+        action="store_true",
+        help="Remove the human description.",
+    )
     for action in ("get", "remove"):
-        item = actions.add_parser(action)
-        item.add_argument("resource_name")
-        item.add_argument("--json", action="store_true")
+        purpose = f"{'Show' if action == 'get' else 'Remove'} a named {kind}."
+        item = actions.add_parser(action, help=purpose, description=purpose)
+        item.add_argument(
+            "resource_name", metavar="NAME", help=f"Existing {kind} name."
+        )
+        item.add_argument(
+            "--json", action="store_true", help="Emit the stable JSON result envelope."
+        )
         if action == "remove":
-            item.add_argument("--cascade", action="store_true")
-            item.add_argument("--yes", action="store_true")
-    listing = actions.add_parser("list")
-    listing.add_argument("--json", action="store_true")
-    rename = actions.add_parser("rename")
-    rename.add_argument("resource_name")
-    rename.add_argument("new_name")
+            item.add_argument(
+                "--cascade",
+                action="store_true",
+                help="Also remove local resources that reference this one.",
+            )
+            item.add_argument(
+                "--yes",
+                action="store_true",
+                help="Approve the displayed removal without prompting.",
+            )
+    listing = actions.add_parser(
+        "list", help=f"List named {plural}.", description=f"List named {plural}."
+    )
+    listing.add_argument(
+        "--json", action="store_true", help="Emit the stable JSON result envelope."
+    )
+    rename = actions.add_parser(
+        "rename", help=f"Rename a {kind}.", description=f"Rename a {kind}."
+    )
+    rename.add_argument("resource_name", metavar="NAME", help=f"Existing {kind} name.")
+    rename.add_argument("new_name", metavar="NEW_NAME", help=f"New {kind} name.")
 
     if kind == "account":
         add.add_argument("account_id")
@@ -499,15 +601,66 @@ def _resource_parser(parent: argparse._SubParsersAction[Any], kind: str) -> None
         update.add_argument("--clear-duration", action="store_true")
         _credential_selector(update)
     elif kind == "target":
-        add.add_argument("--source-account", required=True)
-        add.add_argument("--source-profile", default="default")
+        add.add_argument(
+            "--from-session",
+            metavar="PROFILE",
+            help=(
+                "Build the target from one active Hacksaws-managed session instead "
+                "of repeating its source, destination, and boundary fields."
+            ),
+        )
+        session_folder = add.add_mutually_exclusive_group()
+        session_folder.add_argument(
+            "--location",
+            help=(
+                "Logical AWS folder containing --from-session PROFILE "
+                "(default: default, meaning ~/.aws)."
+            ),
+        )
+        session_folder.add_argument(
+            "-d",
+            "--directory",
+            help="Explicit AWS directory containing --from-session PROFILE.",
+        )
+        add.add_argument(
+            "--source-account",
+            help=(
+                "Manual configured account owning the source credentials; required "
+                "unless --from-session is used."
+            ),
+        )
+        add.add_argument(
+            "--source-profile",
+            help="Manual source AWS profile (default: default).",
+        )
         source = add.add_mutually_exclusive_group()
-        source.add_argument("--source-location", default="default")
-        source.add_argument("--source-directory")
-        add.add_argument("--to")
-        add.add_argument("--to-directory")
-        add.add_argument("--to-profile")
-        add.add_argument("--boundary")
+        source.add_argument(
+            "--source-location",
+            help="Manual source logical AWS folder (default: default).",
+        )
+        source.add_argument(
+            "--source-directory",
+            help="Manual explicit AWS directory containing the source profile.",
+        )
+        add.add_argument(
+            "--to",
+            metavar="LOCATION:PROFILE",
+            help="Manual destination AWS location and profile.",
+        )
+        add.add_argument(
+            "--to-directory",
+            metavar="PATH",
+            help="Manual explicit destination AWS directory; requires --to-profile.",
+        )
+        add.add_argument(
+            "--to-profile",
+            metavar="PROFILE",
+            help="Manual destination profile, paired with --to-directory when used.",
+        )
+        add.add_argument(
+            "--boundary",
+            help="Manual saved boundary to attach to this target.",
+        )
         add.add_argument(
             "--region",
             metavar="REGION_OR_ALIAS",
@@ -517,6 +670,45 @@ def _resource_parser(parent: argparse._SubParsersAction[Any], kind: str) -> None
             "--allow-unknown-region",
             action="store_true",
             help="Accept a canonical-shaped region absent from bundled metadata.",
+        )
+        add.add_argument(
+            "--save-source-account",
+            metavar="NAME",
+            help="Advanced: name a source account reconstructed from the session.",
+        )
+        add.add_argument(
+            "--save-role-account",
+            metavar="NAME",
+            help="Advanced: name a role-owning account reconstructed from the session.",
+        )
+        add.add_argument(
+            "--save-boundary",
+            metavar="NAME",
+            help="Advanced: name a boundary reconstructed from the session.",
+        )
+        add.add_argument(
+            "--save-external-id",
+            action="store_true",
+            help="Permit a recoverable external ID to be stored with the boundary.",
+        )
+        add.add_argument(
+            "--store-policy-as",
+            metavar="NAME",
+            help="Store the session policy locally under this reusable name.",
+        )
+        add.add_argument(
+            "--external-id",
+            help=(
+                "Recovery-only external ID when the session cannot retain that "
+                "secret; requires --from-session."
+            ),
+        )
+        add.add_argument(
+            "--policy",
+            help=(
+                "Recovery-only policy name, ARN, stored name, or local file when "
+                "the session lacks a reusable policy reference."
+            ),
         )
         update.add_argument("--boundary")
         update.add_argument("--clear-boundary", action="store_true")
@@ -1098,6 +1290,99 @@ def _json_requested(arguments: Sequence[str]) -> bool:
     return False
 
 
+def _normalize_login_save_options(arguments: list[str]) -> list[str]:
+    """Support equals-only ``--save=NAME`` without accepting ``--save NAME``."""
+    command_prefix = tuple(arguments[:2])
+    is_login = command_prefix in {
+        (auth, action) for auth in ("mfa", "pk", "web") for action in ("login", "in")
+    }
+    if not (is_login or (arguments and arguments[0] == "assume")):
+        return arguments
+    normalized: list[str] = []
+    save_forms = 0
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            normalized.extend(arguments[index:])
+            break
+        if argument.startswith("--save="):
+            save_forms += 1
+            value = argument.partition("=")[2]
+            if not value:
+                raise _UsageError(
+                    "--save=NAME requires a non-empty name; use bare --save only "
+                    "for an interactive post-login prompt."
+                )
+            normalized.extend(("--save-name", value))
+        else:
+            if argument in {"--save", "--save-name"} or argument.startswith(
+                "--save-name="
+            ):
+                save_forms += 1
+            if (
+                argument == "--save"
+                and index + 1 < len(arguments)
+                and not arguments[index + 1].startswith("-")
+            ):
+                raise _UsageError(
+                    "Ambiguous '--save NAME' is not supported. Use --save=NAME or "
+                    "--save-name NAME; use bare --save only at the end of an "
+                    "interactive command."
+                )
+            normalized.append(argument)
+        index += 1
+    if save_forms > 1:
+        raise _UsageError("Specify a saved-target name only once.")
+    return normalized
+
+
+_SAVE_OVERRIDE_FIELDS = (
+    "save_source_account",
+    "save_role_account",
+    "save_boundary",
+    "save_external_id",
+    "store_policy_as",
+)
+
+
+def _validate_save_arguments(namespace: argparse.Namespace) -> None:
+    """Validate reusable-target controls before any AWS authentication occurs."""
+    save_requested = bool(
+        getattr(namespace, "save", False) or getattr(namespace, "save_name", None)
+    )
+    overrides = [
+        field for field in _SAVE_OVERRIDE_FIELDS if getattr(namespace, field, None)
+    ]
+    if overrides and not save_requested:
+        rendered = ", ".join(f"--{field.replace('_', '-')}" for field in overrides)
+        raise _UsageError(
+            f"{rendered} require --save=NAME, --save-name NAME, or bare --save."
+        )
+    for field in (
+        "save_name",
+        "save_source_account",
+        "save_role_account",
+        "save_boundary",
+        "store_policy_as",
+    ):
+        value = getattr(namespace, field, None)
+        if value:
+            _state.validate_name(value, kind=field.replace("_", " "))
+    if getattr(namespace, "save_external_id", False) and not getattr(
+        namespace, "external_id", None
+    ):
+        raise _UsageError("--save-external-id requires an explicit --external-id.")
+    if getattr(namespace, "save", False) and (
+        bool(getattr(namespace, "json", False)) or not sys.stdin.isatty()
+    ):
+        raise _UsageError(
+            "Bare --save needs an interactive post-login name prompt. In JSON or "
+            "non-interactive use, specify --save=NAME or --save-name NAME.",
+            code="SAVE_NAME_REQUIRED",
+        )
+
+
 @contextlib.contextmanager
 def _redirect_stdin(stream: object) -> Iterator[None]:
     """Temporarily provide a non-TTY input stream for strict machine mode."""
@@ -1127,15 +1412,16 @@ def _print_help(command: Sequence[str] = ()) -> None:
 
 
 def _validate_login(namespace: argparse.Namespace) -> None:
+    _validate_save_arguments(namespace)
     profile = getattr(namespace, "profile", None)
     if profile in {".", "default"}:
         namespace.profile = "default"
         profile = "default"
     if profile and not profile[0].isalnum():
         if getattr(namespace, "target", None):
-            raise _configs.OperationalError("Specify a target only once.")
+            raise _UsageError("Specify a target only once.")
         if len(profile) == 1:
-            raise _configs.OperationalError("A target shorthand requires a name.")
+            raise _UsageError("A target shorthand requires a name.")
         namespace.target = "+" + profile[1:]
         namespace.profile = None
     if getattr(namespace, "policy", None) and not (
@@ -1143,7 +1429,7 @@ def _validate_login(namespace: argparse.Namespace) -> None:
         or getattr(namespace, "boundary", None)
         or getattr(namespace, "target", None)
     ):
-        raise _configs.OperationalError("--policy requires --role or --boundary.")
+        raise _UsageError("--policy requires --role or --boundary.")
     if (
         getattr(namespace, "external_id", None)
         or getattr(namespace, "session_name", None)
@@ -1152,32 +1438,28 @@ def _validate_login(namespace: argparse.Namespace) -> None:
         or getattr(namespace, "boundary", None)
         or getattr(namespace, "target", None)
     ):
-        raise _configs.OperationalError(
-            "Role-only options require --role or --boundary."
-        )
+        raise _UsageError("Role-only options require --role or --boundary.")
     if getattr(namespace, "to", None) and (
         getattr(namespace, "to_directory", None)
         or getattr(namespace, "to_profile", None)
     ):
-        raise _configs.OperationalError(
+        raise _UsageError(
             "--to is mutually exclusive with --to-directory/--to-profile."
         )
     if getattr(namespace, "to_directory", None) and not getattr(
         namespace, "to_profile", None
     ):
-        raise _configs.OperationalError("--to-directory requires --to-profile.")
+        raise _UsageError("--to-directory requires --to-profile.")
     if getattr(namespace, "target", None) and not namespace.target.startswith("+"):
         namespace.target = "+" + namespace.target
     if getattr(namespace, "role", None) and getattr(namespace, "boundary", None):
-        raise _configs.OperationalError(
-            "--role and --boundary/--as are mutually exclusive."
-        )
+        raise _UsageError("--role and --boundary/--as are mutually exclusive.")
     if getattr(namespace, "target", None):
         data = _state.load_config()
         _, target = _state.get_resource(data, "target", namespace.target.lstrip("+"))
         direct_boundary = getattr(namespace, "boundary", None)
         if direct_boundary and target.get("boundary"):
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "A target with a saved boundary cannot accept --boundary/--as."
             )
         overrides = [
@@ -1196,13 +1478,14 @@ def _validate_login(namespace: argparse.Namespace) -> None:
             any(value is not None for value in overrides)
             or getattr(namespace, "directory", "~/.aws") != "~/.aws"
         ):
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "A saved target is a secure preset; source, destination, role, and policy cannot be overridden."
             )
 
 
 def _validate_assume(namespace: argparse.Namespace) -> None:
     """Validate assume-only grammar before AWS discovery or confirmation."""
+    _validate_save_arguments(namespace)
     positional_destination = getattr(namespace, "destination", None)
     if positional_destination:
         if (
@@ -1212,7 +1495,7 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
             or namespace.to_directory
             or namespace.to_profile
         ):
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "Positional DEST is mutually exclusive with saved targets, --self, "
                 "--to, --to-directory, and --to-profile."
             )
@@ -1227,48 +1510,46 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
         profile = "default"
     if profile and not profile[0].isalnum():
         if namespace.target:
-            raise _configs.OperationalError("Specify a saved target only once.")
+            raise _UsageError("Specify a saved target only once.")
         if len(profile) == 1:
-            raise _configs.OperationalError("A target shorthand requires a name.")
+            raise _UsageError("A target shorthand requires a name.")
         namespace.target = "+" + profile[1:]
         namespace.profile = None
         profile = None
     if namespace.target and not namespace.target.startswith("+"):
         namespace.target = "+" + namespace.target
     if not (profile or namespace.target):
-        raise _configs.OperationalError(
-            "Assume requires a source profile or saved target."
-        )
+        raise _UsageError("Assume requires a source profile or saved target.")
     if namespace.self_destination and namespace.keep_source:
-        raise _configs.OperationalError("--self cannot be combined with --keep-source.")
+        raise _UsageError("--self cannot be combined with --keep-source.")
     if namespace.self_destination and (namespace.to_directory or namespace.to_profile):
-        raise _configs.OperationalError(
+        raise _UsageError(
             "--self is mutually exclusive with --to-directory/--to-profile."
         )
     if namespace.to and (namespace.to_directory or namespace.to_profile):
-        raise _configs.OperationalError(
+        raise _UsageError(
             "--to is mutually exclusive with --to-directory/--to-profile."
         )
     if namespace.to_directory and not namespace.to_profile:
-        raise _configs.OperationalError("--to-directory requires --to-profile.")
+        raise _UsageError("--to-directory requires --to-profile.")
     if namespace.to:
         location, separator, destination_profile = namespace.to.partition(":")
         if not separator or not location or not destination_profile:
-            raise _configs.OperationalError("--to must be LOCATION:PROFILE.")
+            raise _UsageError("--to must be LOCATION:PROFILE.")
     data = _state.load_config()
     target: dict[str, Any] | None = None
     if namespace.target:
         _, target = _state.get_resource(data, "target", namespace.target.lstrip("+"))
         if namespace.self_destination:
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "A saved target owns its destination and cannot be combined with --self."
             )
         if namespace.aws_account_name:
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "A saved target supplies its source location; omit --name."
             )
         if namespace.to or namespace.to_directory or namespace.to_profile:
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "A saved target supplies its destination; use --self for an explicit "
                 "in-place assumption."
             )
@@ -1287,7 +1568,7 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
                 if value
             ]
             if overrides:
-                raise _configs.OperationalError(
+                raise _UsageError(
                     "A bounded target supplies its role contract and cannot be "
                     "combined with " + ", ".join(overrides) + "."
                 )
@@ -1305,7 +1586,7 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
                 if value
             ]
             if overrides:
-                raise _configs.OperationalError(
+                raise _UsageError(
                     "An unbounded target may add one saved --boundary/--as, not "
                     + ", ".join(overrides)
                     + "."
@@ -1315,7 +1596,7 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
             or target.get("destination_directory")
             or target.get("destination_profile")
         ):
-            raise _configs.OperationalError(
+            raise _UsageError(
                 "Saved target has no destination; update it or use --self."
             )
     elif not (
@@ -1324,13 +1605,13 @@ def _validate_assume(namespace: argparse.Namespace) -> None:
         or namespace.to_directory
         or namespace.to_profile
     ):
-        raise _configs.OperationalError(
+        raise _UsageError(
             "Assume requires --self, --to LOCATION:PROFILE, --to-profile PROFILE, "
             "or a saved target destination."
         )
     concrete_boundary = namespace.boundary or (target or {}).get("boundary")
     if not (namespace.role or concrete_boundary):
-        raise _configs.OperationalError(
+        raise _UsageError(
             "Assume requires a concrete --role, saved --boundary/--as, or bounded "
             "target."
         )
@@ -2105,6 +2386,44 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
         return _configs.Result(
             "RESOURCE_HELP", f"Choose an action for {kind}.", 2, "stderr"
         )
+    if kind == "target" and action == "add" and args.from_session:
+        manual = [
+            option
+            for option, supplied in (
+                ("--source-account", args.source_account),
+                ("--source-profile", args.source_profile is not None),
+                ("--source-location", args.source_location is not None),
+                ("--source-directory", args.source_directory),
+                ("--to", args.to),
+                ("--to-directory", args.to_directory),
+                ("--to-profile", args.to_profile),
+                ("--boundary", args.boundary),
+                ("--region", args.region),
+                ("--allow-unknown-region", args.allow_unknown_region),
+            )
+            if supplied
+        ]
+        if manual:
+            raise _UsageError(
+                "--from-session reconstructs the target shape and cannot be combined "
+                f"with {', '.join(manual)}."
+            )
+        return _sessions.save_target_from_session(args)
+    if kind == "target" and action == "add":
+        if not args.source_account:
+            raise _UsageError(
+                "target add requires --source-account unless --from-session is used."
+            )
+        recovery_only = [
+            field
+            for field in (*_SAVE_OVERRIDE_FIELDS, "external_id", "policy")
+            if getattr(args, field, None)
+        ]
+        if recovery_only:
+            rendered = ", ".join(
+                f"--{field.replace('_', '-')}" for field in recovery_only
+            )
+            raise _UsageError(f"{rendered} require --from-session PROFILE.")
     data = _state.load_config()
     if action == "list":
         values = [
@@ -2222,7 +2541,7 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
         else:
             value = {
                 "source_account": args.source_account,
-                "source_profile": args.source_profile,
+                "source_profile": args.source_profile or "default",
             }
             if args.source_directory:
                 value["source_directory"] = str(
@@ -2230,7 +2549,7 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
                 )
             else:
                 value["source_location"] = _state.normalize_location(
-                    args.source_location
+                    args.source_location or "default"
                 )
             if args.to:
                 location, separator, profile = args.to.partition(":")
@@ -3081,12 +3400,12 @@ def _run_config(args: argparse.Namespace) -> _configs.Result:
 
 
 _HISTORY_OUTCOMES = {
-    "success": ("✓", "success"),
+    "success": ("OK", "success"),
     "usage-error": ("?", "usage error"),
-    "policy-refusal": ("⊘", "policy refusal"),
-    "cancelled": ("○", "cancelled"),
+    "policy-refusal": ("-", "policy refusal"),
+    "cancelled": ("o", "cancelled"),
     "operational-error": ("!", "operational error"),
-    "interrupted": ("↯", "interrupted"),
+    "interrupted": ("^", "interrupted"),
     "crashed": ("X", "crashed/abandoned"),
 }
 
@@ -3102,6 +3421,8 @@ def _history_records(args: argparse.Namespace) -> list[dict[str, object]]:
         outcome=getattr(args, "outcome", None),
         account=getattr(args, "account", None),
         resource=getattr(args, "resource", None),
+        failure=getattr(args, "failure", None),
+        phase=getattr(args, "phase", None),
         limit=getattr(args, "limit", 50),
         include_running=bool(getattr(args, "include_running", False)),
     )
@@ -3110,12 +3431,12 @@ def _history_records(args: argparse.Namespace) -> list[dict[str, object]]:
 def _history_list_text(records: list[dict[str, object]], *, wide: bool = False) -> str:
     columns = ["ID", "STARTED", "S", "COMMAND", "PROFILE"]
     if wide:
-        columns.extend(("ACCOUNT", "RESOURCE", "RESULT", "MS"))
+        columns.extend(("ACCOUNT", "RESOURCE", "RESULT", "FAILURE", "MS"))
     rows: list[list[object]] = []
     used_symbols: set[str] = set()
     for record in records:
         outcome = str(record.get("outcome") or "")
-        symbol = _HISTORY_OUTCOMES.get(outcome, ("…", "running/unknown"))[0]
+        symbol = _HISTORY_OUTCOMES.get(outcome, ("...", "running/unknown"))[0]
         used_symbols.add(symbol)
         row: list[object] = [
             str(record["id"])[:8],
@@ -3125,11 +3446,15 @@ def _history_list_text(records: list[dict[str, object]], *, wide: bool = False) 
             record.get("profile"),
         ]
         if wide:
+            failure = _history.parse_failure_event(record)
             row.extend(
                 (
                     record.get("accountId"),
                     record.get("resourceName") or record.get("resourceArn"),
                     record.get("resultCode"),
+                    str(failure.get("kind", "")).removeprefix("parse.")
+                    if failure
+                    else None,
                     record.get("durationMs"),
                 )
             )
@@ -3142,8 +3467,8 @@ def _history_list_text(records: list[dict[str, object]], *, wide: bool = False) 
         for outcome, (symbol, meaning) in _HISTORY_OUTCOMES.items()
         if symbol in used_symbols and outcome
     ]
-    if "…" in used_symbols:
-        meanings.append(("…", "running/unknown"))
+    if "..." in used_symbols:
+        meanings.append(("...", "running/unknown"))
     return f"{table}\n\nKey: " + "  ".join(
         f"{symbol} {meaning}" for symbol, meaning in meanings
     )
@@ -3202,6 +3527,47 @@ def _history_show_text(record: dict[str, object]) -> str:
             )
     if record.get("recoveryUnresolved") is True:
         lines.append("Recovery: unresolved; retention and clear preserve this record.")
+    save_event = _history.session_save_event(record)
+    if save_event is not None:
+        event_data = save_event.get("data")
+        save_data = event_data if isinstance(event_data, dict) else {}
+        save_context = [
+            f"{label}={save_data.get(key)}"
+            for key, label in (("target", "target"), ("boundary", "boundary"))
+            if save_data.get(key)
+        ]
+        save_suffix = f" ({', '.join(save_context)})" if save_context else ""
+        lines.append(
+            "Session save: "
+            f"{save_data.get('status') or '-'}{save_suffix}; "
+            f"requested={'yes' if save_data.get('requested') is True else 'no'}; "
+            "credentials active="
+            f"{'yes' if save_data.get('credentialsActive') is True else 'no'}"
+        )
+    parse_event = _history.parse_failure_event(record)
+    if parse_event is not None:
+        event_data = parse_event.get("data")
+        data = event_data if isinstance(event_data, dict) else {}
+        repair = data.get("repair")
+        repair_data = repair if isinstance(repair, dict) else {}
+        lines.extend(
+            (
+                f"Parse phase: {data.get('phase') or '-'}",
+                (
+                    "Parse failure: "
+                    + str(
+                        parse_event.get("kind") or "parse.invalid-syntax"
+                    ).removeprefix("parse.")
+                ),
+                f"Safe attempted shape: {_history.parse_template(parse_event)}",
+                f"Repair: {repair_data.get('helpCommand') or 'hacksaws --help'}",
+                "Privacy: raw arguments and values were never stored.",
+            )
+        )
+    elif record.get("command") == "unknown" and record.get("outcome") == "usage-error":
+        lines.append(
+            "Parse detail: unavailable (recorded before safe structural capture)."
+        )
     return "\n".join(lines)
 
 
@@ -3209,6 +3575,9 @@ def _history_report(records: list[dict[str, object]]) -> dict[str, object]:
     outcomes: dict[str, int] = {}
     commands: dict[str, int] = {}
     duration = 0
+    failures: dict[str, int] = {}
+    session_saves: dict[str, int] = {}
+    account_registrations: dict[str, int] = {}
     for record in records:
         outcome = str(record.get("outcome") or record.get("state") or "unknown")
         command = str(record.get("command") or "unknown")
@@ -3217,25 +3586,65 @@ def _history_report(records: list[dict[str, object]]) -> dict[str, object]:
         value = record.get("durationMs")
         if type(value) is int:
             duration += value
+        parse_event = _history.parse_failure_event(record)
+        if parse_event is not None:
+            failure = str(
+                parse_event.get("kind") or "parse.invalid-syntax"
+            ).removeprefix("parse.")
+            failures[failure] = failures.get(failure, 0) + 1
+        save_event = _history.session_save_event(record)
+        if save_event is not None:
+            save_status = str(
+                save_event.get("kind") or "session-save.unknown"
+            ).removeprefix("session-save.")
+            session_saves[save_status] = session_saves.get(save_status, 0) + 1
+        registration_event = _history.account_registration_event(record)
+        if registration_event is not None:
+            registration_status = str(
+                registration_event.get("kind") or "account-registration.unknown"
+            ).removeprefix("account-registration.")
+            account_registrations[registration_status] = (
+                account_registrations.get(registration_status, 0) + 1
+            )
     return {
         "count": len(records),
         "durationMs": duration,
         "outcomes": dict(sorted(outcomes.items())),
         "commands": dict(sorted(commands.items())),
+        "argumentFailures": dict(sorted(failures.items())),
+        "sessionSaves": dict(sorted(session_saves.items())),
+        "accountRegistrations": dict(sorted(account_registrations.items())),
     }
 
 
 def _history_report_text(report: dict[str, object]) -> str:
     outcomes = cast("dict[str, int]", report["outcomes"])
     commands = cast("dict[str, int]", report["commands"])
-    return "\n\n".join(
-        (
-            f"Commands: {report['count']}  Total duration: {report['durationMs']} ms",
-            "Outcomes\n" + _text_table(("OUTCOME", "COUNT"), list(outcomes.items())),
-            "Command families\n"
-            + _text_table(("COMMAND", "COUNT"), list(commands.items())),
+    failures = cast("dict[str, int]", report["argumentFailures"])
+    session_saves = cast("dict[str, int]", report["sessionSaves"])
+    account_registrations = cast("dict[str, int]", report["accountRegistrations"])
+    sections = [
+        f"Commands: {report['count']}  Total duration: {report['durationMs']} ms",
+        "Outcomes\n" + _text_table(("OUTCOME", "COUNT"), list(outcomes.items())),
+        "Command families\n"
+        + _text_table(("COMMAND", "COUNT"), list(commands.items())),
+    ]
+    if failures:
+        sections.append(
+            "Argument failures\n"
+            + _text_table(("FAILURE", "COUNT"), list(failures.items()))
         )
-    )
+    if session_saves:
+        sections.append(
+            "Session saves\n"
+            + _text_table(("STATUS", "COUNT"), list(session_saves.items()))
+        )
+    if account_registrations:
+        sections.append(
+            "Account registrations\n"
+            + _text_table(("STATUS", "COUNT"), list(account_registrations.items()))
+        )
+    return "\n\n".join(sections)
 
 
 def _history_status_text(report: dict[str, object]) -> str:
@@ -3245,6 +3654,12 @@ def _history_status_text(report: dict[str, object]) -> str:
             f"History database: {report['database']}",
             f"Health: {report['integrity']}",
             f"Records: {report['count']} ({report['running']} running)",
+            (
+                f"Events: {report['events']} "
+                f"({report['parseFailures']} parse failures; "
+                f"{report['sessionSaves']} session saves; "
+                f"{report['accountRegistrations']} account registrations)"
+            ),
             f"Logical size: {report['logicalBytes']} bytes",
             f"Range: {report['oldest'] or '-'} to {report['newest'] or '-'}",
             (
@@ -3310,7 +3725,11 @@ def _run_history(args: argparse.Namespace) -> _configs.Result:
             (
                 "History database and safe records are valid."
                 if report["ok"]
-                else f"History check found {report['corruptRecords']} corrupt records."
+                else (
+                    "History check found "
+                    f"{report['corruptRecords']} corrupt records and "
+                    f"{report['corruptEvents']} corrupt events."
+                )
             ),
             0 if report["ok"] else 1,
             data=report,
@@ -3376,19 +3795,53 @@ def _console_main_invocation(
     raw_arguments = list(sys.argv[1:] if arguments is None else arguments)
     preselected_json = _json_requested(raw_arguments)
     _configs.configure_output(color="auto", json_output=preselected_json)
+    parser = _create_parser()
+    parse_observation = _history.observe_arguments_safely(parser, raw_arguments)
     try:
         normalized_arguments, requested_color, use_json = _extract_global_options(
             raw_arguments
         )
+    except _configs.OperationalError as error:
+        if history_handle is not None:
+            _history.note_parse_failure(
+                history_handle, parse_observation, phase="global", kind="invalid-value"
+            )
+        return _configs.Result(
+            "ARGUMENT_ERROR", f"Error: {error}", _configs.EXIT_USAGE, "stderr"
+        ).echo()
+    try:
+        normalized_arguments = _normalize_login_save_options(normalized_arguments)
+    except _configs.OperationalError as error:
+        if history_handle is not None:
+            _history.note_parse_failure(
+                history_handle,
+                parse_observation,
+                phase="semantic",
+                kind=(
+                    "missing-option-value"
+                    if getattr(error, "code", None) == "SAVE_NAME_REQUIRED"
+                    else "invalid-combination"
+                ),
+            )
+        return _configs.Result(
+            "ARGUMENT_ERROR", f"Error: {error}", _configs.EXIT_USAGE, "stderr"
+        ).echo()
+    try:
         _iam_cli.validate_selector_arguments(normalized_arguments)
     except _configs.OperationalError as error:
+        if history_handle is not None:
+            _history.note_parse_failure(
+                history_handle,
+                parse_observation,
+                phase="selector",
+                kind="conflicting-option",
+            )
         return _configs.Result(
             "ARGUMENT_ERROR", f"Error: {error}", _configs.EXIT_USAGE, "stderr"
         ).echo()
     _configs.configure_output(
         color=cast("Any", requested_color or "auto"), json_output=use_json
     )
-    parser = _create_parser()
     parse_stderr = io.StringIO()
     parse_stdout = io.StringIO()
     try:
@@ -3402,6 +3855,10 @@ def _console_main_invocation(
         ):
             namespace = parser.parse_args(normalized_arguments)
     except SystemExit as error:
+        if error.code != 0 and history_handle is not None:
+            _history.note_parse_failure(
+                history_handle, parse_observation, phase="argparse"
+            )
         result = _configs.Result(
             "HELP" if error.code == 0 else "ARGUMENT_ERROR",
             "" if error.code == 0 else parse_stderr.getvalue().strip(),
@@ -3441,6 +3898,8 @@ def _console_main_invocation(
     ):
         namespace.mfa_code = namespace.profile
         namespace.profile = None
+    if history_handle is not None:
+        _history.enrich(history_handle, namespace)
     if namespace.access_type == "mfa" and namespace.action in {"login", "in"}:
         missing_code = namespace.mfa_code is None and not bool(
             getattr(namespace, "mfa_code_stdin", False)
@@ -3450,6 +3909,13 @@ def _console_main_invocation(
             usage = parser.format_usage().strip()
             if not use_json:
                 parser.print_usage(sys.stderr)
+            if history_handle is not None:
+                _history.note_parse_failure(
+                    history_handle,
+                    parse_observation,
+                    phase="semantic",
+                    kind="missing-required-option",
+                )
             return _configs.Result(
                 "ARGUMENT_ERROR",
                 "the following arguments are required: PROFILE CODE or +TARGET CODE.",
@@ -3457,8 +3923,6 @@ def _console_main_invocation(
                 "stderr",
                 {"usage": usage} if use_json else None,
             ).echo()
-    if history_handle is not None:
-        _history.enrich(history_handle, namespace)
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
     machine_stdin = _NonInteractiveStdin()
@@ -3524,10 +3988,25 @@ def _console_main_invocation(
             else:
                 result = _run_config(namespace)
     except _configs.OperationalError as error:
+        if (
+            history_handle is not None
+            and int(getattr(error, "exit_code", _configs.EXIT_ERROR))
+            == _configs.EXIT_USAGE
+        ):
+            _history.note_parse_failure(
+                history_handle,
+                parse_observation,
+                phase="semantic",
+                kind=(
+                    "missing-option-value"
+                    if getattr(error, "code", None) == "SAVE_NAME_REQUIRED"
+                    else "invalid-combination"
+                ),
+            )
         result = _configs.Result(
             getattr(error, "code", "OPERATIONAL_ERROR"),
             f"Error: {error}",
-            1,
+            int(getattr(error, "exit_code", _configs.EXIT_ERROR)),
             "stderr",
             error.data,
             error.details,

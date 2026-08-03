@@ -120,6 +120,56 @@ def test_allowlist_never_persists_sensitive_or_free_form_values(
     ]
 
 
+def test_unknown_path_extensions_are_not_persisted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    canary = "private-extension-canary"
+    handle = _history.begin(json_mode=False, interactive=False)
+    _history.enrich(
+        handle,
+        argparse.Namespace(
+            access_type="iam",
+            iam_action="policy",
+            policy_action="add",
+            file=f"C:\\private\\policy.{canary}",
+            policy=f"C:\\private\\boundary.{canary}",
+        ),
+    )
+    _history.finish(handle, _result())
+
+    record = _history.list_records()[0]
+    exported = _history.export_records([record], format_name="json")
+    assert canary not in exported
+    assert canary.encode() not in _history.database_path().read_bytes()
+    safe = cast("dict[str, object]", record["safe"])
+    assert safe["inputKinds"] == [
+        {"format": "other", "role": "file"},
+        {"format": "other", "role": "policy-file"},
+    ]
+
+
+def test_argument_observer_failure_is_safe_and_does_not_block_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    canary = "OBSERVER-FAILURE-CANARY"
+
+    def fail_observer(
+        _parser: argparse.ArgumentParser, _arguments: list[str]
+    ) -> dict[str, object]:
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(_history, "observe_arguments", fail_observer)
+    result = _cli.console_main(["--help"])
+
+    assert result.exit_code == 0
+    raw_database = _history.database_path().read_bytes()
+    assert canary.encode() not in raw_database
+    record = _history.list_records()[0]
+    assert record["command"] == "unknown"
+
+
 def test_finish_preserves_safe_parser_metadata_and_result_metrics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -170,6 +220,33 @@ def test_post_prompt_mfa_enrichment_records_presence_and_source_only(
     assert safe["mfaCodeProvided"] is True
     assert safe["mfaCodeSource"] == "prompt"
     assert "mfaCode" not in safe
+
+
+def test_account_registration_history_is_separate_and_count_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    handle = _history.begin(json_mode=False, interactive=False)
+    _history.note_account_registration(
+        status="completed", created=1, reused=1, refreshed=0
+    )
+    _history.finish(handle, _result())
+
+    record = _history.list_records()[0]
+    event = _history.account_registration_event(record)
+    assert event is not None
+    assert event["kind"] == "account-registration.completed"
+    assert event["data"] == {
+        "eventSchemaVersion": _history.EVENT_SCHEMA_VERSION,
+        "redactionVersion": _history.REDACTION_VERSION,
+        "status": "completed",
+        "created": 1,
+        "reused": 1,
+        "refreshed": 0,
+    }
+    report = _history.status()
+    assert report["accountRegistrations"] == 1
+    assert _history.check()["ok"] is True
 
 
 @pytest.mark.parametrize(
@@ -374,7 +451,7 @@ def test_history_list_show_report_status_and_check_are_human_friendly(
     list_output = capsys.readouterr().out
     assert "ID" in list_output
     assert "iam.role.get" in list_output
-    assert "Key: ✓ success" in list_output
+    assert "Key: OK success" in list_output
 
     assert _cli.console_main(["history", "show", identifier[:8]]).exit_code == 0
     show_output = capsys.readouterr().out

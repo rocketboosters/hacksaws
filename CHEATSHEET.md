@@ -46,7 +46,25 @@ Shared login flags:
 --htl N | --mtl N | --stl N    role-only hours/minutes/seconds aliases
 --ecr [--podman] [--ecr-region REGION]...
 --remote                       browser login only
+--save=NAME                    save a reusable +NAME after successful login
+--save-name NAME               explicit-token form of --save=NAME
+--save                         prompt for NAME after credential commit (TTY only)
 ```
+
+Save-only advanced controls:
+
+```text
+--save-source-account NAME    override the discovered source-account key
+--save-role-account NAME      override the discovered role-account key
+--save-boundary NAME          override the generated boundary name
+--save-external-id            explicitly persist the supplied --external-id
+--store-policy-as NAME        copy a local policy into reusable policy storage
+```
+
+`--save=NAME` is intentionally equals-only. `--save NAME` is rejected as
+ambiguous; use `--save-name NAME` when separate tokens are preferable. Bare
+`--save` is interactive only and prompts after credentials are committed.
+JSON/non-TTY use fails before authentication with `SAVE_NAME_REQUIRED`.
 
 Examples:
 
@@ -79,6 +97,7 @@ hacksaws assume SOURCE --boundary NAME (--self | --to ... | --to-profile ...)
 hacksaws assume +TARGET [OPTIONS]
 hacksaws assume --target TARGET [OPTIONS]
 hacksaws assume SOURCE DEST --role ROLE_OR_ARN [OPTIONS]
+hacksaws assume SOURCE --role ROLE_OR_ARN --to agent:default --save=prod-agent
 ```
 
 Positional `DEST` means `--to-profile DEST` in the source location. It conflicts
@@ -144,8 +163,17 @@ hacksaws target add NAME --source-account ACCOUNT [--source-profile PROFILE] \
   [--source-location LOCATION|--source-directory PATH] \
   [--to LOCATION:PROFILE|--to-directory PATH --to-profile PROFILE] \
   [--boundary BOUNDARY] [--description TEXT]
+hacksaws target add NAME --from-session PROFILE \
+  [--location LOCATION|-d DIRECTORY] [--policy VALUE] \
+  [--save-source-account NAME] [--save-role-account NAME] \
+  [--save-boundary NAME] [--external-id VALUE --save-external-id] \
+  [--store-policy-as NAME]
 hacksaws target update NAME [--boundary NAME|--clear-boundary]
 ```
+
+`target add --from-session` reconstructs configuration only from a usable,
+Hacksaws-managed active session. It is the recovery path when authentication
+succeeded but the optional post-login configuration save did not.
 
 ## Regions
 
@@ -229,7 +257,8 @@ hacksaws config import ARCHIVE.zip [--replace] [--yes]
 
 ```shell
 hacksaws history list [PATTERN]... [--since TIME] [--until TIME] [--wide]
-hacksaws history search PATTERN... [--command FAMILY] [--outcome OUTCOME]
+hacksaws history search PATTERN... [--command FAMILY] [--outcome OUTCOME] \
+  [--failure KIND] [--phase PHASE]
 hacksaws history show HISTORY_ID
 hacksaws history report [--since TIME] [--account ACCOUNT]
 hacksaws history export [PATTERN]... [--format jsonl|json] [--output FILE]
@@ -239,17 +268,26 @@ hacksaws history clear (--before TIME|--all) [--dry-run] [--yes]
 ```
 
 List/search/report/export also accept `--command`, `--outcome`, `--account`,
-`--resource`, `--limit`, and `--include-running`. `TIME` is an ISO timestamp or
-a duration ago using seconds, minutes, hours, days, or weeks, such as `15m`,
-`24h`, `7d`, or `2weeks`. Clear never removes a running command or unresolved
-recovery record; interactive apply requires typing exactly `yes`, and
-noninteractive/JSON apply requires `--yes`.
+`--resource`, `--failure`, `--phase`, `--limit`, and `--include-running`.
+`--failure` selects a safe failure category such as `unknown-option` or
+`missing-option-value`; `--phase` selects `global`, `selector`, `argparse`, or
+`semantic`. `TIME` is an ISO timestamp or a duration ago using seconds, minutes,
+hours, days, or weeks, such as `15m`, `24h`, `7d`, or `2weeks`. Clear never
+removes a running command or unresolved recovery record; interactive apply
+requires typing exactly `yes`, and noninteractive/JSON apply requires `--yes`.
 
 History stores safe command metadata and outcomes, never raw arguments,
 stdout/stderr, prompts, paths, documents, credentials, MFA codes, external IDs,
 or exception text. Defaults are 90 days, 10,000 records, and 50 MiB. Inspect or
 change `history.enabled`, `history.max_age`, `history.max_entries`, and
 `history.max_bytes` with `hacksaws config options|get|set`.
+
+Future parse failures store only a bounded, allowlisted command shape: canonical
+command/recognized alias, known option names and value classes/states,
+positional roles, opaque counts, failure phase/kind, and a help command. Unknown
+tokens, identifiers, values, paths, and the literal `--` tail are never stored.
+Older records remain honestly unavailable; Hacksaws cannot reconstruct prior
+failed attempts after the fact.
 
 Human `status` output is a compact, dynamic table. `LOCATION` is hidden when all
 rows use the default location; `TTL` is hidden when no displayed session has a
