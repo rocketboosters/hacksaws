@@ -82,6 +82,7 @@ def _configured(
     root = _home(tmp_path, monkeypatch)
     aws = tmp_path / "aws"
     data = _state.default_config()
+    data["aws"]["region"] = "us-west-2"
     data["accounts"]["Prod"] = {"id": ACCOUNT, "partition": "aws"}
     if boundary:
         data["boundaries"]["Guard"] = {
@@ -370,14 +371,30 @@ def test_target_identity_and_role_account_partition_checks(
     assert boundary == "Guard"
 
     data = _state.load_config()
-    data["accounts"]["Other"] = {"id": OTHER_ACCOUNT, "partition": "aws-cn"}
+    data["accounts"]["Other"] = {"id": OTHER_ACCOUNT, "partition": "aws"}
     _state.save_config(data)
     role, *_ = _sessions._role_details(
         _args(account="Other", role="Worker"), {}, ACCOUNT, "aws"
     )
-    assert role == f"arn:aws-cn:iam::{OTHER_ACCOUNT}:role/Worker"
+    assert role == f"arn:aws:iam::{OTHER_ACCOUNT}:role/Worker"
+
+    data["accounts"]["Other"]["partition"] = "aws-cn"
+    _state.save_config(data)
+    partition_error = "authenticated caller partition"
+    with pytest.raises(_configs.OperationalError, match=partition_error):
+        _sessions._role_details(
+            _args(account="Other", role="Worker"), {}, ACCOUNT, "aws"
+        )
     with pytest.raises(_configs.OperationalError, match="conflicts with --account"):
         _sessions._role_details(_args(account="Other", role=ROLE), {}, ACCOUNT, "aws")
+
+    with pytest.raises(_configs.OperationalError, match=partition_error):
+        _sessions._role_details(
+            _args(role=f"arn:aws-cn:iam::{OTHER_ACCOUNT}:role/Worker"),
+            {},
+            ACCOUNT,
+            "aws",
+        )
 
     target["boundary_data"]["role_arn"] = f"arn:aws:iam::{OTHER_ACCOUNT}:role/Guard"
     target["boundary_data"]["account"] = "Prod"
@@ -399,6 +416,13 @@ def test_role_validation_rejects_invalid_or_missing_operands(
         with pytest.raises(_configs.OperationalError, match=message):
             _sessions._require_concrete_role(_args(policy="Read"), role)
     _sessions._require_concrete_role(_args(), None)
+
+
+def test_invalid_role_error_does_not_echo_pathlike_input() -> None:
+    sentinel = r"C:\sensitive\agent-boundary.json"
+    with pytest.raises(_configs.OperationalError) as raised:
+        _sessions._role_details(_args(role=f"arn:{sentinel}"), {}, ACCOUNT, "aws")
+    assert sentinel not in str(raised.value)
 
 
 def test_configured_role_and_session_name_resolution(
@@ -689,8 +713,18 @@ def test_aws_login_passes_remote_and_wraps_subprocess_errors(tmp_path: Path) -> 
             "dev",
             remote=True,
             login_cache=login_cache,
+            region_name="us-west-2",
         )
-    assert run.call_args.args[0] == ["aws", "login", "--profile", "dev", "--remote"]
+        assert run.call_args.args[0] == [
+            "aws",
+            "login",
+            "--profile",
+            "dev",
+            "--region",
+            "us-west-2",
+            "--no-cli-auto-prompt",
+            "--remote",
+        ]
     assert run.call_args.kwargs["env"]["AWS_CONFIG_FILE"] == str(config)
     assert run.call_args.kwargs["env"]["AWS_LOGIN_CACHE_DIRECTORY"] == str(login_cache)
     with (
@@ -707,6 +741,7 @@ def test_aws_login_passes_remote_and_wraps_subprocess_errors(tmp_path: Path) -> 
             "dev",
             remote=False,
             login_cache=login_cache,
+            region_name="us-west-2",
         )
 
 
@@ -747,8 +782,10 @@ def test_native_browser_remote_cache_ecr_success_and_logout(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del remote
+        assert region_name == "us-west-2"
         assert (
             _write_browser_login(config, login_cache, profile).absolute()
             == new_cache.absolute()
@@ -802,8 +839,10 @@ def test_native_browser_logout_preserves_a_later_same_path_replacement(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del credentials, remote
+        assert region_name == "us-east-1"
         assert profile == "debug"
         assert login_cache == cache.absolute()
         config.parent.mkdir(parents=True, exist_ok=True)
@@ -812,7 +851,7 @@ def test_native_browser_logout_preserves_a_later_same_path_replacement(
             == new_cache.absolute()
         )
 
-    args = _args(directory=str(aws), profile="debug")
+    args = _args(directory=str(aws), profile="debug", region="us-east-1")
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=native),
@@ -857,15 +896,17 @@ def test_native_browser_post_login_failure_reports_complete_rollback(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del credentials, profile, remote
+        assert region_name == "us-east-1"
         assert login_cache == cache.absolute()
         assert (
             _write_browser_login(config_path, login_cache, "debug").absolute()
             == new_cache.absolute()
         )
 
-    args = _args(directory=str(aws), profile="debug")
+    args = _args(directory=str(aws), profile="debug", region="us-east-1")
     with (
         patch("hacksaws._sessions._aws_login", side_effect=login),
         patch("hacksaws._sessions.boto3.Session", return_value=MagicMock()),
@@ -951,8 +992,10 @@ def test_bounded_browser_restores_environment_when_assume_fails(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del credentials, remote
+        assert region_name == "us-west-2"
         assert inherited_cache not in login_cache.parents
         _write_browser_login(config, login_cache, profile)
 

@@ -147,6 +147,40 @@ hacksaws target add NAME --source-account ACCOUNT [--source-profile PROFILE] \
 hacksaws target update NAME [--boundary NAME|--clear-boundary]
 ```
 
+## Regions
+
+```shell
+hacksaws region list [PATTERN]... [--partition PARTITION|--account ACCOUNT]
+hacksaws region list --all-partitions
+hacksaws region explain REGION_OR_ALIAS [--account ACCOUNT]
+hacksaws region alias add ALIAS REGION_OR_ALIAS [--description TEXT]
+hacksaws region alias update ALIAS [--region REGION_OR_ALIAS] \
+  [--description TEXT|--clear-description]
+hacksaws region alias get ALIAS
+hacksaws region alias list [PATTERN]...
+hacksaws region alias rename ALIAS NEW_ALIAS
+hacksaws region alias remove ALIAS
+
+hacksaws account update ACCOUNT --region REGION_OR_ALIAS|--clear-region
+hacksaws target update TARGET --region REGION_OR_ALIAS|--clear-region
+hacksaws config set aws.region REGION_OR_ALIAS
+hacksaws config reset aws.region
+hacksaws profile region get [--profile PROFILE|--target TARGET]
+hacksaws profile region set REGION_OR_ALIAS [--profile PROFILE|--target TARGET]
+hacksaws profile region clear [--profile PROFILE|--target TARGET]
+```
+
+Accepted inputs are canonical names (`us-west-2`), collision-free compact
+aliases (`usw2`), curated geography aliases (`oregon`), and global custom
+aliases. Aliases are input-only; configuration persists canonical names.
+
+Precedence: `--region` → `AWS_REGION` → `AWS_DEFAULT_REGION` → saved target →
+destination profile → source profile → account preference → `aws.region` →
+interactive prompt. Noninteractive execution never prompts. Use
+`--allow-unknown-region` only for an exact canonical-shaped region missing from
+Botocore; alias-like unknowns and partition mismatches still fail. See
+[Regions and aliases](docs/regions.md).
+
 ## Policies
 
 ```shell

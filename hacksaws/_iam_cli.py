@@ -24,6 +24,7 @@ from hacksaws import _iam_policy_cli
 from hacksaws import _iam_recovery
 from hacksaws import _iam_role_cli
 from hacksaws import _output
+from hacksaws import _regions
 from hacksaws import _state
 
 if TYPE_CHECKING:
@@ -141,6 +142,15 @@ def add_selector_arguments(
         metavar="REGION",
         help="AWS region used for regional clients and console links.",
     )
+    credentials.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        default=False if root else argparse.SUPPRESS,
+        help=(
+            "Allow an exact canonical region absent from bundled Botocore metadata; "
+            "aliases never bypass validation."
+        ),
+    )
     if mutation:
         safety = parser.add_argument_group("safety")
         safety.add_argument(
@@ -172,6 +182,7 @@ _SELECTOR_SPELLINGS = {
     "target": ("--target",),
     "account": ("--account",),
     "region": ("--region",),
+    "allow_unknown_region": ("--allow-unknown-region",),
     "yes": ("--yes",),
     "dry_run": ("--dry-run",),
 }
@@ -790,14 +801,20 @@ def _cleanup_plan_text(data: Mapping[str, object]) -> str:
     return "\n".join(_output.safe_terminal_text(line) for line in lines)
 
 
-def _iam_console_url(partition: str) -> str:
+def _iam_console_url(context: IamCommandContext) -> str:
     """Return the partition-appropriate IAM console home link."""
+    partition = getattr(context, "partition", "aws")
+    region_name = getattr(context, "region_name", "us-east-1")
     domain = {
         "aws": "console.aws.amazon.com",
         "aws-cn": "console.amazonaws.cn",
         "aws-us-gov": "console.amazonaws-us-gov.com",
-    }.get(partition, "console.aws.amazon.com")
-    return f"https://{domain}/iam/home#/home"
+    }.get(partition)
+    if domain is None:
+        raise _configs.OperationalError(
+            f"AWS Console links are not supported for partition {partition!r}."
+        )
+    return f"https://{region_name}.{domain}/iam/home?region={region_name}#/home"
 
 
 def cleanup_result(
@@ -891,7 +908,7 @@ def cleanup_result(
             )
     outcome = service.execute(plan)
     result_data = outcome.as_dict()
-    console_url = _iam_console_url(plan.partition)
+    console_url = _iam_console_url(context)
     result_data["consoleUrl"] = console_url
     applied = {
         "operationsPlanned": len(plan.steps),
@@ -991,6 +1008,8 @@ class IamCommandContext:
     account_id: str
     partition: str
     arn: str
+    region_name: str
+    region_resolution: _regions.RegionResolution
 
     @classmethod
     def create(
@@ -1002,12 +1021,74 @@ class IamCommandContext:
         """Resolve local selection, create clients, and verify caller identity only."""
         selector = _configs.resolve_credential_selector(args)
         directory, profile, expected_account = _selected_source(selector, args)
+        region_settings = _iam_region_settings(selector, expected_account)
+        env_region = os.getenv("AWS_REGION") or ""
+        env_default_region = os.getenv("AWS_DEFAULT_REGION") or ""
         with credential_environment(directory / "config", directory / "credentials"):
             try:
-                selected_session = session_factory(
-                    profile_name=profile, region_name=args.region
+                higher_precedence_region = any(
+                    (
+                        getattr(args, "region", None),
+                        env_region,
+                        env_default_region,
+                        region_settings["target"],
+                    )
                 )
-                credentials = selected_session.get_credentials()
+                profile_session = (
+                    None
+                    if higher_precedence_region
+                    else session_factory(profile_name=profile)
+                )
+                profile_credentials = (
+                    profile_session.get_credentials()
+                    if profile_session is not None
+                    else None
+                )
+                if profile_session is not None and profile_credentials is None:
+                    raise _configs.OperationalError(
+                        f"Selected AWS profile {profile!r} has no credentials."
+                    )
+                preference = _regions.resolve_region_preference(
+                    explicit=getattr(args, "region", None),
+                    env_region=env_region,
+                    env_default_region=env_default_region,
+                    target=region_settings["target"],
+                    source=(
+                        profile_session.region_name
+                        if profile_session is not None
+                        else None
+                    ),
+                    account=region_settings["account"],
+                    global_region=region_settings["global"],
+                    custom_aliases=region_settings["aliases"],
+                    partition=(
+                        str(expected_account["partition"])
+                        if expected_account is not None
+                        else None
+                    ),
+                    allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
+                    interactive=False,
+                )
+                region_resolution = _regions.validate_service_region(
+                    preference.resolution,
+                    "sts",
+                    allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
+                )
+                region_name = region_resolution.canonical
+                selected_session = (
+                    profile_session
+                    if profile_session is not None
+                    and profile_session.region_name == region_name
+                    else session_factory(
+                        profile_name=profile,
+                        region_name=region_name,
+                    )
+                )
+                credentials = (
+                    profile_credentials
+                    if selected_session is profile_session
+                    else selected_session.get_credentials()
+                )
                 if credentials is None:
                     raise _configs.OperationalError(
                         f"Selected AWS profile {profile!r} has no credentials."
@@ -1017,7 +1098,7 @@ class IamCommandContext:
                     aws_access_key_id=frozen.access_key,
                     aws_secret_access_key=frozen.secret_key,
                     aws_session_token=frozen.token,
-                    region_name=args.region or selected_session.region_name,
+                    region_name=region_name,
                 )
                 sts = session.client("sts")
                 iam = session.client("iam")
@@ -1034,6 +1115,16 @@ class IamCommandContext:
                     "Unable to verify selected IAM credentials with "
                     f"GetCallerIdentity: {error}"
                 ) from error
+        if partition not in _regions.OPERATIONAL_PARTITIONS:
+            raise _configs.OperationalError(
+                f"Authenticated caller partition {partition!r} is not supported."
+            )
+        if partition != region_resolution.partition:
+            raise _configs.OperationalError(
+                "Resolved AWS region partition "
+                f"{region_resolution.partition!r} does not match authenticated "
+                f"caller partition {partition!r}."
+            )
         if expected_account and (
             account_id != expected_account["id"]
             or partition != expected_account["partition"]
@@ -1059,6 +1150,8 @@ class IamCommandContext:
             account_id=account_id,
             partition=partition,
             arn=arn,
+            region_name=region_name,
+            region_resolution=region_resolution,
         )
 
 
@@ -1084,6 +1177,33 @@ def _selected_source(
     if expected_name:
         _, expected = _state.get_resource(data, "account", expected_name)
     return directory.expanduser().absolute(), profile, expected
+
+
+def _iam_region_settings(
+    selector: _configs.CredentialSelector,
+    expected_account: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return configured IAM-region preference layers without AWS side effects."""
+    data = _state.load_config()
+    aws = data.get("aws")
+    aws_settings = aws if isinstance(aws, dict) else {}
+    target_region: str | None = None
+    if selector.target:
+        _, target = _state.get_resource(data, "target", selector.target.lstrip("+"))
+        value = target.get("region")
+        target_region = value if isinstance(value, str) else None
+    account_region: str | None = None
+    if expected_account is not None:
+        value = expected_account.get("region")
+        account_region = value if isinstance(value, str) else None
+    global_value = aws_settings.get("region")
+    aliases = aws_settings.get("region_aliases")
+    return {
+        "target": target_region,
+        "account": account_region,
+        "global": global_value if isinstance(global_value, str) else None,
+        "aliases": aliases if isinstance(aliases, dict) else {},
+    }
 
 
 def recovery_result(args: argparse.Namespace) -> _configs.Result:

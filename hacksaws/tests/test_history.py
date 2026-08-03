@@ -14,6 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -485,6 +486,21 @@ def test_history_storage_failure_never_changes_command_output(
     payload = json.loads(capsys.readouterr().out)
     assert result.exit_code == 0
     assert payload["code"] == "CONFIG_OPTIONS"
+
+
+def test_partial_database_initialization_always_closes_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Close a sqlite handle when an initialization PRAGMA fails."""
+    _isolate(monkeypatch, tmp_path)
+    connection = MagicMock()
+    connection.execute.side_effect = sqlite3.DatabaseError("corrupt database")
+    monkeypatch.setattr(sqlite3, "connect", MagicMock(return_value=connection))
+
+    with pytest.raises(sqlite3.DatabaseError, match="corrupt database"):
+        _history._connect()
+
+    connection.close.assert_called_once_with()
 
 
 def test_unexpected_cli_exception_is_finalized_as_crashed(

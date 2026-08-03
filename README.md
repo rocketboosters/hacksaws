@@ -40,6 +40,14 @@ hacksaws web in debug
 aws sts get-caller-identity --profile debug
 ```
 
+Regions accept canonical names and friendly aliases. Hacksaws explains the
+resolution and always persists the canonical AWS name:
+
+```shell
+hacksaws region explain oregon
+# Canonical region: us-west-2
+```
+
 `pk` is an exact alias for `web`:
 
 ```shell
@@ -272,6 +280,7 @@ models.
 - [IAM roles and trust](docs/iam-roles-and-trust.md)
 - [Cleanup and Leave No Trace](docs/cleanup.md)
 - [Configuration](docs/configuration.md)
+- [Regions and aliases](docs/regions.md)
 - [Policy cache](docs/cache.md)
 - [Local command history](docs/history.md)
 - [Security model](docs/security-model.md)

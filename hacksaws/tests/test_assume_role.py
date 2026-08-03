@@ -1481,16 +1481,24 @@ def test_raw_account_id_uses_caller_partition_and_asserts_direct_role_arn() -> N
         _sessions._role_details(args, {}, ACCOUNT, "aws-cn")
 
 
-def test_configured_account_name_keeps_its_configured_partition(
+def test_configured_account_name_must_share_the_authenticated_partition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path))
     data = _state.default_config()
+    data["accounts"]["Other"] = {"id": OTHER_ACCOUNT, "partition": "aws"}
     data["accounts"]["China"] = {"id": OTHER_ACCOUNT, "partition": "aws-cn"}
     _state.save_config(data)
-    args = _args(Path(), role="AgentSession", account="China")
+
+    args = _args(Path(), role="AgentSession", account="Other")
     role, *_ = _sessions._role_details(args, {}, ACCOUNT, "aws")
-    assert role == f"arn:aws-cn:iam::{OTHER_ACCOUNT}:role/AgentSession"
+    assert role == f"arn:aws:iam::{OTHER_ACCOUNT}:role/AgentSession"
+
+    args = _args(Path(), role="AgentSession", account="China")
+    with pytest.raises(
+        _configs.OperationalError, match="authenticated caller partition"
+    ):
+        _sessions._role_details(args, {}, ACCOUNT, "aws")
 
 
 def test_legacy_backup_validation_errors_are_operational_errors(

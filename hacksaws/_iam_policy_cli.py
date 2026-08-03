@@ -91,11 +91,21 @@ _MAX_POLICY_VERSIONS = 5
 
 
 def _console_url(context: IamCommandContext, arn: str) -> str:
-    region = (
-        getattr(getattr(context, "session", None), "region_name", None) or "us-east-1"
+    region = getattr(context, "region_name", None) or getattr(
+        getattr(context, "session", None), "region_name", None
     )
+    region = region or "us-east-1"
+    domain = {
+        "aws": "console.aws.amazon.com",
+        "aws-cn": "console.amazonaws.cn",
+        "aws-us-gov": "console.amazonaws-us-gov.com",
+    }.get(context.partition)
+    if domain is None:
+        raise OperationalError(
+            f"AWS Console links are not supported for partition {context.partition!r}."
+        )
     return (
-        f"https://{region}.console.aws.amazon.com/iam/home?region={region}"
+        f"https://{region}.{domain}/iam/home?region={region}"
         f"#/policies/details/{quote(arn, safe='')}?section=permissions"
     )
 
@@ -139,6 +149,12 @@ def _selectors(parser: argparse.ArgumentParser, *, mutation: bool = False) -> No
         default=argparse.SUPPRESS,
         metavar="REGION",
         help="Region used for AWS clients and console links.",
+    )
+    group.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Allow only an exact unknown canonical region; aliases stay strict.",
     )
     if mutation:
         safety = parser.add_argument_group("safety")

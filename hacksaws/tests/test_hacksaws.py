@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import os
 import subprocess
 import tomllib
 from contextlib import ExitStack
@@ -25,6 +24,8 @@ import hacksaws
 from hacksaws import _aws
 from hacksaws import _configs
 from hacksaws import _ecr
+from hacksaws import _sessions
+from hacksaws import _state
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -122,6 +123,16 @@ def _session(*, region_name: str, clients: Mapping[str, object]) -> MagicMock:
     session = MagicMock()
     session.region_name = region_name
     session.client.side_effect = clients.__getitem__
+    return session
+
+
+def _authenticated_session(*, clients: Mapping[str, object] | None = None) -> MagicMock:
+    """Return an MFA-authenticated session with deterministic frozen credentials."""
+    session = _session(region_name="us-west-2", clients=clients or {})
+    frozen = session.get_credentials.return_value.get_frozen_credentials.return_value
+    frozen.access_key = TEMPORARY_ACCESS_KEY
+    frozen.secret_key = TEMPORARY_SECRET_KEY
+    frozen.token = SESSION_TOKEN
     return session
 
 
@@ -246,18 +257,10 @@ def test_podman_without_ecr_does_not_run_container_commands(
 ) -> None:
     """Treat --podman only as the engine choice for an explicit ECR operation."""
     context = _context(tmp_path, podman=True)
-    account = _configs.AwsAccount(
-        identity_response=_identity_response(),
-        region_name="us-west-2",
-        ecr_additional_regions=(),
-    )
-
     with (
-        patch("hacksaws._aws.logout"),
-        patch("hacksaws._aws.login"),
         patch(
-            "hacksaws._configs.AwsAccount.from_context",
-            return_value=account,
+            "hacksaws._sessions.mfa_login",
+            return_value=_configs.Result("MFA_LOGIN", "logged in"),
         ),
         patch("hacksaws._ecr.logout") as ecr_logout,
         patch("hacksaws._ecr.login") as ecr_login,
@@ -284,36 +287,26 @@ def test_mfa_without_action_prints_command_help(
 
 def test_login_exchanges_and_stores_credentials(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Use STS with exact parameters and persist temporary credentials."""
+    """Persist MFA credentials while retaining the original section for logout."""
     _prepare_aws_directory(tmp_path)
-    identity_client = _sts_client()
-    token_client = _sts_client()
-    identity_stubber = Stubber(identity_client)
-    identity_stubber.add_response(
-        "get_caller_identity",
-        _identity_response(),
-        {},
-    )
-    token_stubber = Stubber(token_client)
-    token_stubber.add_response(
-        "get_session_token",
-        {"Credentials": _temporary_credentials()},
-        {
-            "DurationSeconds": 43200,
-            "SerialNumber": MFA_SERIAL,
-            "TokenCode": "123456",
-        },
-    )
-    sessions = [
-        _session(region_name="us-west-2", clients={"sts": identity_client}),
-        _session(region_name="us-west-2", clients={"sts": token_client}),
-    ]
+    monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "hacksaws-home"))
+    _state.save_config(_state.default_config())
+    raw = MagicMock(region_name="us-west-2")
+    intermediate = _authenticated_session()
+    source_config = _sessions._read_ini(tmp_path / "config")
 
     with (
-        identity_stubber,
-        token_stubber,
-        patch("boto3.Session", side_effect=sessions) as session_factory,
+        patch(
+            "hacksaws._sessions._persistent_source",
+            return_value=(raw, source_config),
+        ),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT_ID, "aws", _identity_response()["Arn"]),
+        ),
+        patch("hacksaws._sessions._mfa_session", return_value=intermediate),
     ):
         result = hacksaws.console_main(
             [
@@ -327,7 +320,6 @@ def test_login_exchanges_and_stores_credentials(
         )
 
     credentials = _read_ini(tmp_path / "credentials")
-    backup = _read_ini(tmp_path / f"{PROFILE}.store.credentials")
     assert result.code == "MFA_LOGIN"
     assert result.exit_code == 0
     assert credentials[PROFILE] == {
@@ -335,18 +327,11 @@ def test_login_exchanges_and_stores_credentials(
         "aws_secret_access_key": TEMPORARY_SECRET_KEY,
         "aws_session_token": SESSION_TOKEN,
     }
-    assert backup[PROFILE] == {
+    managed = _state.load_sessions()[f"{tmp_path.absolute()}::{PROFILE}"]
+    assert managed["section_backup"]["credentials"]["original"]["values"] == {
         "aws_access_key_id": STATIC_ACCESS_KEY,
         "aws_secret_access_key": STATIC_SECRET_KEY,
     }
-    assert os.environ["AWS_SHARED_CREDENTIALS_FILE"] == str(
-        tmp_path / "credentials",
-    )
-    assert os.environ["AWS_CONFIG_FILE"] == str(tmp_path / "config")
-    assert session_factory.call_args_list == [
-        call(profile_name=PROFILE),
-        call(profile_name=PROFILE),
-    ]
 
 
 def test_logout_restores_credentials(tmp_path: Path) -> None:
@@ -406,33 +391,18 @@ def test_ecr_regions_and_container_commands_are_ordered_and_exact(
     tmp_path: Path,
     engine: str,
     podman: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run exact engine commands in primary-first, duplicate-free region order."""
     _prepare_aws_directory(tmp_path)
     regions = ["us-east-1", "us-west-2", "eu-west-1", "us-east-1"]
     ordered_regions = ["us-west-2", "us-east-1", "eu-west-1"]
 
-    identity_client = _sts_client()
-    token_client = _sts_client()
-    identity_stubber = Stubber(identity_client)
-    identity_stubber.add_response("get_caller_identity", _identity_response(), {})
-    token_stubber = Stubber(token_client)
-    token_stubber.add_response(
-        "get_session_token",
-        {"Credentials": _temporary_credentials()},
-        {
-            "DurationSeconds": 43200,
-            "SerialNumber": MFA_SERIAL,
-            "TokenCode": "123456",
-        },
-    )
-    sessions = [
-        _session(region_name="us-west-2", clients={"sts": identity_client}),
-        _session(region_name="us-west-2", clients={"sts": token_client}),
-    ]
+    monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "hacksaws-home"))
+    _state.save_config(_state.default_config())
+    raw = MagicMock(region_name="us-west-2")
+    regional_clients: dict[str, object] = {}
     stack = ExitStack()
-    stack.enter_context(identity_stubber)
-    stack.enter_context(token_stubber)
     for region in ordered_regions:
         ecr_client = _ecr_client(region)
         ecr_stubber = Stubber(ecr_client)
@@ -452,7 +422,12 @@ def test_ecr_regions_and_container_commands_are_ordered_and_exact(
             {"registryIds": [ACCOUNT_ID]},
         )
         stack.enter_context(ecr_stubber)
-        sessions.append(_session(region_name=region, clients={"ecr": ecr_client}))
+        regional_clients[region] = ecr_client
+    intermediate = _authenticated_session()
+    intermediate.client.side_effect = lambda service, *, region_name: (
+        regional_clients[region_name] if service == "ecr" else None
+    )
+    source_config = _sessions._read_ini(tmp_path / "config")
 
     arguments = [
         "mfa",
@@ -470,7 +445,15 @@ def test_ecr_regions_and_container_commands_are_ordered_and_exact(
 
     with (
         stack,
-        patch("boto3.Session", side_effect=sessions),
+        patch(
+            "hacksaws._sessions._persistent_source",
+            return_value=(raw, source_config),
+        ),
+        patch(
+            "hacksaws._sessions._identity",
+            return_value=(ACCOUNT_ID, "aws", _identity_response()["Arn"]),
+        ),
+        patch("hacksaws._sessions._mfa_session", return_value=intermediate),
         patch("subprocess.run") as subprocess_run,
     ):
         result = hacksaws.console_main(arguments)
@@ -479,10 +462,6 @@ def test_ecr_regions_and_container_commands_are_ordered_and_exact(
         f"{ACCOUNT_ID}.dkr.ecr.{region}.amazonaws.com" for region in ordered_regions
     ]
     expected_calls = [
-        *[
-            call([engine, "logout", registry], input=None, check=False)
-            for registry in registries
-        ],
         *[
             call(
                 [
@@ -582,13 +561,17 @@ def test_known_configuration_failure_is_concise(
                 "123456",
                 "--directory",
                 str(tmp_path),
+                "--region",
+                "us-west-2",
             ],
         )
 
     captured = capsys.readouterr()
     assert result.code == "OPERATIONAL_ERROR"
     assert result.exit_code == 1
-    assert captured.err.startswith("Error: AWS config file does not exist:")
+    assert captured.err.startswith(
+        f"Error: Profile '{PROFILE}' does not define mfa_serial."
+    )
     assert "Traceback" not in captured.err
 
 

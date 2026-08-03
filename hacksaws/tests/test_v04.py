@@ -17,6 +17,7 @@ from hacksaws import _configs
 from hacksaws import _duration
 from hacksaws import _ecr
 from hacksaws import _policies
+from hacksaws import _regions
 from hacksaws import _sessions
 from hacksaws import _state
 
@@ -49,6 +50,7 @@ def test_parser_supports_target_shorthand_and_web_alias() -> None:
 
 def _minimal_target(home: Path, *, boundary: bool = False) -> None:
     data = _state.default_config()
+    data["aws"]["region"] = "us-east-1"
     data["accounts"]["Prod"] = {"id": "123456789012", "partition": "aws"}
     if boundary:
         data["boundaries"]["Guard"] = {
@@ -290,8 +292,10 @@ def test_native_browser_cache_is_removed_after_identity_failure(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del remote
+        assert region_name == "us-east-1"
         assert _browser_login_files(config, login_cache, profile) == cache_file
 
     namespace = _cli._create_parser().parse_args(["web", "in", "+Prod"])
@@ -593,6 +597,8 @@ def test_expanded_mfa_write_failure_restores_existing_destination(
             str(aws_dir),
             "--role",
             "arn:aws:iam::123456789012:role/read",
+            "--region",
+            "us-east-1",
         ]
     )
     _cli._validate_login(namespace)
@@ -652,8 +658,10 @@ def test_bounded_browser_ecr_is_cleaned_when_assume_role_fails(
         *,
         remote: bool,
         login_cache: Path,
+        region_name: str,
     ) -> None:
         del remote
+        assert region_name == "us-east-1"
         _browser_login_files(config, login_cache, profile)
 
     with (
@@ -916,6 +924,61 @@ def test_ecr_registry_dns_suffix_is_partition_aware(
         (),
     )
     assert account.ecr_registries[0].endswith(suffix)
+
+
+def test_ecr_regions_use_effective_primary_alias_and_ordered_canonical_dedupe() -> None:
+    context = _configs.Context(
+        argparse.Namespace(
+            region="pacific",
+            allow_unknown_region=False,
+        )
+    )
+    account = _configs.AwsAccount(
+        {
+            "Account": "123456789012",
+            "Arn": "arn:aws:iam::123456789012:user/test",
+        },
+        "us-east-1",
+        ("oregon", "virginia", "us-east-1"),
+    )
+    aliases = {"pacific": {"region": "us-west-2"}}
+
+    with (
+        patch("hacksaws._ecr._configured_region_aliases", return_value=aliases),
+        patch(
+            "hacksaws._ecr._regions.canonicalize_regions",
+            wraps=_regions.canonicalize_regions,
+        ) as canonicalize,
+    ):
+        assert _ecr._ecr_regions(context, account) == ("us-west-2", "us-east-1")
+
+    assert canonicalize.call_args.kwargs["partition"] == "aws"
+    assert canonicalize.call_args.kwargs["service"] == "ecr"
+
+
+def test_ecr_region_partition_and_unknown_escape_are_strict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    account = _configs.AwsAccount(
+        {
+            "Account": "123456789012",
+            "Arn": "arn:aws:iam::123456789012:user/test",
+        },
+        "us-east-1",
+        (),
+    )
+    args = argparse.Namespace(region="future-west", allow_unknown_region=True)
+    context = _configs.Context(args)
+    with pytest.raises(_regions.RegionError, match="Unknown AWS region or alias"):
+        _ecr._ecr_regions(context, account)
+
+    args.region = "us-future-1"
+    assert _ecr._ecr_regions(context, account) == ("us-future-1",)
+    assert "service support cannot be verified" in capsys.readouterr().err
+
+    args.region = "beijing"
+    with pytest.raises(_regions.RegionError, match="Unknown AWS region or alias"):
+        _ecr._ecr_regions(context, account)
 
 
 def test_direct_policy_requires_role(capsys: pytest.CaptureFixture[str]) -> None:

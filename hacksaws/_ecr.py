@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import subprocess
+import sys
 from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -16,9 +17,57 @@ from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
 from hacksaws import _configs
+from hacksaws import _regions
+from hacksaws import _state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _configured_region_aliases() -> dict[str, object]:
+    """Return user region aliases without exposing unrelated configuration."""
+    data = _state.load_config()
+    aws = data.get("aws")
+    if not isinstance(aws, dict):
+        return {}
+    aliases = aws.get("region_aliases")
+    return cast("dict[str, object]", aliases) if isinstance(aliases, dict) else {}
+
+
+def _ecr_regions(
+    context: _configs.Context,
+    aws_account: _configs.AwsAccount,
+) -> tuple[str, ...]:
+    """Canonicalize, partition-check, service-check, and dedupe ECR regions."""
+    args = getattr(context, "args", None)
+    allow_unknown = getattr(args, "allow_unknown_region", False) is True
+    preference = getattr(args, "_region_preference", None)
+    preferred = (
+        preference.canonical
+        if isinstance(preference, _regions.RegionPreference)
+        else None
+    )
+    effective = getattr(args, "_effective_region", None)
+    explicit = getattr(args, "region", None)
+    primary = next(
+        (
+            value
+            for value in (preferred, effective, explicit, aws_account.region_name)
+            if isinstance(value, str) and value
+        ),
+        aws_account.region_name,
+    )
+    resolutions = _regions.canonicalize_regions(
+        (primary, *aws_account.ecr_additional_regions),
+        custom_aliases=_configured_region_aliases(),
+        partition=aws_account.partition,
+        allow_unknown=allow_unknown,
+        service="ecr",
+    )
+    for resolution in resolutions:
+        if resolution.warning:
+            print(f"Warning: {resolution.warning}", file=sys.stderr)  # noqa: T201
+    return tuple(item.canonical for item in resolutions)
 
 
 def _run_container_engine(
@@ -118,7 +167,7 @@ def login(context: _configs.Context, aws_account: _configs.AwsAccount) -> list[s
             region_name=region_name,
             dns_suffix=aws_account.dns_suffix,
         )
-        for region_name in aws_account.ecr_regions
+        for region_name in _ecr_regions(context, aws_account)
     ]
 
 
@@ -131,7 +180,7 @@ def login_with_session(
 ) -> list[str]:
     """Install ECR tokens using broad intermediate credentials."""
     completed: list[str] = []
-    for region_name in aws_account.ecr_regions:
+    for region_name in _ecr_regions(context, aws_account):
         registry = _do_login(
             context,
             account_id=aws_account.id,
@@ -153,7 +202,8 @@ def logout(
 ) -> None:
     """Log the selected container engine out of every configured ECR registry."""
     engine = context.container_engine
-    for registry in aws_account.ecr_registries:
+    for region_name in _ecr_regions(context, aws_account):
+        registry = f"{aws_account.id}.dkr.ecr.{region_name}.{aws_account.dns_suffix}"
         _run_container_engine(
             engine,
             [engine, "logout", registry],

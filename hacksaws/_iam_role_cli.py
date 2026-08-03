@@ -57,11 +57,21 @@ _CREATE_ROLE_HANDLER = "create-role-with-receipt"
 
 
 def _console_url(context: IamCommandContext, role_name: str) -> str:
-    region = (
-        getattr(getattr(context, "session", None), "region_name", None) or "us-east-1"
+    region = getattr(context, "region_name", None) or getattr(
+        getattr(context, "session", None), "region_name", None
     )
+    region = region or "us-east-1"
+    domain = {
+        "aws": "console.aws.amazon.com",
+        "aws-cn": "console.amazonaws.cn",
+        "aws-us-gov": "console.amazonaws-us-gov.com",
+    }.get(context.partition)
+    if domain is None:
+        raise OperationalError(
+            f"AWS Console links are not supported for partition {context.partition!r}."
+        )
     return (
-        f"https://{region}.console.aws.amazon.com/iam/home?region={region}"
+        f"https://{region}.{domain}/iam/home?region={region}"
         f"#/roles/details/{quote(role_name, safe='')}"
     )
 
@@ -118,6 +128,12 @@ def _add_selector_arguments(
         default=argparse.SUPPRESS,
         metavar="REGION",
         help="Region used for AWS clients and console links.",
+    )
+    group.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Allow only an exact unknown canonical region; aliases stay strict.",
     )
     if mutation:
         safety = parser.add_argument_group("safety")
@@ -1652,7 +1668,21 @@ def _looks_like_file(value: str) -> bool:
 
 def _resolve_policy_arn(reference: str, context: IamCommandContext) -> str:
     if reference.startswith("arn:"):
-        return reference
+        try:
+            parsed = managed.ManagedPolicyArn.parse(reference)
+        except managed.PolicyServiceError as error:
+            raise OperationalError("Invalid IAM managed-policy ARN.") from error
+        if parsed.partition != context.partition:
+            raise OperationalError(
+                "Managed-policy ARN partition does not match the authenticated "
+                "caller partition."
+            )
+        if parsed.account_id not in {managed.AWS_ACCOUNT, context.account_id}:
+            raise OperationalError(
+                "Managed-policy ARN does not belong to AWS or the authenticated "
+                "caller account."
+            )
+        return parsed.value
     matches: list[str] = []
     paginator = context.iam.get_paginator("list_policies")
     for scope in ("Local", "AWS"):

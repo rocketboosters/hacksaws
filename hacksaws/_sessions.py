@@ -35,7 +35,9 @@ from botocore.exceptions import ClientError
 from hacksaws import _configs
 from hacksaws import _duration
 from hacksaws import _ecr
+from hacksaws import _history
 from hacksaws import _policies
+from hacksaws import _regions
 from hacksaws import _state
 
 if TYPE_CHECKING:
@@ -52,6 +54,8 @@ _CONFLICTING_ENV = {
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_CONFIG_FILE",
     "AWS_LOGIN_CACHE_DIRECTORY",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
 }
 
 
@@ -607,7 +611,11 @@ def _role_details(
             r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/(.+)", str(role)
         )
         if not match:
-            raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
+            raise _configs.OperationalError("Invalid role ARN.")
+        if match.group(1) != partition:
+            raise _configs.OperationalError(
+                "Role ARN partition does not match the authenticated caller partition."
+            )
         if account_name:
             asserted_account, asserted_partition = _role_account_assertion(
                 str(account_name), partition
@@ -683,6 +691,123 @@ def _configured_role_before_auth(args: Any) -> str | None:
     return str(boundary["role_arn"])
 
 
+def _profile_region(directory: Path, profile: str) -> str | None:
+    """Read one physical AWS profile region without invoking provider precedence."""
+    parser = _read_ini(directory / "config")
+    section = _section(profile, config=True)
+    value = parser.get(section, "region", fallback="").strip()
+    return value or None
+
+
+def _region_configuration(
+    args: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str | None]:
+    """Load target/account/global region inputs without contacting AWS."""
+    data = _state.load_config()
+    target: dict[str, Any] = {}
+    account: dict[str, Any] = {}
+    if getattr(args, "target", None):
+        _, selected = _state.get_resource(data, "target", args.target.lstrip("+"))
+        target = dict(selected)
+        if target.get("source_account"):
+            _, selected_account = _state.get_resource(
+                data, "account", str(target["source_account"])
+            )
+            account = dict(selected_account)
+    elif getattr(args, "account", None):
+        try:
+            _, selected_account = _state.get_resource(
+                data, "account", str(args.account)
+            )
+        except _configs.OperationalError:
+            selected_account = {}
+        account = dict(selected_account)
+    if not account:
+        configured_role = _configured_role_before_auth(args)
+        match = re.fullmatch(
+            r"arn:([^:]+):iam::(\d{12}):role/.+", configured_role or ""
+        )
+        if match:
+            for selected_account in data.get("accounts", {}).values():
+                if selected_account.get("partition") == match.group(
+                    1
+                ) and selected_account.get("id") == match.group(2):
+                    account = dict(selected_account)
+                    break
+    aws = cast("dict[str, Any]", data["aws"])
+    aliases = cast("dict[str, Any]", aws["region_aliases"])
+    global_region = aws["region"]
+    return (
+        target,
+        account,
+        aliases,
+        (str(global_region) if isinstance(global_region, str) else None),
+    )
+
+
+def _resolve_session_region(
+    args: Any,
+    *,
+    source_directory: Path,
+    source_profile: str,
+    destination_directory: Path,
+    destination_profile: str,
+) -> _regions.RegionPreference:
+    """Resolve one canonical invocation region before any journal or AWS call."""
+    existing = getattr(args, "_region_preference", None)
+    if isinstance(existing, _regions.RegionPreference):
+        return existing
+    target, account, aliases, global_region = _region_configuration(args)
+    destination_region = _profile_region(destination_directory, destination_profile)
+    source_region = _profile_region(source_directory, source_profile)
+    partition = account.get("partition")
+    if not isinstance(partition, str):
+        configured_role = _configured_role_before_auth(args)
+        match = re.fullmatch(r"arn:([^:]+):iam::\d{12}:role/.+", configured_role or "")
+        partition = match.group(1) if match else None
+    preference = _regions.resolve_region_preference(
+        explicit=getattr(args, "region", None),
+        target=(
+            str(target["region"]) if isinstance(target.get("region"), str) else None
+        ),
+        destination=destination_region,
+        source=source_region,
+        account=(
+            str(account["region"]) if isinstance(account.get("region"), str) else None
+        ),
+        global_region=global_region,
+        custom_aliases=aliases,
+        partition=partition,
+        allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
+        interactive=not bool(getattr(args, "json", False)) and sys.stdin.isatty(),
+    )
+    args._region_preference = preference
+    _history.note_region(
+        region=preference.canonical,
+        partition=preference.resolution.partition,
+        source=preference.source,
+    )
+    return preference
+
+
+def _region_metadata(preference: _regions.RegionPreference) -> dict[str, Any]:
+    """Return secret-free region metadata for session, status, and history output."""
+    resolution = preference.resolution
+    return {
+        "region": resolution.canonical,
+        "region_partition": resolution.partition,
+        "region_source": preference.source,
+        "region_input_kind": resolution.source,
+        "region_alias": resolution.matched_alias,
+        "region_known": resolution.known,
+        "region_warning": resolution.warning,
+    }
+
+
+def _region_to_persist(preference: _regions.RegionPreference) -> str | None:
+    return preference.canonical if preference.persist_to_destination else None
+
+
 def _session_name(role: str, boundary: str | None, override: str | None) -> str:
     raw = (
         override
@@ -744,7 +869,7 @@ def _assume(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     match = re.fullmatch(r"arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role/.+", role)
     if not match:
-        raise _configs.OperationalError(f"Invalid role ARN {role!r}.")
+        raise _configs.OperationalError("Invalid role ARN.")
     duration = effective_duration or _effective_assume_duration(
         session, role, args=args, target=target
     )
@@ -775,10 +900,17 @@ def _assume(
         raise _configs.OperationalError(
             f"Unable to assume boundary role {role}: {error}"
         ) from error
+    preference = getattr(args, "_region_preference", None)
+    region_name = (
+        preference.canonical
+        if isinstance(preference, _regions.RegionPreference)
+        else None
+    )
     final_session = boto3.Session(
         aws_access_key_id=response["Credentials"]["AccessKeyId"],
         aws_secret_access_key=response["Credentials"]["SecretAccessKey"],
         aws_session_token=response["Credentials"]["SessionToken"],
+        region_name=region_name,
     )
     account, final_partition, _ = _identity(final_session, label="boundary credentials")
     if account != match.group(2) or final_partition != match.group(1):
@@ -803,6 +935,11 @@ def _assume(
             else None
         ),
         "expires_at": response["Credentials"]["Expiration"].astimezone(UTC).isoformat(),
+        **(
+            _region_metadata(preference)
+            if isinstance(preference, _regions.RegionPreference)
+            else {}
+        ),
     }
     return response["Credentials"], metadata
 
@@ -997,7 +1134,7 @@ def _parser_from_bytes(value: bytes | None, path: Path) -> configparser.ConfigPa
 
 
 def _persistent_source(
-    source_dir: Path, profile: str
+    source_dir: Path, profile: str, *, region_name: str | None = None
 ) -> tuple[Any, configparser.ConfigParser]:
     """Build a session from original persistent credentials, never installed output."""
     credentials_path = source_dir / "credentials"
@@ -1017,7 +1154,7 @@ def _persistent_source(
             "for transactional MFA re-login."
         )
     config_section = _section(profile, config=True)
-    region = config.get(config_section, "region", fallback=None)
+    region = region_name or config.get(config_section, "region", fallback=None)
     source = boto3.Session(
         aws_access_key_id=values["aws_access_key_id"],
         aws_secret_access_key=values["aws_secret_access_key"],
@@ -1033,6 +1170,8 @@ def _mfa_session(
     profile: str,
     token: str,
     lifespan: int,
+    *,
+    region_name: str | None = None,
 ) -> Any:
     section = _section(profile, config=True)
     if not config.has_option(section, "mfa_serial"):
@@ -1054,7 +1193,7 @@ def _mfa_session(
         aws_access_key_id=values["AccessKeyId"],
         aws_secret_access_key=values["SecretAccessKey"],
         aws_session_token=values["SessionToken"],
-        region_name=source.region_name,
+        region_name=region_name or source.region_name,
     )
 
 
@@ -1062,7 +1201,16 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
     """Authenticate with MFA and transactionally persist only the final tier."""
     args = context.args
     source_dir, source_profile, destination_dir, destination_profile = _paths(args)
-    raw, source_config = _persistent_source(source_dir, source_profile)
+    region = _resolve_session_region(
+        args,
+        source_directory=source_dir,
+        source_profile=source_profile,
+        destination_directory=destination_dir,
+        destination_profile=destination_profile,
+    )
+    raw, source_config = _persistent_source(
+        source_dir, source_profile, region_name=region.canonical
+    )
     source_account, partition, _ = _identity(raw, label="MFA source credentials")
     target = _target_details(args, source_account, partition)
     role, policy, external_id, boundary_name = _role_details(
@@ -1070,7 +1218,12 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
     )
     _require_concrete_role(args, role)
     intermediate = _mfa_session(
-        raw, source_config, source_profile, args.mfa_code, args.lifespan
+        raw,
+        source_config,
+        source_profile,
+        args.mfa_code,
+        args.lifespan,
+        region_name=region.canonical,
     )
     journal = _begin(
         [
@@ -1087,7 +1240,7 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
                     "Account": source_account,
                     "Arn": f"arn:{partition}:iam::{source_account}:user/hacksaws",
                 },
-                region_name=intermediate.region_name or args.region or "us-east-1",
+                region_name=region.canonical,
                 ecr_additional_regions=tuple(args.ecr_region or ()),
             )
             ecr_registries = _ecr.login_with_session(
@@ -1132,8 +1285,9 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
             source_profile,
             destination_dir / "config",
             destination_profile,
-            args.region,
+            _region_to_persist(region),
         )
+        metadata.update(_region_metadata(region))
         metadata["source_account"] = source_account
         metadata["source_partition"] = partition
         metadata["target"] = target.get("target_name")
@@ -1246,10 +1400,19 @@ def _aws_login(
     *,
     remote: bool,
     login_cache: Path,
+    region_name: str,
 ) -> None:
     _aws_cli_version()
     config.parent.mkdir(parents=True, exist_ok=True)
-    command = ["aws", "login", "--profile", profile]
+    command = [
+        "aws",
+        "login",
+        "--profile",
+        profile,
+        "--region",
+        region_name,
+        "--no-cli-auto-prompt",
+    ]
     if remote:
         command.append("--remote")
     try:
@@ -1271,6 +1434,18 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     configured_role = _configured_role_before_auth(args)
     _require_concrete_role(args, configured_role)
     has_boundary = configured_role is not None
+    region = _resolve_session_region(
+        args,
+        source_directory=source_dir,
+        source_profile=source_profile,
+        destination_directory=destination_dir,
+        destination_profile=destination_profile,
+    )
+    _regions.validate_service_region(
+        region.resolution,
+        "signin",
+        allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
+    )
     if not has_boundary:
         native_cache = _native_login_cache()
         journal = _begin(
@@ -1283,12 +1458,17 @@ def browser_login(context: _configs.Context) -> _configs.Result:
         ecr_registries: list[str] = []
         login_completed = False
         try:
+            if region.persist_to_destination:
+                _apply_region_values(
+                    destination_dir, destination_profile, {}, region.canonical
+                )
             _aws_login(
                 destination_dir / "config",
                 destination_dir / "credentials",
                 destination_profile,
                 remote=args.remote,
                 login_cache=native_cache,
+                region_name=region.canonical,
             )
             login_completed = True
             initial_lineage = _browser_cache_lineage(
@@ -1307,7 +1487,9 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                 destination_dir / "credentials",
                 native_cache,
             ):
-                native = boto3.Session(profile_name=destination_profile)
+                native = boto3.Session(
+                    profile_name=destination_profile, region_name=region.canonical
+                )
                 account, partition, principal = _identity(native, label="browser login")
             lineage = _browser_cache_lineage(
                 destination_dir / "config",
@@ -1326,7 +1508,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                         "Account": account,
                         "Arn": f"arn:{partition}:iam::{account}:user/hacksaws",
                     },
-                    native.region_name or args.region or "us-east-1",
+                    region.canonical,
                     tuple(args.ecr_region or ()),
                 )
                 ecr_registries = _ecr.login_with_session(
@@ -1352,6 +1534,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                     "policy_provenance": "AWS-native login_session",
                     "expires_at": None,
                     "login_cache_lineage": lineage,
+                    **_region_metadata(region),
                 },
                 journal,
                 method="browser-native",
@@ -1386,12 +1569,14 @@ def browser_login(context: _configs.Context) -> _configs.Result:
     ecr_registries = []
     login_completed = False
     try:
+        _apply_region_values(staging, source_profile, {}, region.canonical)
         _aws_login(
             staging_config,
             staging_credentials,
             source_profile,
             remote=args.remote,
             login_cache=staging_cache,
+            region_name=region.canonical,
         )
         login_completed = True
         initial_lineage = _browser_cache_lineage(
@@ -1401,7 +1586,9 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             journal, initial_lineage, staging_config, source_profile
         )
         with _aws_environment(staging_config, staging_credentials, staging_cache):
-            intermediate = boto3.Session(profile_name=source_profile)
+            intermediate = boto3.Session(
+                profile_name=source_profile, region_name=region.canonical
+            )
             source_account, partition, source_principal = _identity(
                 intermediate, label="browser staging login"
             )
@@ -1426,7 +1613,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
                         "Account": source_account,
                         "Arn": (f"arn:{partition}:iam::{source_account}:user/hacksaws"),
                     },
-                    intermediate.region_name or args.region or "us-east-1",
+                    region.canonical,
                     tuple(args.ecr_region or ()),
                 )
                 ecr_registries = _ecr.login_with_session(
@@ -1455,7 +1642,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             source_profile,
             destination_dir / "config",
             destination_profile,
-            args.region,
+            _region_to_persist(region),
         )
         config = _read_ini(destination_dir / "config")
         section = _section(destination_profile, config=True)
@@ -1467,6 +1654,7 @@ def browser_login(context: _configs.Context) -> _configs.Result:
             source_partition=partition,
             target=target.get("target_name"),
         )
+        metadata.update(_region_metadata(region))
         _record(
             destination_dir,
             destination_profile,
@@ -1590,6 +1778,13 @@ def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
         destination_profile = _normalize_profile(args.to_profile)
     source = source.absolute()
     destination = destination.absolute()
+    region = _resolve_session_region(
+        args,
+        source_directory=source,
+        source_profile=source_profile,
+        destination_directory=destination,
+        destination_profile=destination_profile,
+    )
     source_key = f"{source}::{source_profile}"
     destination_key = f"{destination}::{destination_profile}"
     same_key = source_key == destination_key
@@ -1684,7 +1879,9 @@ def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
     with _aws_environment(
         source / "config", source / "credentials", source_login_cache
     ):
-        authenticated = boto3.Session(profile_name=source_profile)
+        authenticated = boto3.Session(
+            profile_name=source_profile, region_name=region.canonical
+        )
         source_account, partition, source_arn = _identity(
             authenticated, label="authenticated assume-role source"
         )
@@ -1725,6 +1922,7 @@ def _assume_preflight(context: _configs.Context) -> dict[str, Any]:
         "external_id": external_id,
         "boundary_name": boundary_name,
         "region_values": _region_values(source, source_profile),
+        "region_preference": region,
     }
 
 
@@ -1769,6 +1967,12 @@ def _assume_public_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "keepSource": plan["keep_source"],
         "keepEcr": plan["keep_ecr"],
         "replace": plan["replace"],
+        "region": {
+            "canonical": plan["region_preference"].canonical,
+            "partition": plan["region_preference"].resolution.partition,
+            "source": plan["region_preference"].source,
+            "persistToDestination": plan["region_preference"].persist_to_destination,
+        },
         "lifecycle": {
             "source": "keep" if plan["keep_source"] else "logout",
             "destination": destination_action,
@@ -1806,8 +2010,22 @@ def _assume_arguments_fingerprint(args: Any) -> str:
         "replace",
         "force",
     )
+    preference = getattr(args, "_region_preference", None)
+    region_state = (
+        {
+            "canonical": preference.canonical,
+            "partition": preference.resolution.partition,
+            "source": preference.source,
+            "persist": preference.persist_to_destination,
+        }
+        if isinstance(preference, _regions.RegionPreference)
+        else None
+    )
     encoded = json.dumps(
-        {name: getattr(args, name, None) for name in names},
+        {
+            **{name: getattr(args, name, None) for name in names},
+            "resolved_region": region_state,
+        },
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -1994,13 +2212,17 @@ def _write_section(path: Path, section: str, state: dict[str, Any]) -> None:
 
 
 def _planned_destination_config(data: dict[str, Any], args: Any) -> dict[str, str]:
+    del args  # Region precedence was frozen into the prepared plan.
     destination = cast("Path", data["destination"])
     profile = str(data["destination_profile"])
     parser = _read_ini(destination / "config")
     section = _section(profile, config=True)
     values = dict(parser[section].items()) if section in parser else {}
-    if getattr(args, "region", None):
-        values["region"] = str(args.region)
+    preference = data.get("region_preference")
+    if isinstance(preference, _regions.RegionPreference) and (
+        preference.persist_to_destination
+    ):
+        values["region"] = preference.canonical
     else:
         for key, value in data["region_values"].items():
             values.setdefault(key, value)
@@ -3060,11 +3282,18 @@ _PUBLIC_SESSION_STRING_FIELDS = {
     "source_profile",
     "source_destination",
     "source_auth_method",
+    "region",
+    "region_partition",
+    "region_source",
+    "region_input_kind",
+    "region_alias",
+    "region_warning",
 }
 _PUBLIC_SESSION_BOOL_FIELDS = {
     "cache_cleanup_incomplete",
     "policy_cached",
     "source_logged_out",
+    "region_known",
 }
 _PUBLIC_SESSION_INT_FIELDS = {"session_schema_version"}
 
@@ -3107,6 +3336,13 @@ def _public_session(session: dict[str, Any], *, now: datetime) -> dict[str, Any]
     )
     public["destination"] = str(destination)
     public["location"] = _location_for_directory(destination)
+    try:
+        public["profile_region"] = _profile_region(
+            destination,
+            str(public.get("profile") or session.get("profile") or "default"),
+        )
+    except _configs.OperationalError:
+        public["profile_region"] = None
     public["managed"] = True
     effective_scope = _effective_scope(session)
     public["effective_scope"] = effective_scope
@@ -3230,7 +3466,11 @@ def _verify_status(item: dict[str, Any]) -> dict[str, Any]:
             directory / "config", directory / "credentials", _native_login_cache()
         ):
             account, partition, arn = _identity(
-                boto3.Session(profile_name=profile), label=f"profile {profile!r}"
+                boto3.Session(
+                    profile_name=profile,
+                    region_name=(str(item["region"]) if item.get("region") else None),
+                ),
+                label=f"profile {profile!r}",
             )
     except _configs.OperationalError as error:
         return {"status": "error", "message": str(error)}
@@ -3346,6 +3586,7 @@ def profile_inventory(
     }
     for directory, location in _known_directories().items():
         names: set[str] = set()
+        profile_regions: dict[str, str] = {}
         for filename, is_config in (("credentials", False), ("config", True)):
             path = directory / filename
             try:
@@ -3357,8 +3598,19 @@ def profile_inventory(
                 if is_config:
                     if section == "default":
                         names.add("default")
+                        region_value = parser.get(
+                            section, "region", fallback=""
+                        ).strip()
+                        if region_value:
+                            profile_regions["default"] = region_value
                     elif section.startswith("profile ") and section[8:]:
-                        names.add(section[8:])
+                        profile_name = section[8:]
+                        names.add(profile_name)
+                        region_value = parser.get(
+                            section, "region", fallback=""
+                        ).strip()
+                        if region_value:
+                            profile_regions[profile_name] = region_value
                 else:
                     names.add(section)
         if directory.exists():
@@ -3379,6 +3631,8 @@ def profile_inventory(
                 "directory": str(directory),
                 "profile": profile_name,
                 "managed": lifecycle is not None or legacy,
+                "region": profile_regions.get(profile_name)
+                or (lifecycle or {}).get("region"),
                 "state": (
                     lifecycle["state"]
                     if lifecycle
@@ -3424,6 +3678,208 @@ def profile_inventory(
                 }
             )
     return {"profiles": profiles, "count": len(profiles), "warnings": warnings}
+
+
+def _selected_profile_endpoint(args: Any) -> tuple[Path, str, str | None]:
+    """Resolve one profile/location selector for local profile configuration."""
+    selector = _configs.resolve_credential_selector(args)
+    if selector.target:
+        data = _state.load_config()
+        target_name, target = _state.get_resource(
+            data, "target", selector.target.lstrip("+")
+        )
+        directory = (
+            Path(str(target["source_directory"])).expanduser().absolute()
+            if target.get("source_directory")
+            else _state.aws_directory(target.get("source_location")).absolute()
+        )
+        return directory, _normalize_profile(target.get("source_profile")), target_name
+    directory = selector.directory or _state.aws_directory(selector.location).absolute()
+    return directory, _normalize_profile(selector.profile), None
+
+
+def _profile_region_result(
+    directory: Path, profile: str, *, target: str | None = None
+) -> dict[str, Any]:
+    current = _profile_region(directory, profile)
+    result: dict[str, Any] = {
+        "directory": str(directory),
+        "location": _location_for_directory(directory),
+        "profile": profile,
+        "target": target,
+        "region": current,
+    }
+    if current:
+        data = _state.load_config()
+        resolution = _regions.resolve_region(
+            current,
+            custom_aliases=data["aws"]["region_aliases"],
+            allow_unknown=True,
+        )
+        result.update(
+            partition=resolution.partition,
+            description=resolution.description,
+            known=resolution.known,
+        )
+    else:
+        result.update(partition=None, description=None, known=None)
+    managed = _state.load_sessions().get(f"{directory.absolute()}::{profile}")
+    result["managed"] = managed is not None
+    result["auth_method"] = managed.get("auth_method") if managed else None
+    return result
+
+
+def profile_region_get(args: Any) -> dict[str, Any]:
+    """Return one profile's physical service region without loading credentials."""
+    directory, profile, target = _selected_profile_endpoint(args)
+    return _profile_region_result(directory, profile, target=target)
+
+
+def _rebase_managed_region(
+    session: dict[str, Any],
+    *,
+    config: Path,
+    profile: str,
+    resolution: _regions.RegionResolution | None,
+) -> None:
+    sections = session.get("section_backup")
+    if not isinstance(sections, dict):
+        raise _configs.OperationalError(
+            "Managed session has no safe config-section backup to rebase."
+        )
+    config_backup = sections.get("config")
+    if not isinstance(config_backup, dict):
+        raise _configs.OperationalError(
+            "Managed session has no safe config-section backup to rebase."
+        )
+    original = config_backup.get("original")
+    if not isinstance(original, dict) or not isinstance(original.get("values"), dict):
+        raise _configs.OperationalError("Managed original config section is invalid.")
+    originally_existed = bool(original.get("exists"))
+    original_values = {
+        str(key): str(value) for key, value in original["values"].items()
+    }
+    if resolution is None:
+        original_values.pop("region", None)
+        original["exists"] = originally_existed or bool(original_values)
+        for key in (
+            "region",
+            "region_partition",
+            "region_source",
+            "region_input_kind",
+            "region_alias",
+            "region_known",
+            "region_warning",
+        ):
+            session.pop(key, None)
+    else:
+        original_values["region"] = resolution.canonical
+        original["exists"] = True
+        session.update(
+            region=resolution.canonical,
+            region_partition=resolution.partition,
+            region_source="profile-command",
+            region_input_kind=resolution.source,
+            region_alias=resolution.matched_alias,
+            region_known=resolution.known,
+            region_warning=resolution.warning,
+        )
+    original["values"] = original_values
+    config_backup["installed"] = _section_state(config, _section(profile, config=True))
+
+
+def profile_region_change(args: Any, *, clear: bool = False) -> dict[str, Any]:
+    """Transactionally persist a profile region and rebase managed logout state."""
+    directory, profile, target = _selected_profile_endpoint(args)
+    config_path = directory / "config"
+    section = _section(profile, config=True)
+    parser = _read_ini(config_path)
+    current = parser.get(section, "region", fallback="").strip() or None
+    sessions = _state.load_sessions()
+    key = f"{directory.absolute()}::{profile}"
+    managed = sessions.get(key)
+    if managed:
+        _profile_section_plans(managed, directory, profile, force=False)
+    data = _state.load_config()
+    aliases = data["aws"]["region_aliases"]
+    current_resolution = (
+        _regions.resolve_region(current, custom_aliases=aliases, allow_unknown=True)
+        if current
+        else None
+    )
+    if clear:
+        if current is None:
+            result = _profile_region_result(directory, profile, target=target)
+            result.update(changed=False, previous_region=None, warnings=[])
+            return result
+        if managed and managed.get("auth_method") == "browser-native":
+            raise _configs.OperationalError(
+                "An active browser-native profile requires a physical region for "
+                "credential refresh; log out before clearing it."
+            )
+        resolution = None
+    else:
+        resolution = _regions.resolve_region(
+            str(args.region),
+            custom_aliases=aliases,
+            allow_unknown=bool(getattr(args, "allow_unknown_region", False)),
+        )
+        expected_partition = (
+            current_resolution.partition
+            if current_resolution
+            else str(
+                (managed or {}).get("region_partition")
+                or (managed or {}).get("source_partition")
+                or (managed or {}).get("target_partition")
+                or ""
+            )
+            or None
+        )
+        if expected_partition and resolution.partition != expected_partition:
+            raise _regions.RegionError(
+                "REGION_PARTITION_MISMATCH",
+                f"Profile {profile!r} is in partition {expected_partition!r}; "
+                f"region {resolution.canonical!r} is in {resolution.partition!r}.",
+                repairs=("Choose a region in the profile's current partition.",),
+            )
+    selected = resolution.canonical if resolution else None
+    if selected == current:
+        result = _profile_region_result(directory, profile, target=target)
+        result.update(changed=False, previous_region=current, warnings=[])
+        return result
+    journal = _begin([config_path, _state.sessions_path()])
+    try:
+        if section not in parser:
+            parser.add_section(section)
+        if resolution is None:
+            parser[section].pop("region", None)
+            if not parser[section]:
+                parser.remove_section(section)
+        else:
+            parser[section]["region"] = resolution.canonical
+        _write_ini(config_path, parser)
+        if managed:
+            _rebase_managed_region(
+                managed,
+                config=config_path,
+                profile=profile,
+                resolution=resolution,
+            )
+            sessions[key] = managed
+            _state.save_sessions(sessions)
+        _commit()
+    except Exception:
+        _rollback(journal)
+        raise
+    result = _profile_region_result(directory, profile, target=target)
+    result.update(
+        changed=True,
+        previous_region=current,
+        warnings=[
+            "Already-running processes may retain the previous AWS region until restarted."
+        ],
+    )
+    return result
 
 
 def _restore_profile_sections(
@@ -3548,7 +4004,10 @@ def _upgrade_legacy_browser_lineage(
         with _aws_environment(
             destination / "config", destination / "credentials", root
         ):
-            active = boto3.Session(profile_name=profile)
+            active = boto3.Session(
+                profile_name=profile,
+                region_name=_profile_region(destination, profile),
+            )
             identity = _identity(active, label="legacy browser login cache ownership")
         current = _browser_cache_lineage(config, profile, root, identity=identity)
     except _configs.OperationalError:
@@ -3722,7 +4181,15 @@ def _tracked_login_cache_plan(  # noqa: PLR0911
                         destination / "credentials",
                         root,
                     ):
-                        active = boto3.Session(profile_name=profile)
+                        current_region = session.get("region") or _profile_region(
+                            destination, profile
+                        )
+                        active = boto3.Session(
+                            profile_name=profile,
+                            region_name=(
+                                str(current_region) if current_region else None
+                            ),
+                        )
                         identity = _identity(
                             active, label="browser login cache ownership"
                         )
@@ -4629,6 +5096,16 @@ def import_config(source: Path, *, replace: bool, yes: bool) -> str:
             existing_config = _state.load_config()
             current = copy.deepcopy(existing_config)
             conflicts: list[str] = []
+            defaults = _state.default_config()
+            for section in ("cache", "naming", "history", "aws"):
+                if current[section] == imported[section]:
+                    continue
+                customized = current[section] != defaults[section]
+                if customized:
+                    conflicts.append(f"config:{section}")
+                    if not replace:
+                        continue
+                current[section] = copy.deepcopy(imported[section])
             for collection in ("accounts", "boundaries", "targets", "policies"):
                 for name, value in imported[collection].items():
                     existing = next(

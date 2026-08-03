@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from hacksaws import _regions
 from hacksaws._configs import OperationalError
 
 SCHEMA_VERSION = 1
@@ -34,6 +35,7 @@ TOP_LEVEL = {
     "session",
     "output",
     "history",
+    "aws",
 }
 NAMING_FIELDS = {"case", "prefix", "suffix", "enforcement"}
 NAMING_CASES = {"Pascal", "camel", "snake", "kebab"}
@@ -85,6 +87,7 @@ def default_config() -> dict[str, Any]:
             "max_entries": 10_000,
             "max_bytes": 50 * 1024 * 1024,
         },
+        "aws": {"region": None, "region_aliases": {}},
     }
 
 
@@ -153,7 +156,7 @@ def _validate_config(data: object) -> dict[str, Any]:
     if type(data) is not dict:
         raise OperationalError("Hacksaws config must be a JSON object.")
     defaults = default_config()
-    for key in ("naming", "iam", "session", "output", "history"):
+    for key in ("naming", "iam", "session", "output", "history", "aws"):
         data.setdefault(key, deepcopy(defaults[key]))
     unknown = set(data) - TOP_LEVEL
     if unknown:
@@ -273,6 +276,33 @@ def _validate_foundation_settings(data: dict[str, Any]) -> None:
             raise OperationalError(
                 f"Config history.{field} must be a positive integer."
             )
+    aws = data["aws"]
+    if type(aws) is not dict or set(aws) != {"region", "region_aliases"}:
+        raise OperationalError(
+            "Config aws accepts only region and region_aliases settings."
+        )
+    if aws["region"] is not None:
+        _validate_canonical_region(aws["region"], label="Config aws.region")
+    if type(aws["region_aliases"]) is not dict:
+        raise OperationalError("Config aws.region_aliases must be an object.")
+    _regions.validate_custom_aliases(aws["region_aliases"])
+
+
+def _validate_canonical_region(
+    value: object, *, label: str, partition: str | None = None
+) -> str:
+    """Require a canonical known or explicitly forward-compatible region."""
+    if type(value) is not str:
+        raise OperationalError(f"{label} must be canonical region text.")
+    resolution = _regions.resolve_region(value, partition=partition, allow_unknown=True)
+    if resolution.canonical != value or resolution.source not in {
+        "canonical",
+        "unknown",
+    }:
+        raise OperationalError(
+            f"{label} must store canonical region {resolution.canonical!r}, not an alias."
+        )
+    return resolution.canonical
 
 
 def _validate_resources(data: dict[str, Any]) -> None:
@@ -297,6 +327,7 @@ def _validate_resources(data: dict[str, Any]) -> None:
             "description",
             "unverified",
             "credential_target",
+            "region",
         }
         if unknown:
             raise OperationalError(
@@ -323,6 +354,12 @@ def _validate_resources(data: dict[str, Any]) -> None:
         ):
             raise OperationalError(
                 f"Account {name!r} unverified must be true when set."
+            )
+        if "region" in account:
+            _validate_canonical_region(
+                account["region"],
+                label=f"Account {name!r} region",
+                partition=account["partition"],
             )
     for name, policy in data["policies"].items():
         unknown = set(policy) - {"file", "description"}
@@ -402,6 +439,7 @@ def _validate_resources(data: dict[str, Any]) -> None:
             "destination_directory",
             "boundary",
             "description",
+            "region",
         }
         if set(target) - allowed:
             raise OperationalError(f"Unknown target field(s) for {name}.")
@@ -459,9 +497,27 @@ def _validate_resources(data: dict[str, Any]) -> None:
             raise OperationalError(
                 f"Target {name!r} references missing boundary {boundary!r}."
             )
+        if "region" in target:
+            account_key = _find_key(data["accounts"], target["source_account"])
+            account = data["accounts"][account_key]
+            _validate_canonical_region(
+                target["region"],
+                label=f"Target {name!r} region",
+                partition=account["partition"],
+            )
 
 
 CONFIG_OPTION_PATTERNS: dict[str, dict[str, object]] = {
+    "aws.region": {
+        "description": "Global fallback AWS region; aliases resolve before storage.",
+        "default": None,
+    },
+    "aws.region_aliases.<alias>.region": {
+        "description": "Canonical region selected by one global custom alias.",
+    },
+    "aws.region_aliases.<alias>.description": {
+        "description": "Optional human description for one custom region alias.",
+    },
     "naming.global.{case|prefix|suffix|enforcement}": {
         "description": "Default naming policy; later layers override earlier layers.",
         "default": {"case": "Pascal", "prefix": "", "suffix": "", "enforcement": "off"},
@@ -509,6 +565,12 @@ CONFIG_OPTION_PATTERNS: dict[str, dict[str, object]] = {
     },
     "accounts.<account>.credential_target": {
         "description": "Per-account credential target used only when explicitly selected.",
+    },
+    "accounts.<account>.region": {
+        "description": "Preferred fallback region for one configured AWS account.",
+    },
+    "targets.<target>.region": {
+        "description": "Saved target region, overriding profile/account/global defaults.",
     },
 }
 
@@ -559,6 +621,21 @@ def get_config_option(data: dict[str, Any], key: str) -> object:
 def set_config_option(data: dict[str, Any], key: str, value: object) -> None:
     """Set a known leaf option and validate the complete schema-one document."""
     parts = _option_parts(key)
+    if parts[:2] == ["aws", "region_aliases"] and len(parts) == 4:
+        alias, field = parts[2:]
+        if field not in {"region", "description"}:
+            raise OperationalError(
+                f"Unknown config option {key!r}; run 'config options'."
+            )
+        aliases = data["aws"]["region_aliases"]
+        existing = aliases.get(alias)
+        if field == "description" and type(existing) is not dict:
+            raise OperationalError(
+                f"Set aws.region_aliases.{alias}.region before its description."
+            )
+        aliases.setdefault(alias, {})[field] = value
+        _validate_config(data)
+        return
     if parts[:2] == ["naming", "resources"] and len(parts) == 4:
         resource, field = parts[2:]
         validate_name(resource, kind="naming resource")
@@ -595,10 +672,15 @@ def set_config_option(data: dict[str, Any], key: str, value: object) -> None:
     if (
         parts[:1] == ["accounts"]
         and len(parts) == 3
-        and parts[2] == "credential_target"
+        and parts[2] in {"credential_target", "region"}
     ):
         account, value_map = get_resource(data, "account", parts[1])
-        data["accounts"][account] = {**value_map, "credential_target": value}
+        data["accounts"][account] = {**value_map, parts[2]: value}
+        _validate_config(data)
+        return
+    if parts[:1] == ["targets"] and len(parts) == 3 and parts[2] == "region":
+        target, value_map = get_resource(data, "target", parts[1])
+        data["targets"][target] = {**value_map, "region": value}
         _validate_config(data)
         return
     current: dict[str, Any] = data
@@ -619,6 +701,20 @@ def reset_config_option(data: dict[str, Any], key: str) -> None:
     """Reset a known option to its schema-one default where one exists."""
     defaults = default_config()
     parts = _option_parts(key)
+    if parts[:2] == ["aws", "region_aliases"] and len(parts) == 4:
+        alias, field = parts[2:]
+        aliases = data["aws"]["region_aliases"]
+        existing = aliases.get(alias)
+        if type(existing) is not dict or field not in existing:
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        if field == "region":
+            del aliases[alias]
+        elif field == "description":
+            del existing[field]
+        else:
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        _validate_config(data)
+        return
     if parts[:2] == ["naming", "resources"] and len(parts) == 4:
         resource, field = parts[2:]
         override = data["naming"]["resources"].get(resource)
@@ -662,6 +758,20 @@ def reset_config_option(data: dict[str, Any], key: str) -> None:
             del resources[resource]
         if not resources:
             del data["naming"]["account_resources"][account]
+        _validate_config(data)
+        return
+    if (
+        len(parts) == 3
+        and parts[0] in {"accounts", "targets"}
+        and parts[2]
+        in ({"credential_target", "region"} if parts[0] == "accounts" else {"region"})
+    ):
+        kind = "account" if parts[0] == "accounts" else "target"
+        canonical, value = get_resource(data, kind, parts[1])
+        if parts[2] not in value:
+            raise OperationalError(f"Config option {key!r} has no reset default.")
+        value.pop(parts[2])
+        data[parts[0]][canonical] = value
         _validate_config(data)
         return
     current: dict[str, Any] = data

@@ -138,6 +138,94 @@ def test_context_rejects_selected_account_mismatch(
         )
 
 
+def test_context_canonicalizes_alias_before_every_aws_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _account_config(tmp_path, monkeypatch)
+    data = _state.load_config()
+    data["aws"]["region_aliases"] = {
+        "pacific": {"region": "us-west-2", "description": "deployment region"}
+    }
+    _state.save_config(data)
+    calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> _Session:
+        calls.append(kwargs)
+        return _Session()
+
+    context = _iam_cli.IamCommandContext.create(
+        argparse.Namespace(
+            profile="deploy",
+            location="default",
+            directory=str(tmp_path / "aws"),
+            target=None,
+            account="Prod",
+            region="pacific",
+            allow_unknown_region=False,
+        ),
+        session_factory=factory,
+    )
+
+    assert context.region_name == "us-west-2"
+    assert context.region_resolution.source == "custom"
+    assert calls[0] == {"profile_name": "deploy", "region_name": "us-west-2"}
+    assert calls[1]["region_name"] == "us-west-2"
+
+
+def test_context_verifies_region_partition_against_authenticated_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "state"))
+    _state.save_config(_state.default_config())
+
+    with pytest.raises(
+        _configs.OperationalError, match="authenticated caller partition"
+    ):
+        _iam_cli.IamCommandContext.create(
+            argparse.Namespace(
+                profile="deploy",
+                location="default",
+                directory=str(tmp_path / "aws"),
+                target=None,
+                account=None,
+                region="beijing",
+                allow_unknown_region=False,
+            ),
+            session_factory=lambda **_kwargs: _Session(),
+        )
+
+
+def test_context_unknown_escape_never_accepts_alias_like_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "state"))
+    _state.save_config(_state.default_config())
+    args = argparse.Namespace(
+        profile="deploy",
+        location="default",
+        directory=str(tmp_path / "aws"),
+        target=None,
+        account=None,
+        region="future-west",
+        allow_unknown_region=True,
+    )
+    with pytest.raises(_configs.OperationalError, match="Unknown AWS region or alias"):
+        _iam_cli.IamCommandContext.create(
+            args,
+            session_factory=lambda **_kwargs: pytest.fail(
+                "invalid alias must fail before AWS session creation"
+            ),
+        )
+
+    args.region = "us-future-1"
+    context = _iam_cli.IamCommandContext.create(
+        args,
+        session_factory=lambda **_kwargs: _Session(),
+    )
+    assert context.region_name == "us-future-1"
+    assert context.region_resolution.known is False
+
+
 def test_iam_remote_alias_help_json_error_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -184,11 +272,13 @@ def test_terminal_iam_selectors_cleanup_aliases_and_no_abbreviations() -> None:
             "admin",
             "--location",
             "horizon",
+            "--allow-unknown-region",
             "--dry-run",
         ]
     )
     assert policy.profile == "admin"
     assert policy.location == "horizon"
+    assert policy.allow_unknown_region is True
     assert policy.dry_run is True
 
     for prefix in (["cleanup"], ["iam", "cleanup"], ["remote", "cleanup"]):

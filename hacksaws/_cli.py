@@ -27,11 +27,11 @@ from rich.text import Text
 from hacksaws import _aws
 from hacksaws import _configs
 from hacksaws import _duration
-from hacksaws import _ecr
 from hacksaws import _history
 from hacksaws import _iam_cli
 from hacksaws import _output
 from hacksaws import _policies
+from hacksaws import _regions
 from hacksaws import _sessions
 from hacksaws import _state
 
@@ -211,6 +211,11 @@ def _login_arguments(parser: argparse.ArgumentParser, *, browser: bool = False) 
     parser.add_argument(
         "--region", help="AWS region used for login and regional operations."
     )
+    parser.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        help="Accept a new canonical AWS region absent from bundled Botocore data.",
+    )
     _duration_arguments(parser)
     _ecr_arguments(parser)
     if browser:
@@ -325,6 +330,11 @@ def _assume_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--region", help="AWS region used for credential resolution and console links."
+    )
+    parser.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        help="Accept a new canonical AWS region absent from bundled Botocore data.",
     )
     _duration_arguments(parser)
     parser.add_argument(
@@ -444,6 +454,32 @@ def _resource_parser(parent: argparse._SubParsersAction[Any], kind: str) -> None
     if kind == "account":
         add.add_argument("account_id")
         add.add_argument("--partition", choices=sorted(_state.PARTITIONS))
+        add.add_argument(
+            "--region",
+            metavar="REGION_OR_ALIAS",
+            help="Preferred region for this account; stored canonically.",
+        )
+        add.add_argument(
+            "--allow-unknown-region",
+            action="store_true",
+            help="Accept a canonical-shaped region absent from bundled metadata.",
+        )
+        account_region = update.add_mutually_exclusive_group()
+        account_region.add_argument(
+            "--region",
+            metavar="REGION_OR_ALIAS",
+            help="Replace this account's preferred region.",
+        )
+        account_region.add_argument(
+            "--clear-region",
+            action="store_true",
+            help="Remove this account's preferred region.",
+        )
+        update.add_argument(
+            "--allow-unknown-region",
+            action="store_true",
+            help="Accept a canonical-shaped region absent from bundled metadata.",
+        )
         _credential_selector(add)
         _credential_selector(update)
     elif kind == "boundary":
@@ -472,8 +508,34 @@ def _resource_parser(parent: argparse._SubParsersAction[Any], kind: str) -> None
         add.add_argument("--to-directory")
         add.add_argument("--to-profile")
         add.add_argument("--boundary")
+        add.add_argument(
+            "--region",
+            metavar="REGION_OR_ALIAS",
+            help="Saved target region, ahead of profile/account/global defaults.",
+        )
+        add.add_argument(
+            "--allow-unknown-region",
+            action="store_true",
+            help="Accept a canonical-shaped region absent from bundled metadata.",
+        )
         update.add_argument("--boundary")
         update.add_argument("--clear-boundary", action="store_true")
+        target_region = update.add_mutually_exclusive_group()
+        target_region.add_argument(
+            "--region",
+            metavar="REGION_OR_ALIAS",
+            help="Replace this target's saved region.",
+        )
+        target_region.add_argument(
+            "--clear-region",
+            action="store_true",
+            help="Remove this target's saved region.",
+        )
+        update.add_argument(
+            "--allow-unknown-region",
+            action="store_true",
+            help="Accept a canonical-shaped region absent from bundled metadata.",
+        )
         update.add_argument("--source-account")
         update.add_argument("--source-profile")
         update_source = update.add_mutually_exclusive_group()
@@ -608,9 +670,134 @@ def _create_parser() -> argparse.ArgumentParser:
         help="Include full AWS-directory paths in the human table.",
     )
     profile_list.add_argument("--json", action="store_true")
+    profile_region = profile_actions.add_parser(
+        "region", help="Inspect or change the region stored on one AWS profile."
+    )
+    profile_region_actions = profile_region.add_subparsers(dest="profile_region_action")
+    profile_region_get = profile_region_actions.add_parser(
+        "get", help="Show the profile's currently stored region."
+    )
+    _credential_selector(profile_region_get)
+    profile_region_get.add_argument(
+        "--json", action="store_true", help="Emit stable JSON."
+    )
+    profile_region_set = profile_region_actions.add_parser(
+        "set", help="Store a canonical region on the profile."
+    )
+    profile_region_set.add_argument(
+        "region",
+        metavar="REGION_OR_ALIAS",
+        help="Canonical region or compact, geography, or custom alias.",
+    )
+    profile_region_set.add_argument(
+        "--allow-unknown-region",
+        action="store_true",
+        help="Accept a canonical-shaped region absent from bundled metadata.",
+    )
+    _credential_selector(profile_region_set)
+    profile_region_set.add_argument(
+        "--json", action="store_true", help="Emit stable JSON."
+    )
+    profile_region_clear = profile_region_actions.add_parser(
+        "clear", help="Remove the region stored on the profile."
+    )
+    _credential_selector(profile_region_clear)
+    profile_region_clear.add_argument(
+        "--json", action="store_true", help="Emit stable JSON."
+    )
 
     for kind in ("account", "boundary", "target"):
         _resource_parser(types, kind)
+
+    region = types.add_parser(
+        "region",
+        help="Discover canonical AWS regions and manage input-only aliases.",
+        description=(
+            "Resolve canonical regions, compact aliases such as usw2, geography "
+            "aliases such as oregon, and portable custom aliases. Hacksaws always "
+            "stores the canonical AWS region."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  hacksaws region list '*west*'\n"
+            "  hacksaws region explain oregon\n"
+            "  hacksaws region alias add pacific us-west-2\n"
+            "  hacksaws region list --account production\n\n"
+            "Operational AWS, China, and GovCloud regions are shown by default. "
+            "Use --all-partitions for discovery only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    region_actions = region.add_subparsers(dest="region_action")
+    for action in ("list", "explain"):
+        item = region_actions.add_parser(action)
+        if action == "list":
+            item.add_argument(
+                "patterns",
+                nargs="*",
+                help="Case-insensitive fnmatch patterns ORed across names and aliases.",
+            )
+        else:
+            item.add_argument(
+                "region",
+                metavar="REGION_OR_ALIAS",
+                help="Canonical region or compact, geography, or custom alias.",
+            )
+            item.add_argument(
+                "--allow-unknown-region",
+                action="store_true",
+                help="Accept a canonical-shaped region absent from bundled metadata.",
+            )
+        scope = item.add_mutually_exclusive_group()
+        scope.add_argument("--partition", help="Limit discovery to one AWS partition.")
+        scope.add_argument(
+            "--account", help="Use a configured account's partition as the scope."
+        )
+        item.add_argument(
+            "--all-partitions",
+            action="store_true",
+            help="Include discovery-only partitions Hacksaws cannot operate in.",
+        )
+        item.add_argument("--json", action="store_true", help="Emit stable JSON.")
+    alias = region_actions.add_parser(
+        "alias", help="Manage portable global custom region aliases."
+    )
+    alias_actions = alias.add_subparsers(dest="region_alias_action")
+    alias_add = alias_actions.add_parser("add", help="Create a portable input alias.")
+    alias_add.add_argument("alias", help="New lower-kebab-case alias name.")
+    alias_add.add_argument(
+        "region",
+        metavar="REGION_OR_ALIAS",
+        help="Known region or built-in alias to store canonically.",
+    )
+    alias_add.add_argument("--description", help="Optional purpose or geography note.")
+    alias_update = alias_actions.add_parser(
+        "update", help="Change an alias target or description."
+    )
+    alias_update.add_argument("alias", help="Existing custom alias name.")
+    alias_update.add_argument(
+        "--region",
+        metavar="REGION_OR_ALIAS",
+        help="Replacement known region or built-in alias.",
+    )
+    alias_update.add_argument("--description", help="Replacement description.")
+    alias_update.add_argument(
+        "--clear-description", action="store_true", help="Remove its description."
+    )
+    for action in ("get", "remove"):
+        item = alias_actions.add_parser(action)
+        item.add_argument("alias", help="Existing custom alias name.")
+        item.add_argument("--json", action="store_true", help="Emit stable JSON.")
+    alias_list = alias_actions.add_parser("list", help="List custom aliases.")
+    alias_list.add_argument(
+        "patterns",
+        nargs="*",
+        help="Case-insensitive fnmatch patterns ORed across alias fields.",
+    )
+    alias_list.add_argument("--json", action="store_true", help="Emit stable JSON.")
+    alias_rename = alias_actions.add_parser("rename", help="Rename an input alias.")
+    alias_rename.add_argument("alias", help="Existing custom alias name.")
+    alias_rename.add_argument("new_alias", help="New lower-kebab-case alias name.")
 
     policy = types.add_parser(
         "policy", help="Manage reusable policy documents stored on this computer."
@@ -724,6 +911,7 @@ def _create_parser() -> argparse.ArgumentParser:
     direct_set.add_argument("key")
     direct_set.add_argument("value")
     direct_set.add_argument("--json", action="store_true")
+    direct_set.add_argument("--allow-unknown-region", action="store_true")
     option = config_actions.add_parser("option", aliases=["opt"])
     option_actions = option.add_subparsers(dest="option_action")
     option_actions.add_parser("list", aliases=["ls"]).add_argument(
@@ -737,6 +925,7 @@ def _create_parser() -> argparse.ArgumentParser:
     option_set.add_argument("key")
     option_set.add_argument("value")
     option_set.add_argument("--json", action="store_true")
+    option_set.add_argument("--allow-unknown-region", action="store_true")
 
     history = types.add_parser(
         "history",
@@ -1235,7 +1424,7 @@ def _run_assume(context: _configs.Context) -> _configs.Result:
 
 
 def _run_mfa(context: _configs.Context) -> _configs.Result:
-    """Execute MFA while preserving the legacy direct-profile behavior."""
+    """Execute MFA through the transactional session lifecycle."""
     action = cast("str | None", context.args.action)
     if not action:
         _print_help(("mfa",))
@@ -1274,19 +1463,7 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
     if not context.args.mfa_code:
         raise _configs.OperationalError("MFA token code cannot be empty.")
     _history.note_mfa_code(source=context.args.mfa_code_source)
-    if _sessions.is_expanded_login(context.args):
-        return _sessions.mfa_login(context)
-
-    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(context.credentials_path)
-    os.environ["AWS_CONFIG_FILE"] = str(context.config_path)
-    _aws.logout(context)
-    aws_account = _configs.AwsAccount.from_context(context)
-    if cast("bool", context.args.ecr):
-        _ecr.logout(context, aws_account, check=False)
-    _aws.login(context)
-    if cast("bool", context.args.ecr):
-        _ecr.login(context, aws_account)
-    return _configs.Result("MFA_LOGIN", f"Logged into profile {context.profile}")
+    return _sessions.mfa_login(context)
 
 
 def _run_logout(context: _configs.Context) -> _configs.Result:
@@ -1625,7 +1802,7 @@ def _status_text(report: dict[str, Any]) -> str:
     states = [_status_state(item) for item in sessions]
     auth = [_status_auth(item) for item in sessions]
 
-    columns = ["PROFILE", "STATE", "AUTH", "ACCOUNT", "SCOPE"]
+    columns = ["PROFILE", "REGION", "STATE", "AUTH", "ACCOUNT", "SCOPE"]
     if show_location:
         columns.insert(0, "LOCATION")
     if show_ttl:
@@ -1637,6 +1814,7 @@ def _status_text(report: dict[str, Any]) -> str:
     for index, item in enumerate(sessions):
         row = [
             str(item.get("profile") or "default"),
+            str(item.get("profile_region") or item.get("region") or ""),
             states[index][0],
             auth[index][0],
             str(item.get("target_account") or item.get("source_account") or ""),
@@ -1654,7 +1832,7 @@ def _status_text(report: dict[str, Any]) -> str:
 
 
 def _profile_list_text(report: dict[str, Any], *, wide: bool = False) -> str:
-    columns = ["LOCATION", "PROFILE", "STATE", "AUTH", "VERIFY"]
+    columns = ["LOCATION", "PROFILE", "REGION", "STATE", "AUTH", "VERIFY"]
     if wide:
         columns.append("DIRECTORY")
     return _text_table(
@@ -1663,6 +1841,7 @@ def _profile_list_text(report: dict[str, Any], *, wide: bool = False) -> str:
             [
                 item.get("location"),
                 item["profile"],
+                item.get("region"),
                 item["state"],
                 item.get("auth_method"),
                 (item.get("verification") or {}).get("status"),
@@ -1708,12 +1887,13 @@ def _config_text(data: dict[str, Any], *, account: str | None = None) -> str:
     sections = [
         "Accounts\n"
         + _text_table(
-            ["NAME", "ID", "PARTITION", "VERIFIED", "DESCRIPTION"],
+            ["NAME", "ID", "PARTITION", "REGION", "VERIFIED", "DESCRIPTION"],
             [
                 [
                     name,
                     value.get("id"),
                     value.get("partition"),
+                    value.get("region"),
                     "no" if value.get("unverified") else "yes",
                     value.get("description"),
                 ]
@@ -1736,11 +1916,12 @@ def _config_text(data: dict[str, Any], *, account: str | None = None) -> str:
         ),
         "Targets\n"
         + _text_table(
-            ["NAME", "ACCOUNT", "SOURCE", "DESTINATION", "BOUNDARY"],
+            ["NAME", "ACCOUNT", "REGION", "SOURCE", "DESTINATION", "BOUNDARY"],
             [
                 [
                     name,
                     value.get("source_account"),
+                    value.get("region"),
                     (
                         f"{value.get('source_location', value.get('source_directory', 'default'))}:"
                         f"{value.get('source_profile', 'default')}"
@@ -1769,6 +1950,11 @@ def _config_text(data: dict[str, Any], *, account: str | None = None) -> str:
             + _text_table(
                 ["AREA", "VALUE"],
                 [
+                    ["aws.region", data.get("aws", {}).get("region")],
+                    [
+                        "aws.region-aliases",
+                        len(data.get("aws", {}).get("region_aliases", {})),
+                    ],
                     ["cache.max-age", data.get("cache", {}).get("max_age")],
                     ["output.color", data.get("output", {}).get("color")],
                 ],
@@ -1987,6 +2173,13 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
                 "partition": partition,
                 **({"unverified": True} if unverified else {}),
             }
+            if args.region:
+                value["region"] = _regions.resolve_region(
+                    args.region,
+                    custom_aliases=data["aws"]["region_aliases"],
+                    partition=partition,
+                    allow_unknown=args.allow_unknown_region,
+                ).canonical
         elif kind == "boundary":
             _, account = _state.get_resource(data, "account", args.account)
             role = args.role
@@ -2060,6 +2253,16 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
                 )
             if args.boundary:
                 value["boundary"] = args.boundary
+            if args.region:
+                _, source_account = _state.get_resource(
+                    data, "account", args.source_account
+                )
+                value["region"] = _regions.resolve_region(
+                    args.region,
+                    custom_aliases=data["aws"]["region_aliases"],
+                    partition=source_account["partition"],
+                    allow_unknown=args.allow_unknown_region,
+                ).canonical
         if args.description:
             value["description"] = args.description
         _state.add_resource(data, kind, args.resource_name, value)
@@ -2070,6 +2273,17 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
         if args.clear_description:
             _, item = _state.get_resource(data, kind, args.resource_name)
             item.pop("description", None)
+        if kind == "account":
+            _, item = _state.get_resource(data, kind, args.resource_name)
+            if args.region:
+                patch["region"] = _regions.resolve_region(
+                    args.region,
+                    custom_aliases=data["aws"]["region_aliases"],
+                    partition=item["partition"],
+                    allow_unknown=args.allow_unknown_region,
+                ).canonical
+            if args.clear_region:
+                item.pop("region", None)
         if kind == "boundary":
             _, existing_boundary = _state.get_resource(data, kind, args.resource_name)
             selected_account = args.account or existing_boundary["account"]
@@ -2140,6 +2354,19 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
                     "destination_profile",
                 ):
                     item.pop(field, None)
+            if args.region:
+                source_account_name = args.source_account or item["source_account"]
+                _, source_account = _state.get_resource(
+                    data, "account", source_account_name
+                )
+                patch["region"] = _regions.resolve_region(
+                    args.region,
+                    custom_aliases=data["aws"]["region_aliases"],
+                    partition=source_account["partition"],
+                    allow_unknown=args.allow_unknown_region,
+                ).canonical
+            if args.clear_region:
+                item.pop("region", None)
             if args.to and (args.to_directory or args.to_profile):
                 raise _configs.OperationalError(
                     "--to is mutually exclusive with --to-directory/--to-profile."
@@ -2338,6 +2565,44 @@ def _run_cache(args: argparse.Namespace) -> _configs.Result:
 
 
 def _run_profile(args: argparse.Namespace) -> _configs.Result:
+    if args.profile_action == "region":
+        action = args.profile_region_action
+        if action == "get":
+            value = _sessions.profile_region_get(args)
+            message = (
+                json.dumps(value, indent=2)
+                if args.json
+                else (
+                    f"{value['location']}:{value['profile']} uses {value['region']}."
+                    if value["region"]
+                    else f"{value['location']}:{value['profile']} has no stored region."
+                )
+            )
+            return _configs.Result(
+                "PROFILE_REGION_GET", message, data=value, kind="info"
+            )
+        if action in {"set", "clear"}:
+            value = _sessions.profile_region_change(args, clear=action == "clear")
+            if args.json:
+                message = json.dumps(value, indent=2)
+            elif value["changed"]:
+                verb = "Cleared" if action == "clear" else f"Set {value['region']} on"
+                message = f"{verb} {value['location']}:{value['profile']}."
+                if value["warnings"]:
+                    message += "\nWarning: " + " ".join(value["warnings"])
+            else:
+                message = f"{value['location']}:{value['profile']} already " + (
+                    "has no stored region."
+                    if value["region"] is None
+                    else f"uses {value['region']}."
+                )
+            return _configs.Result(
+                f"PROFILE_REGION_{action.upper()}", message, data=value
+            )
+        _print_help(("profile", "region"))
+        return _configs.Result(
+            "PROFILE_REGION_HELP", "Choose a profile region action.", 2, "stderr"
+        )
     if args.profile_action != "list":
         _print_help(("profile",))
         return _configs.Result("PROFILE_HELP", "Choose a profile action.", 2, "stderr")
@@ -2348,6 +2613,306 @@ def _run_profile(args: argparse.Namespace) -> _configs.Result:
         data=report,
         kind="info",
     )
+
+
+def _region_scope(
+    data: dict[str, Any], args: argparse.Namespace
+) -> tuple[str | None, str | None]:
+    """Resolve optional partition/account filters for region discovery."""
+    if getattr(args, "account", None):
+        account_name, account = _state.get_resource(data, "account", args.account)
+        return str(account["partition"]), account_name
+    partition = getattr(args, "partition", None)
+    known_partitions = {
+        item.partition for item in _regions.region_registry(all_partitions=True)
+    }
+    if partition and partition not in known_partitions:
+        raise _regions.RegionError(
+            "REGION_PARTITION_UNKNOWN",
+            f"Unknown AWS partition {partition!r}.",
+            candidates=sorted(known_partitions),
+        )
+    return partition, None
+
+
+def _region_record(
+    info: _regions.RegionInfo,
+    custom: dict[str, tuple[str, str | None]],
+) -> dict[str, Any]:
+    return {
+        "region": info.name,
+        "name": info.description,
+        "partition": info.partition,
+        "operational": info.operational,
+        "compact": info.compact_alias,
+        "geography": list(info.geography_aliases),
+        "custom": sorted(
+            alias for alias, (region, _) in custom.items() if region == info.name
+        ),
+    }
+
+
+def _region_list_text(values: list[dict[str, Any]]) -> str:
+    return _text_table(
+        ["REGION", "NAME", "PARTITION", "COMPACT", "GEOGRAPHY", "CUSTOM"],
+        [
+            [
+                item["region"],
+                item["name"],
+                item["partition"],
+                item["compact"],
+                ", ".join(item["geography"]),
+                ", ".join(item["custom"]),
+            ]
+            for item in values
+        ],
+    )
+
+
+def _alias_items(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+    return cast("dict[str, dict[str, str]]", data["aws"]["region_aliases"])
+
+
+def _alias_key(aliases: dict[str, Any], name: str) -> str:
+    normalized = _regions.normalize_alias(name)
+    match = next((key for key in aliases if key.casefold() == normalized), None)
+    if match is None:
+        raise _regions.RegionError(
+            "REGION_ALIAS_NOT_FOUND", f"Unknown custom region alias {name!r}."
+        )
+    return match
+
+
+def _alias_list_text(values: list[dict[str, Any]]) -> str:
+    return _text_table(
+        ["ALIAS", "REGION", "NAME", "DESCRIPTION"],
+        [
+            [item["alias"], item["region"], item["name"], item.get("description")]
+            for item in values
+        ],
+    )
+
+
+def _run_region_alias(
+    args: argparse.Namespace, data: dict[str, Any]
+) -> _configs.Result:
+    """Run custom alias CRUD while persisting canonical targets only."""
+    action = args.region_alias_action
+    if not action:
+        _print_help(("region", "alias"))
+        return _configs.Result(
+            "REGION_ALIAS_HELP", "Choose a region alias action.", 2, "stderr"
+        )
+    aliases = _alias_items(data)
+    custom = data["aws"]["region_aliases"]
+    if action == "list":
+        values = []
+        for alias, item in sorted(aliases.items()):
+            resolution = _regions.resolve_region(item["region"])
+            record = {
+                "alias": alias,
+                "region": resolution.canonical,
+                "name": resolution.description,
+                **(
+                    {"description": item["description"]}
+                    if item.get("description")
+                    else {}
+                ),
+            }
+            if not args.patterns or any(
+                fnmatch.fnmatchcase(candidate.casefold(), pattern.casefold())
+                for pattern in args.patterns
+                for candidate in (
+                    alias,
+                    resolution.canonical,
+                    resolution.description,
+                    item.get("description", ""),
+                )
+            ):
+                values.append(record)
+        return _configs.Result(
+            "REGION_ALIAS_LIST",
+            json.dumps(values, indent=2) if args.json else _alias_list_text(values),
+            data=values,
+        )
+    if action == "get":
+        key = _alias_key(aliases, args.alias)
+        item = aliases[key]
+        resolution = _regions.resolve_region(item["region"])
+        value = {
+            "alias": key,
+            "region": resolution.canonical,
+            "name": resolution.description,
+            **({"description": item["description"]} if item.get("description") else {}),
+        }
+        return _configs.Result(
+            "REGION_ALIAS_GET",
+            json.dumps(value, indent=2) if args.json else _alias_list_text([value]),
+            data=value,
+        )
+    if action == "remove":
+        key = _alias_key(aliases, args.alias)
+        del aliases[key]
+        _state.save_config(data)
+        return _configs.Result(
+            "REGION_ALIAS_REMOVE",
+            f"Removed region alias {key}; canonical stored regions are unchanged.",
+            data={"alias": key, "consumersChanged": False},
+        )
+    if action == "rename":
+        key = _alias_key(aliases, args.alias)
+        new_name = _regions.normalize_alias(args.new_alias)
+        if new_name != args.new_alias:
+            raise _regions.RegionError(
+                "REGION_ALIAS_INVALID",
+                f"Custom aliases use lower kebab case; try {new_name!r}.",
+            )
+        if any(existing.casefold() == new_name for existing in aliases):
+            raise _regions.RegionError(
+                "REGION_ALIAS_CONFLICT", f"Region alias {new_name!r} already exists."
+            )
+        aliases[new_name] = aliases.pop(key)
+        _state.save_config(data)
+        return _configs.Result(
+            "REGION_ALIAS_RENAME",
+            f"Renamed region alias {key} to {new_name}; canonical consumers are unchanged.",
+        )
+    name = _regions.normalize_alias(args.alias)
+    if name != args.alias:
+        raise _regions.RegionError(
+            "REGION_ALIAS_INVALID",
+            f"Custom aliases use lower kebab case; try {name!r}.",
+        )
+    if action == "add" and any(key.casefold() == name for key in aliases):
+        raise _regions.RegionError(
+            "REGION_ALIAS_CONFLICT", f"Region alias {name!r} already exists."
+        )
+    key = name if action == "add" else _alias_key(aliases, name)
+    existing = aliases.get(key, {})
+    region_input = args.region if action == "add" else args.region or existing["region"]
+    resolution = _regions.resolve_region(region_input, custom_aliases=custom)
+    value = {"region": resolution.canonical}
+    description = getattr(args, "description", None)
+    if description is not None:
+        value["description"] = description
+    elif existing.get("description") and not getattr(args, "clear_description", False):
+        value["description"] = existing["description"]
+    aliases[key] = value
+    _state.save_config(data)
+    return _configs.Result(
+        "REGION_ALIAS_SAVED",
+        f"Saved region alias {key} as {resolution.canonical} ({resolution.description}).",
+        data={"alias": key, **value, "name": resolution.description},
+    )
+
+
+def _run_region(args: argparse.Namespace) -> _configs.Result:
+    """Discover canonical regions or manage global custom aliases."""
+    data = _state.load_config()
+    if args.region_action == "alias":
+        return _run_region_alias(args, data)
+    if args.region_action not in {"list", "explain"}:
+        _print_help(("region",))
+        return _configs.Result("REGION_HELP", "Choose a region action.", 2, "stderr")
+    partition, account_name = _region_scope(data, args)
+    aliases = data["aws"]["region_aliases"]
+    if args.region_action == "explain":
+        resolution = _regions.resolve_region(
+            args.region,
+            custom_aliases=aliases,
+            partition=partition,
+            allow_unknown=args.allow_unknown_region,
+            allow_non_operational=args.all_partitions,
+        )
+        value = {
+            "input": resolution.input,
+            "region": resolution.canonical,
+            "name": resolution.description,
+            "partition": resolution.partition,
+            "operational": resolution.operational,
+            "known": resolution.known,
+            "matchedBy": resolution.source,
+            "matchedAlias": resolution.matched_alias,
+            "account": account_name,
+            "storedAs": resolution.canonical,
+            "warning": resolution.warning,
+        }
+        text = "\n".join(
+            f"{label}: {value[key] or '-'}"
+            for key, label in (
+                ("input", "Input"),
+                ("region", "Canonical region"),
+                ("name", "Name"),
+                ("partition", "Partition"),
+                ("matchedBy", "Matched by"),
+                ("storedAs", "Configuration stores"),
+                ("warning", "Warning"),
+            )
+        )
+        return _configs.Result(
+            "REGION_EXPLAIN",
+            json.dumps(value, indent=2) if args.json else text,
+            data=value,
+        )
+    custom = _regions.custom_alias_map(aliases)
+    values = []
+    for info in _regions.region_registry(all_partitions=args.all_partitions):
+        if partition and info.partition != partition:
+            continue
+        item = _region_record(info, custom)
+        candidates = (
+            item["region"],
+            item["name"],
+            item["partition"],
+            item["compact"] or "",
+            *item["geography"],
+            *item["custom"],
+        )
+        if args.patterns and not any(
+            fnmatch.fnmatchcase(str(candidate).casefold(), pattern.casefold())
+            for pattern in args.patterns
+            for candidate in candidates
+        ):
+            continue
+        values.append(item)
+    return _configs.Result(
+        "REGION_LIST",
+        json.dumps(values, indent=2) if args.json else _region_list_text(values),
+        data=values,
+    )
+
+
+def _canonical_config_region(
+    data: dict[str, Any], key: str, value: object, *, allow_unknown: bool
+) -> object:
+    """Resolve region-bearing config values before schema persistence."""
+    if type(value) is not str:
+        return value
+    parts = key.split(".")
+    option_shape = tuple(parts)
+    partition = None
+    if option_shape[:1] == ("accounts",) and option_shape[2:] == ("region",):
+        _, account = _state.get_resource(data, "account", parts[1])
+        partition = account["partition"]
+    elif option_shape[:1] == ("targets",) and option_shape[2:] == ("region",):
+        _, target = _state.get_resource(data, "target", parts[1])
+        _, account = _state.get_resource(data, "account", target["source_account"])
+        partition = account["partition"]
+    is_region = key == "aws.region" or (
+        option_shape[:1] in {("accounts",), ("targets",)}
+        and option_shape[2:] == ("region",)
+    )
+    is_alias_region = option_shape[:2] == ("aws", "region_aliases") and option_shape[
+        3:
+    ] == ("region",)
+    if not (is_region or is_alias_region):
+        return value
+    return _regions.resolve_region(
+        value,
+        custom_aliases=data["aws"]["region_aliases"],
+        partition=partition,
+        allow_unknown=allow_unknown and not is_alias_region,
+    ).canonical
 
 
 def _run_config(args: argparse.Namespace) -> _configs.Result:
@@ -2395,6 +2960,12 @@ def _run_config(args: argparse.Namespace) -> _configs.Result:
                 nested_set_value: object = json.loads(args.value)
             except json.JSONDecodeError:
                 nested_set_value = args.value
+            nested_set_value = _canonical_config_region(
+                data,
+                args.key,
+                nested_set_value,
+                allow_unknown=args.allow_unknown_region,
+            )
             _state.set_config_option(data, args.key, nested_set_value)
             _state.save_config(data)
             return _configs.Result(
@@ -2431,6 +3002,12 @@ def _run_config(args: argparse.Namespace) -> _configs.Result:
                 direct_option_value = json.loads(args.value)
             except json.JSONDecodeError:
                 direct_option_value = args.value
+            direct_option_value = _canonical_config_region(
+                data,
+                args.key,
+                direct_option_value,
+                allow_unknown=args.allow_unknown_region,
+            )
             _state.set_config_option(data, args.key, direct_option_value)
             _state.save_config(data)
             return _configs.Result(
@@ -2936,6 +3513,8 @@ def _console_main_invocation(
                 result = _run_profile(namespace)
             elif namespace.access_type in {"account", "boundary", "target"}:
                 result = _run_resource(namespace)
+            elif namespace.access_type == "region":
+                result = _run_region(namespace)
             elif namespace.access_type == "policy":
                 result = _run_policy(namespace)
             elif namespace.access_type == "cache":
@@ -2946,7 +3525,7 @@ def _console_main_invocation(
                 result = _run_config(namespace)
     except _configs.OperationalError as error:
         result = _configs.Result(
-            "OPERATIONAL_ERROR",
+            getattr(error, "code", "OPERATIONAL_ERROR"),
             f"Error: {error}",
             1,
             "stderr",

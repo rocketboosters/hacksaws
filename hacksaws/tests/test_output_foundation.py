@@ -248,11 +248,11 @@ def test_status_text_golden_is_compact_and_self_explaining() -> None:
         }
     )
     assert rendered == (
-        "PROFILE  STATE  AUTH      ACCOUNT       SCOPE"
+        "PROFILE  REGION  STATE  AUTH      ACCOUNT       SCOPE"
         "                                          TTL\n"
-        "-------  -----  --------  ------------  "
+        "-------  ------  -----  --------  ------------  "
         "---------------------------------------------  ---\n"
-        "debug    🟢     web→role  123456789012  "
+        "debug            🟢     web→role  123456789012  "
         "TerraformUnlimited → CloudWatchReadOnlyAccess  60m\n"
         "\n"
         "State: 1 🟢active"

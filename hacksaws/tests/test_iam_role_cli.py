@@ -786,6 +786,16 @@ def test_caller_trust_shapes_and_policy_resolution_errors(harness: Any) -> None:
     )
     assert cli._caller_trust(denied, ctx) is None
     assert cli._resolve_policy_arn("arn:aws:iam::aws:policy/X", ctx).endswith("/X")
+    with pytest.raises(OperationalError, match="partition"):
+        cli._resolve_policy_arn("arn:aws-cn:iam::aws:policy/X", ctx)
+    with pytest.raises(OperationalError, match="authenticated caller account"):
+        cli._resolve_policy_arn("arn:aws:iam::999999999999:policy/X", ctx)
+    sensitive_path = "C:/private/agent-policy.json"
+    with pytest.raises(
+        OperationalError, match="Invalid IAM managed-policy ARN"
+    ) as caught:
+        cli._resolve_policy_arn(f"arn:aws:s3:::{sensitive_path}", ctx)
+    assert sensitive_path not in str(caught.value)
     empty = FakeIam()
     empty.policy_pages = Paginator([{"Policies": []}])
     with pytest.raises(OperationalError, match="not found"):
@@ -803,6 +813,27 @@ def test_caller_trust_shapes_and_policy_resolution_errors(harness: Any) -> None:
     )
     with pytest.raises(OperationalError, match="ambiguous"):
         cli._resolve_policy_arn("Read", context(iam=ambiguous))
+
+
+@pytest.mark.parametrize(
+    ("partition", "region", "domain"),
+    [
+        ("aws", "us-west-2", "us-west-2.console.aws.amazon.com"),
+        ("aws-cn", "cn-north-1", "cn-north-1.console.amazonaws.cn"),
+        (
+            "aws-us-gov",
+            "us-gov-west-1",
+            "us-gov-west-1.console.amazonaws-us-gov.com",
+        ),
+    ],
+)
+def test_console_links_use_verified_partition_and_canonical_region(
+    partition: str, region: str, domain: str
+) -> None:
+    ctx = SimpleNamespace(partition=partition, region_name=region)
+    url = cli._console_url(ctx, "Agent")
+    assert url.startswith(f"https://{domain}/")
+    assert f"region={region}" in url
 
 
 def test_principal_resolution_forms_and_user_failure(

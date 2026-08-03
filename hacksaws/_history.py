@@ -117,21 +117,25 @@ def _connect() -> sqlite3.Connection:
     _secure(directory)
     path = database_path()
     connection = sqlite3.connect(path, timeout=5.0)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA synchronous = NORMAL")
-    with _initialization_lock:
-        if path not in _initialized_databases:
-            try:
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        with _initialization_lock:
+            if path not in _initialized_databases:
                 connection.execute("PRAGMA journal_mode = WAL")
                 _migrate(connection)
-            except (OSError, sqlite3.Error, HistoryError):
-                connection.close()
-                raise
-            _initialized_databases.add(path)
-    _secure(path)
-    return connection
+                _initialized_databases.add(path)
+    except BaseException:
+        # sqlite3.connect() can succeed before a corrupt/locked database makes
+        # an initialization PRAGMA fail. Close that partially initialized
+        # handle immediately; Python 3.13+ warns when it is left to the GC.
+        connection.close()
+        raise
+    else:
+        _secure(path)
+        return connection
 
 
 @contextlib.contextmanager
@@ -235,6 +239,7 @@ def _canonical_command(args: argparse.Namespace) -> tuple[str, str | None]:
         "config_action",
         "option_action",
         "profile_action",
+        "profile_region_action",
         "history_action",
     ):
         value = getattr(args, field, None)
@@ -444,6 +449,37 @@ def note_mfa_code(*, source: str) -> None:
                 if isinstance(safe, dict):
                     safe["mfaCodeProvided"] = True
                     safe["mfaCodeSource"] = source
+                    connection.execute(
+                        "UPDATE invocations SET safe_json = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (
+                            json.dumps(safe, sort_keys=True, separators=(",", ":")),
+                            _now(),
+                            identifier,
+                        ),
+                    )
+    except (OSError, sqlite3.Error, HistoryError):
+        return
+
+
+def note_region(*, region: str, partition: str, source: str) -> None:
+    """Attach the resolved, secret-free region provenance to this invocation."""
+    identifier = _current.get()
+    if identifier is None:
+        return
+    try:
+        with _database() as connection:
+            row = connection.execute(
+                "SELECT safe_json FROM invocations WHERE id = ?", (identifier,)
+            ).fetchone()
+            if row is None:
+                return
+            with contextlib.suppress(json.JSONDecodeError):
+                safe = json.loads(row[0])
+                if isinstance(safe, dict):
+                    safe["resolvedRegion"] = region
+                    safe["regionPartition"] = partition
+                    safe["regionSource"] = source
                     connection.execute(
                         "UPDATE invocations SET safe_json = ?, updated_at = ? "
                         "WHERE id = ?",

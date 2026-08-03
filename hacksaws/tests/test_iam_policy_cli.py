@@ -113,6 +113,16 @@ def context() -> SimpleNamespace:
     )
 
 
+def test_policy_console_link_uses_verified_partition_and_region() -> None:
+    ctx = SimpleNamespace(partition="aws-cn", region_name="cn-north-1")
+    url = cli._console_url(
+        ctx,
+        f"arn:aws-cn:iam::{ACCOUNT}:policy/hacksaws/AgentRead",
+    )
+    assert url.startswith("https://cn-north-1.console.amazonaws.cn/")
+    assert "region=cn-north-1" in url
+
+
 def service() -> Mock:
     value = Mock()
     value.account_id = ACCOUNT
