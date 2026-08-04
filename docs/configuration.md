@@ -62,6 +62,18 @@ hacksaws config set history.max_bytes 52428800
 The limits use seconds, entries, and bytes. See
 [Local command history](history.md) for the redaction and retention contract.
 
+## AWS environment values
+
+Hacksaws treats an unset, empty, or whitespace-only value for any `AWS_*`
+environment variable as absent. Literal nonblank values are preserved exactly;
+for example, `null` and `none` remain profile names or paths rather than special
+sentinels. This normalization does not rewrite the parent shell environment.
+
+Static region and service metadata is loaded independently of AWS credentials,
+while a nonblank `AWS_DATA_PATH` continues to extend Botocore's metadata search
+path. Region selection keeps its documented precedence: `AWS_REGION` precedes
+`AWS_DEFAULT_REGION`, and blank values at either layer are skipped.
+
 `config export` creates a portable zip excluding temporary caches.
 `config import` validates the complete archive before replacing state.
 

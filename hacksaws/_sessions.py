@@ -32,6 +32,7 @@ import yaml
 from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
+from hacksaws import _aws_env
 from hacksaws import _configs
 from hacksaws import _duration
 from hacksaws import _ecr
@@ -787,7 +788,8 @@ def _resolve_session_region(
         interactive=not bool(getattr(args, "json", False)) and sys.stdin.isatty(),
     )
     args._region_preference = preference
-    _history.note_region(
+    _history.call_safely(
+        _history.note_region,
         region=preference.canonical,
         partition=preference.resolution.partition,
         source=preference.source,
@@ -1046,12 +1048,17 @@ def _finish_session_save(
             profile,
         )
     except _configs.OperationalError as error:
-        _history.note_account_registration(
-            status="failed", created=0, reused=0, refreshed=0
+        _history.call_safely(
+            _history.note_account_registration,
+            status="failed",
+            created=0,
+            reused=0,
+            refreshed=0,
         )
         retry = _session_save.retry_command(plan) if plan.requested else None
         if plan.requested:
-            _history.note_session_save(
+            _history.call_safely(
+                _history.note_session_save,
                 status=(
                     "cancelled"
                     if isinstance(error, _session_save.SaveCancelled)
@@ -1095,7 +1102,8 @@ def _finish_session_save(
     existing = dict(result.data) if isinstance(result.data, dict) else {}
     summary = _session_save.outcome_data(outcome)
     registration = cast("dict[str, int]", summary["accountRegistration"])
-    _history.note_account_registration(
+    _history.call_safely(
+        _history.note_account_registration,
         status="completed",
         created=registration["created"],
         reused=registration["reused"],
@@ -1103,7 +1111,8 @@ def _finish_session_save(
     )
     bundle_changed = bool(summary["bundleChanged"])
     if plan.requested:
-        _history.note_session_save(
+        _history.call_safely(
+            _history.note_session_save,
             status="saved" if bundle_changed else "noop",
             target=outcome.target,
             boundary=outcome.boundary,
@@ -1559,7 +1568,7 @@ def _require_browser_runtime() -> None:
 
 def _native_login_cache() -> Path:
     """Resolve the cache directory external AWS tools will use after native login."""
-    configured = os.environ.get("AWS_LOGIN_CACHE_DIRECTORY")
+    configured = _aws_env.aws_environment_value("AWS_LOGIN_CACHE_DIRECTORY")
     if configured:
         return Path(configured).expanduser().absolute()
     return Path.home() / ".aws" / "login" / "cache"
@@ -1571,7 +1580,9 @@ def _clean_env(
     login_cache: Path | None = None,
 ) -> dict[str, str]:
     env = {
-        key: value for key, value in os.environ.items() if key not in _CONFLICTING_ENV
+        key: value
+        for key, value in _aws_env.normalized_aws_environment(os.environ).items()
+        if key not in _CONFLICTING_ENV
     }
     if config:
         env["AWS_CONFIG_FILE"] = str(config)
@@ -1587,8 +1598,9 @@ def _aws_environment(
     config: Path, credentials: Path, login_cache: Path
 ) -> Iterator[None]:
     """Temporarily scrub inherited AWS identity/path variables for one staging area."""
-    previous = {key: os.environ.get(key) for key in _CONFLICTING_ENV}
-    for key in _CONFLICTING_ENV:
+    keys = _CONFLICTING_ENV | set(_aws_env.blank_aws_environment_keys(os.environ))
+    previous = {key: os.environ.get(key) for key in keys}
+    for key in keys:
         os.environ.pop(key, None)
     os.environ["AWS_CONFIG_FILE"] = str(config)
     os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
@@ -1596,7 +1608,7 @@ def _aws_environment(
     try:
         yield
     finally:
-        for key in _CONFLICTING_ENV:
+        for key in keys:
             value = previous[key]
             if value is None:
                 os.environ.pop(key, None)
@@ -1939,6 +1951,46 @@ def _profile_exists(directory: Path, profile: str) -> bool:
     credentials = _read_ini(directory / "credentials")
     config = _read_ini(directory / "config")
     return profile in credentials or _section(profile, config=True) in config
+
+
+def _ambient_profile_exists(profile: str) -> bool:
+    """Return whether ambient AWS file selection still resolves one profile."""
+    config = Path(
+        _aws_env.aws_environment_value("AWS_CONFIG_FILE") or Path.home() / ".aws/config"
+    ).expanduser()
+    credentials = Path(
+        _aws_env.aws_environment_value("AWS_SHARED_CREDENTIALS_FILE")
+        or Path.home() / ".aws/credentials"
+    ).expanduser()
+    return profile in _read_ini(credentials) or _section(
+        profile, config=True
+    ) in _read_ini(config)
+
+
+def stale_profile_environment_warnings(
+    directory: Path, profile: str
+) -> tuple[str, ...]:
+    """Explain ambient profile selectors left stale by a successful logout."""
+    if _profile_exists(directory, profile) or _ambient_profile_exists(profile):
+        return ()
+    selected = next(
+        (
+            (variable, value)
+            for variable in ("AWS_DEFAULT_PROFILE", "AWS_PROFILE")
+            if (value := _aws_env.aws_environment_value(variable)) is not None
+        ),
+        None,
+    )
+    if selected is None or selected[1] != profile:
+        return ()
+    variable, _value = selected
+    return (
+        (
+            f"{variable} still selects removed profile {profile!r} in the parent "
+            f"shell. Hacksaws cannot clear its parent shell; in PowerShell run "
+            f"`$env:{variable} = $null`."
+        ),
+    )
 
 
 def _legacy_source_backup(
@@ -3880,10 +3932,15 @@ def save_target_from_session(args: Any) -> _configs.Result:
             rollback=_rollback,
         )
     except _configs.OperationalError:
-        _history.note_account_registration(
-            status="failed", created=0, reused=0, refreshed=0
+        _history.call_safely(
+            _history.note_account_registration,
+            status="failed",
+            created=0,
+            reused=0,
+            refreshed=0,
         )
-        _history.note_session_save(
+        _history.call_safely(
+            _history.note_session_save,
             status="failed",
             target=plan.name,
             boundary=plan.boundary_name,
@@ -3891,7 +3948,8 @@ def save_target_from_session(args: Any) -> _configs.Result:
             credentials_active=True,
         )
         raise
-    _history.note_account_registration(
+    _history.call_safely(
+        _history.note_account_registration,
         status="completed",
         created=outcome.accounts_created,
         reused=outcome.accounts_reused,
@@ -3900,7 +3958,8 @@ def save_target_from_session(args: Any) -> _configs.Result:
     bundle_changed = (
         outcome.changed if outcome.bundle_changed is None else outcome.bundle_changed
     )
-    _history.note_session_save(
+    _history.call_safely(
+        _history.note_session_save,
         status="saved" if bundle_changed else "noop",
         target=outcome.target,
         boundary=outcome.boundary,
@@ -4810,7 +4869,7 @@ def _logout_key(key: str, args: Any) -> dict[str, Any]:
             else:
                 sessions.pop(key, None)
             _state.save_sessions(sessions)
-    return {
+    outcome: dict[str, Any] = {
         "key": key,
         "destination": str(destination),
         "profile": profile,
@@ -4824,6 +4883,10 @@ def _logout_key(key: str, args: Any) -> dict[str, Any]:
         "residue": cache_residue,
         "changed": True,
     }
+    warnings = stale_profile_environment_warnings(destination, profile)
+    if warnings:
+        outcome["warnings"] = list(warnings)
+    return outcome
 
 
 def logout(context: _configs.Context) -> bool:
@@ -4831,6 +4894,12 @@ def logout(context: _configs.Context) -> bool:
     _source, _source_profile, destination, profile = _paths(context.args)
     key = f"{destination.absolute()}::{profile}"
     return bool(_logout_key(key, context.args)["changed"])
+
+
+def logout_environment_warnings(context: _configs.Context) -> tuple[str, ...]:
+    """Return stale ambient-profile warnings for the logout destination."""
+    _source, _source_profile, destination, profile = _paths(context.args)
+    return stale_profile_environment_warnings(destination, profile)
 
 
 def logout_all(args: Any) -> dict[str, Any]:
@@ -4895,7 +4964,8 @@ def explain_target(value: str) -> dict[str, Any]:
 
 def check_config(args: Any) -> dict[str, Any]:
     """Run config checks without leaking credential environment mutations."""
-    previous = {key: os.environ.get(key) for key in _CONFLICTING_ENV}
+    keys = _CONFLICTING_ENV | set(_aws_env.blank_aws_environment_keys(os.environ))
+    previous = {key: os.environ.get(key) for key in keys}
     try:
         return _check_config(args)
     finally:

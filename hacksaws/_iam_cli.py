@@ -18,6 +18,7 @@ import boto3
 from botocore.exceptions import BotoCoreError
 from botocore.exceptions import ClientError
 
+from hacksaws import _aws_env
 from hacksaws import _configs
 from hacksaws import _iam_cleanup
 from hacksaws import _iam_policy_cli
@@ -977,7 +978,14 @@ def _dispatch_cleanup(args: argparse.Namespace) -> _configs.Result:
 @contextlib.contextmanager
 def credential_environment(config: Path, credentials: Path) -> Iterator[None]:
     """Temporarily bind Boto3 to exactly one selected shared-config source."""
-    keys = _CREDENTIAL_ENVIRONMENT_KEYS
+    keys = (
+        *_CREDENTIAL_ENVIRONMENT_KEYS,
+        *(
+            key
+            for key in _aws_env.blank_aws_environment_keys(os.environ)
+            if key not in _CREDENTIAL_ENVIRONMENT_KEYS
+        ),
+    )
     previous = {key: os.environ.get(key) for key in keys}
     os.environ["AWS_CONFIG_FILE"] = str(config)
     os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
@@ -1022,8 +1030,8 @@ class IamCommandContext:
         selector = _configs.resolve_credential_selector(args)
         directory, profile, expected_account = _selected_source(selector, args)
         region_settings = _iam_region_settings(selector, expected_account)
-        env_region = os.getenv("AWS_REGION") or ""
-        env_default_region = os.getenv("AWS_DEFAULT_REGION") or ""
+        env_region = _aws_env.aws_environment_value("AWS_REGION")
+        env_default_region = _aws_env.aws_environment_value("AWS_DEFAULT_REGION")
         with credential_environment(directory / "config", directory / "credentials"):
             try:
                 higher_precedence_region = any(

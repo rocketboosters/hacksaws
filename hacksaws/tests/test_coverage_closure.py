@@ -79,7 +79,7 @@ def _target_config() -> dict[str, Any]:
 def test_package_version_falls_back_to_pyproject() -> None:
     with patch("importlib.metadata.version", side_effect=metadata.PackageNotFoundError):
         reloaded = importlib.reload(hacksaws)
-    assert reloaded.__version__ == "0.4.0"
+    assert reloaded.__version__ == "0.4.1"
 
 
 def test_coverage_gate_uses_two_decimal_precision() -> None:

@@ -8,6 +8,7 @@ import fnmatch
 import json
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -28,6 +29,7 @@ from hacksaws._duration import parse_count
 from hacksaws._duration import parse_duration
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
 SCHEMA_VERSION = 2
@@ -828,13 +830,16 @@ def _safe_namespace(args: argparse.Namespace) -> dict[str, object]:
 
 def begin(*, json_mode: bool, interactive: bool) -> HistoryHandle:
     """Start one best-effort invocation without retaining argv."""
-    _audit.reset_confirmation()
-    settings = _settings()
-    if settings["enabled"] is not True or _suspended.get():
-        return HistoryHandle(id=None, started_monotonic=time.monotonic(), enabled=False)
-    identifier = uuid.uuid4().hex
-    started = _now()
+    started_monotonic = time.monotonic()
     try:
+        _audit.reset_confirmation()
+        settings = _settings()
+        if settings["enabled"] is not True or _suspended.get():
+            return HistoryHandle(
+                id=None, started_monotonic=started_monotonic, enabled=False
+            )
+        identifier = uuid.uuid4().hex
+        started = _now()
         with _database() as connection:
             connection.execute(
                 """
@@ -846,10 +851,38 @@ def begin(*, json_mode: bool, interactive: bool) -> HistoryHandle:
             )
         _current.set(identifier)
         return HistoryHandle(
-            id=identifier, started_monotonic=time.monotonic(), enabled=True
+            id=identifier, started_monotonic=started_monotonic, enabled=True
         )
-    except (OSError, sqlite3.Error, HistoryError):
-        return HistoryHandle(id=None, started_monotonic=time.monotonic(), enabled=False)
+    except Exception:  # noqa: BLE001 - history must never prevent the command
+        call_safely(warn_unavailable, json_mode=json_mode)
+        _current.set(None)
+        return HistoryHandle(
+            id=None, started_monotonic=started_monotonic, enabled=False
+        )
+
+
+def warn_unavailable(*, json_mode: bool) -> None:
+    """Warn when history is unavailable without corrupting JSON output."""
+    if json_mode:
+        return
+    try:
+        sys.stderr.write(
+            "Warning: local command history is unavailable; continuing without "
+            "recording.\n"
+        )
+    except Exception:  # noqa: BLE001 - even warning output is best-effort
+        return
+
+
+def call_safely(
+    operation: Callable[..., object], /, *args: object, **kwargs: object
+) -> bool:
+    """Run one diagnostic history side effect without affecting its caller."""
+    try:
+        operation(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - history is optional telemetry
+        return False
+    return True
 
 
 def enrich(handle: HistoryHandle, args: argparse.Namespace) -> None:

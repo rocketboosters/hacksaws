@@ -59,6 +59,13 @@ hacksaws logout --all
 hacksaws logout --all --except "horizon:prod*" --except "+hacw"
 ```
 
+If logout removes a temporary profile still selected by `AWS_PROFILE` or
+`AWS_DEFAULT_PROFILE`, Hacksaws warns that the parent shell variable is stale
+and shows a PowerShell command that can clear it. A child process cannot modify
+its parent shell, but local Hacksaws commands continue to work with that stale
+selector. No warning is emitted when the variable is blank, selects another
+profile, or logout restores an underlying profile with the same name.
+
 `--except` requires `--all`. Patterns match canonical `location:profile` names
 and target aliases. Tracked ECR logins are removed unless `--keep-ecr` is used.
 

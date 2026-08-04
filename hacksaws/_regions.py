@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import difflib
-import os
 import re
 import sys
 from collections.abc import Mapping
@@ -11,15 +10,19 @@ from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING
 from typing import Literal
+from typing import cast
 
-import botocore.session
+from botocore import loaders
 from botocore.exceptions import UnknownRegionError
+from botocore.regions import EndpointResolver
 
+from hacksaws import _aws_env
 from hacksaws._configs import OperationalError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+    from typing import Any
 
 OPERATIONAL_PARTITIONS = frozenset({"aws", "aws-cn", "aws-us-gov"})
 REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
@@ -175,9 +178,44 @@ def _compact_candidate(region: str) -> str:
 
 
 @cache
-def region_registry(*, all_partitions: bool = False) -> tuple[RegionInfo, ...]:
+def _partition_data(data_path: str | None) -> dict[str, object]:
+    """Load static endpoint metadata without resolving an AWS profile."""
+    return cast(
+        "dict[str, object]",
+        loaders.create_loader(data_path).load_data("partitions"),
+    )
+
+
+@cache
+def _endpoint_data(data_path: str | None) -> dict[str, object]:
+    """Load static service endpoints without resolving an AWS profile."""
+    return cast(
+        "dict[str, object]",
+        loaders.create_loader(data_path).load_data("endpoints"),
+    )
+
+
+def _resolver() -> EndpointResolver:
+    return EndpointResolver(
+        _endpoint_data(_aws_env.aws_environment_value("AWS_DATA_PATH")),
+        uses_builtin_data=True,
+    )
+
+
+@cache
+def _service_endpoint_prefix(service: str, data_path: str | None) -> str:
+    """Resolve the endpoints metadata name from one static service model."""
+    model = loaders.create_loader(data_path).load_service_model(service, "service-2")
+    metadata = model.get("metadata", {})
+    return str(metadata.get("endpointPrefix") or service)
+
+
+@cache
+def _region_registry(
+    *, all_partitions: bool, data_path: str | None
+) -> tuple[RegionInfo, ...]:
     """Return deterministic Botocore regions with collision-free compact aliases."""
-    partitions = botocore.session.get_session().get_data("partitions")["partitions"]
+    partitions = cast("list[dict[str, Any]]", _partition_data(data_path)["partitions"])
     raw: list[tuple[str, str, str]] = []
     for partition in partitions:
         partition_name = str(partition["id"])
@@ -216,6 +254,14 @@ def region_registry(*, all_partitions: bool = False) -> tuple[RegionInfo, ...]:
             )
         )
     return tuple(result)
+
+
+def region_registry(*, all_partitions: bool = False) -> tuple[RegionInfo, ...]:
+    """Return static regions, honoring a meaningful custom AWS data path."""
+    return _region_registry(
+        all_partitions=all_partitions,
+        data_path=_aws_env.aws_environment_value("AWS_DATA_PATH"),
+    )
 
 
 def _registry_maps(
@@ -323,7 +369,7 @@ def validate_custom_aliases(aliases: Mapping[str, object]) -> None:
 def _infer_partition(value: str) -> str:
     """Infer an unknown canonical region only through Botocore partition patterns."""
     try:
-        return str(botocore.session.get_session().get_partition_for_region(value))
+        return str(_resolver().get_partition_for_region(value))
     except UnknownRegionError as error:
         raise RegionError(
             "REGION_PARTITION_UNKNOWN",
@@ -559,13 +605,15 @@ def resolve_region_preference(  # noqa: PLR0913
         ("explicit", explicit),
         (
             "aws-region-env",
-            env_region if env_region is not None else os.getenv("AWS_REGION"),
+            env_region
+            if env_region is not None
+            else _aws_env.aws_environment_value("AWS_REGION"),
         ),
         (
             "aws-default-region-env",
             env_default_region
             if env_default_region is not None
-            else os.getenv("AWS_DEFAULT_REGION"),
+            else _aws_env.aws_environment_value("AWS_DEFAULT_REGION"),
         ),
         ("target", target),
         ("destination-profile", destination),
@@ -618,11 +666,11 @@ def validate_service_region(
     if service == "signin":
         supported = resolution.partition in OPERATIONAL_PARTITIONS
     else:
-        supported = (
-            resolution.canonical
-            in botocore.session.get_session().get_available_regions(
-                service, partition_name=resolution.partition
-            )
+        endpoint_prefix = _service_endpoint_prefix(
+            service, _aws_env.aws_environment_value("AWS_DATA_PATH")
+        )
+        supported = resolution.canonical in _resolver().get_available_endpoints(
+            endpoint_prefix, partition_name=resolution.partition
         )
     if not supported:
         raise RegionError(

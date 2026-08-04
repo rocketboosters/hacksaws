@@ -1743,7 +1743,7 @@ def _run_mfa(context: _configs.Context) -> _configs.Result:
         context.args.mfa_code_source = "argument"
     if not context.args.mfa_code:
         raise _configs.OperationalError("MFA token code cannot be empty.")
-    _history.note_mfa_code(source=context.args.mfa_code_source)
+    _history.call_safely(_history.note_mfa_code, source=context.args.mfa_code_source)
     return _sessions.mfa_login(context)
 
 
@@ -1786,14 +1786,18 @@ def _run_logout(context: _configs.Context) -> _configs.Result:
             legacy_context = _configs.Context(args=legacy_args)
             try:
                 _aws.logout(legacy_context)
-                report["outcomes"].append(
-                    {
-                        "profile": item["profile"],
-                        "destination": item["directory"],
-                        "state": "logged-out",
-                        "changed": True,
-                    }
+                outcome: dict[str, Any] = {
+                    "profile": item["profile"],
+                    "destination": item["directory"],
+                    "state": "logged-out",
+                    "changed": True,
+                }
+                warnings = _sessions.stale_profile_environment_warnings(
+                    legacy_context.aws_directory, legacy_context.profile
                 )
+                if warnings:
+                    outcome["warnings"] = list(warnings)
+                report["outcomes"].append(outcome)
             except _configs.OperationalError as error:
                 report["errors"].append(
                     {
@@ -1820,24 +1824,48 @@ def _run_logout(context: _configs.Context) -> _configs.Result:
         context.args.profile = "default"
     _sessions.recover_journal()
     if _sessions.logout(context):
+        warnings = _sessions.logout_environment_warnings(context)
+        data: dict[str, Any] = {"profile": context.profile, "changed": True}
+        if warnings:
+            data["warnings"] = list(warnings)
         return _configs.Result(
             "LOGOUT",
-            f"Logged out of profile {context.profile}",
-            data={"profile": context.profile, "changed": True},
+            "\n".join(
+                (
+                    f"Logged out of profile {context.profile}",
+                    *(f"Warning: {warning}" for warning in warnings),
+                )
+            ),
+            data=data,
         )
     os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(context.credentials_path)
     os.environ["AWS_CONFIG_FILE"] = str(context.config_path)
     legacy_active = context.storage_path.exists()
     _aws.logout(context)
     changed = legacy_active
+    warnings = (
+        _sessions.stale_profile_environment_warnings(
+            context.aws_directory, context.profile
+        )
+        if changed
+        else ()
+    )
+    data = {"profile": context.profile, "changed": changed}
+    if warnings:
+        data["warnings"] = list(warnings)
     return _configs.Result(
         "MFA_LOGOUT" if changed else "LOGOUT_NO_STATE",
         (
-            f"Logged out of profile {context.profile}"
+            "\n".join(
+                (
+                    f"Logged out of profile {context.profile}",
+                    *(f"Warning: {warning}" for warning in warnings),
+                )
+            )
             if changed
             else f"No Hacksaws-managed login state found for profile {context.profile}."
         ),
-        data={"profile": context.profile, "changed": changed},
+        data=data,
         kind="info" if not changed else "success",
     )
 
@@ -2252,7 +2280,11 @@ def _logout_report_text(report: dict[str, Any]) -> str:
     rows.extend(
         [["-", item["key"], f"error: {item['message']}"] for item in report["errors"]]
     )
-    return _text_table(["PROFILE", "DESTINATION", "RESULT"], rows)
+    table = _text_table(["PROFILE", "DESTINATION", "RESULT"], rows)
+    warnings = [
+        warning for item in report["outcomes"] for warning in item.get("warnings", [])
+    ]
+    return "\n".join((table, *(f"Warning: {warning}" for warning in warnings)))
 
 
 def _cache_list_text(entries: list[dict[str, Any]]) -> str:
@@ -3746,9 +3778,9 @@ def _run_history(args: argparse.Namespace) -> _configs.Result:
                 kind="info",
             )
         if args.yes:
-            _history.note_confirmation("yes-flag", "bypassed")
+            _history.call_safely(_history.note_confirmation, "yes-flag", "bypassed")
         elif bool(getattr(args, "json", False)) or not sys.stdin.isatty():
-            _history.note_confirmation("exact-yes", "unavailable")
+            _history.call_safely(_history.note_confirmation, "exact-yes", "unavailable")
             return _configs.Result(
                 "CONFIRMATION_REQUIRED",
                 "History clear requires an interactive exact 'yes' or --yes.",
@@ -3764,8 +3796,10 @@ def _run_history(args: argparse.Namespace) -> _configs.Result:
                 "Type 'yes' exactly to continue: "
             )
             accepted = answer.strip() == "yes"
-            _history.note_confirmation(
-                "exact-yes", "accepted" if accepted else "declined"
+            _history.call_safely(
+                _history.note_confirmation,
+                "exact-yes",
+                "accepted" if accepted else "declined",
             )
             if not accepted:
                 return _configs.Result(
@@ -3803,8 +3837,12 @@ def _console_main_invocation(
         )
     except _configs.OperationalError as error:
         if history_handle is not None:
-            _history.note_parse_failure(
-                history_handle, parse_observation, phase="global", kind="invalid-value"
+            _history.call_safely(
+                _history.note_parse_failure,
+                history_handle,
+                parse_observation,
+                phase="global",
+                kind="invalid-value",
             )
         return _configs.Result(
             "ARGUMENT_ERROR", f"Error: {error}", _configs.EXIT_USAGE, "stderr"
@@ -3813,7 +3851,8 @@ def _console_main_invocation(
         normalized_arguments = _normalize_login_save_options(normalized_arguments)
     except _configs.OperationalError as error:
         if history_handle is not None:
-            _history.note_parse_failure(
+            _history.call_safely(
+                _history.note_parse_failure,
                 history_handle,
                 parse_observation,
                 phase="semantic",
@@ -3830,7 +3869,8 @@ def _console_main_invocation(
         _iam_cli.validate_selector_arguments(normalized_arguments)
     except _configs.OperationalError as error:
         if history_handle is not None:
-            _history.note_parse_failure(
+            _history.call_safely(
+                _history.note_parse_failure,
                 history_handle,
                 parse_observation,
                 phase="selector",
@@ -3856,8 +3896,11 @@ def _console_main_invocation(
             namespace = parser.parse_args(normalized_arguments)
     except SystemExit as error:
         if error.code != 0 and history_handle is not None:
-            _history.note_parse_failure(
-                history_handle, parse_observation, phase="argparse"
+            _history.call_safely(
+                _history.note_parse_failure,
+                history_handle,
+                parse_observation,
+                phase="argparse",
             )
         result = _configs.Result(
             "HELP" if error.code == 0 else "ARGUMENT_ERROR",
@@ -3899,7 +3942,7 @@ def _console_main_invocation(
         namespace.mfa_code = namespace.profile
         namespace.profile = None
     if history_handle is not None:
-        _history.enrich(history_handle, namespace)
+        _history.call_safely(_history.enrich, history_handle, namespace)
     if namespace.access_type == "mfa" and namespace.action in {"login", "in"}:
         missing_code = namespace.mfa_code is None and not bool(
             getattr(namespace, "mfa_code_stdin", False)
@@ -3910,7 +3953,8 @@ def _console_main_invocation(
             if not use_json:
                 parser.print_usage(sys.stderr)
             if history_handle is not None:
-                _history.note_parse_failure(
+                _history.call_safely(
+                    _history.note_parse_failure,
                     history_handle,
                     parse_observation,
                     phase="semantic",
@@ -3993,7 +4037,8 @@ def _console_main_invocation(
             and int(getattr(error, "exit_code", _configs.EXIT_ERROR))
             == _configs.EXIT_USAGE
         ):
-            _history.note_parse_failure(
+            _history.call_safely(
+                _history.note_parse_failure,
                 history_handle,
                 parse_observation,
                 phase="semantic",
@@ -4018,17 +4063,28 @@ def _console_main_invocation(
 def console_main(arguments: Sequence[str] | None = None) -> _configs.Result:
     """Run one isolated CLI invocation without leaking output mode to callers."""
     raw_arguments = list(sys.argv[1:] if arguments is None else arguments)
-    history_handle = _history.begin(
-        json_mode=_json_requested(raw_arguments), interactive=sys.stdin.isatty()
-    )
+    json_mode = _json_requested(raw_arguments)
+    try:
+        history_handle = _history.begin(
+            json_mode=json_mode, interactive=sys.stdin.isatty()
+        )
+    except Exception:  # noqa: BLE001 - history is an optional diagnostic
+        _history.call_safely(_history.warn_unavailable, json_mode=json_mode)
+        history_handle = None
     _configs.configure_output()
     try:
         result = _console_main_invocation(raw_arguments, history_handle=history_handle)
     except BaseException as error:
-        _history.fail(history_handle, error)
+        if history_handle is not None and not _history.call_safely(
+            _history.fail, history_handle, error
+        ):
+            _history.call_safely(_history.warn_unavailable, json_mode=json_mode)
         raise
     else:
-        _history.finish(history_handle, result)
+        if history_handle is not None and not _history.call_safely(
+            _history.finish, history_handle, result
+        ):
+            _history.call_safely(_history.warn_unavailable, json_mode=json_mode)
         return result
     finally:
         _configs.configure_output()
