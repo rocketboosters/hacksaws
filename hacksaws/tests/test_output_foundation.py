@@ -8,6 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -971,3 +972,200 @@ def test_cache_filters_confirmation_and_help_branches(
     )
     assert cleared.data == {"removed": ["aws-CloudWatchReadOnly"], "count": 1}
     assert _cli._run_cache(argparse.Namespace(cache_action=None)).code == "CACHE_HELP"
+
+
+def test_target_list_text_is_empty_placeholder_for_no_targets() -> None:
+    assert _cli._target_list_text({}) == "(none)"
+
+
+def test_target_list_text_renders_dynamic_columns_order_and_legend() -> None:
+    items = {
+        "Deploy": {
+            "source_account": "Prod",
+            "source_profile": "admin",
+            "source_directory": "/abs/source",
+            "destination_location": "west",
+            "destination_profile": "release",
+            "boundary": "Guard",
+            "region": "us-east-1",
+            "description": "deploy   target\nnotes",
+        },
+        "Simple": {
+            "source_account": "Dev",
+            "source_profile": "dev",
+            "source_location": "default",
+        },
+    }
+    rendered = _cli._target_list_text(items)
+
+    assert rendered == (
+        "NAME    ACCOUNT  PROFILE  LOCATION        →PROFILE  →LOCATION  "
+        "BOUNDARY  REGION     DESC\n"
+        "------  -------  -------  --------------  --------  ---------  "
+        "--------  ---------  -------------------\n"
+        "Deploy  Prod     admin    📁 /abs/source  release   ⌖ west     "
+        "Guard     us-east-1  deploy target notes\n"
+        "Simple  Dev      dev      ⌖ default       -         -          "
+        "-         -          -\n\n"
+        "Key: ⌖ location  📁 directory  → destination"
+    )
+    lines = rendered.splitlines()
+    # Fixed then dynamic column order, headers uppercase.
+    assert lines[0].split() == [
+        "NAME",
+        "ACCOUNT",
+        "PROFILE",
+        "LOCATION",
+        "→PROFILE",
+        "→LOCATION",
+        "BOUNDARY",
+        "REGION",
+        "DESC",
+    ]
+    # Configured insertion order is preserved (Deploy before Simple).
+    assert lines[2].startswith("Deploy")
+    assert lines[3].startswith("Simple")
+    # Missing optional cells on the second row render '-', and description
+    # whitespace (including embedded newlines) is collapsed, not truncated.
+    assert "deploy target notes" in rendered
+    # Legend appears exactly once, after exactly one blank line, with
+    # deterministic symbol order and only symbols actually used.
+    assert "\n\nKey: ⌖ location  📁 directory  → destination" in rendered
+    assert rendered.count("Key:") == 1
+
+
+def test_target_list_text_omits_unused_optional_columns_and_destination_key() -> None:
+    items = {
+        "Solo": {
+            "source_account": "Prod",
+            "source_profile": "admin",
+            "source_location": "default",
+        }
+    }
+    rendered = _cli._target_list_text(items)
+    header = rendered.splitlines()[0]
+    assert header.split() == ["NAME", "ACCOUNT", "PROFILE", "LOCATION"]
+    assert "→" not in rendered
+    assert "📁" not in rendered
+    assert "Key: ⌖ location" in rendered
+    assert "destination" not in rendered
+
+
+def test_boundary_list_text_is_empty_placeholder_for_no_boundaries() -> None:
+    assert _cli._boundary_list_text({"policies": {}}, {}) == "(none)"
+
+
+def test_boundary_list_text_role_suffix_covers_full_path_after_role() -> None:
+    items = {
+        "Guard": {
+            "role_arn": "arn:aws:iam::123456789012:role/team/nested/Read",
+            "account": "Prod",
+        }
+    }
+    rendered = _cli._boundary_list_text({"policies": {}}, items)
+    lines = rendered.splitlines()
+    assert lines[0].split() == ["NAME", "ACCOUNT", "ROLE"]
+    assert "team/nested/Read" in lines[2]
+
+
+def test_boundary_list_text_dynamic_columns_ttl_masking_and_verified() -> None:
+    data = {"policies": {"Custom.json": {"file": "stored_session_policies/x.yaml"}}}
+    items: dict[str, dict[str, Any]] = {
+        "Guard": {
+            "role_arn": "arn:aws:iam::123456789012:role/Read",
+            "account": "Prod",
+            "policy": "custom.json",
+            "external_id": "abcdef123456",
+            "duration": 5430,
+            "verified": True,
+            "description": "guard   boundary",
+        },
+        "Bare": {
+            "role_arn": "arn:aws:iam::123456789012:role/Bare",
+            "account": "Prod",
+        },
+    }
+    rendered = _cli._boundary_list_text(data, items)
+
+    assert rendered == (
+        "NAME   ACCOUNT  ROLE  POLICY       TTL       EXT ID  VERIFIED  DESC\n"
+        "-----  -------  ----  -----------  --------  ------  --------  "
+        "--------------\n"
+        "Guard  Prod     Read  custom.json  1h30m30s  ab…56   ✓         "
+        "guard boundary\n"
+        "Bare   Prod     Bare  -            -         -       ?         -\n\n"
+        "Key: ✓ verified  ? unverified"
+    )
+    lines = rendered.splitlines()
+    assert lines[0].split() == [
+        "NAME",
+        "ACCOUNT",
+        "ROLE",
+        "POLICY",
+        "TTL",
+        "EXT",
+        "ID",
+        "VERIFIED",
+        "DESC",
+    ]
+    # Configured order preserved.
+    assert lines[2].startswith("Guard")
+    assert lines[3].startswith("Bare")
+    # Case-insensitive configured-name precedence keeps the raw boundary
+    # reference unmarked, even though it ends in .json.
+    assert "custom.json 📄" not in rendered
+    assert "custom.json ☁" not in rendered
+    # External id masking: never the raw secret.
+    assert "abcdef123456" not in rendered
+    # Legend has exactly one blank line then Key:, deterministic used-only
+    # order, omitting unused policy-classification symbols.
+    assert rendered.count("Key:") == 1
+    assert "☁" not in rendered
+    assert "📄" not in rendered
+
+
+def test_boundary_policy_precedence_configured_name_beats_arn_and_file_forms() -> None:
+    data = {"policies": {"Custom.json": {"file": "x.yaml"}}}
+    # Configured name wins case-insensitively and is preserved unmarked, even
+    # though the stored reference casing differs and it ends in .json.
+    assert _cli._boundary_policy_display(data["policies"], "custom.json") == (
+        "custom.json"
+    )
+    assert _cli._boundary_policy_display(data["policies"], "CUSTOM.JSON") == (
+        "CUSTOM.JSON"
+    )
+    # A managed-policy ARN not matching any configured name is marked with the
+    # cloud symbol, keyed off capture group 3 of _policies.POLICY_ARN.
+    assert (
+        _cli._boundary_policy_display({}, "arn:aws:iam::aws:policy/ReadOnlyAccess")
+        == "ReadOnlyAccess ☁"
+    )
+    # A persisted-schema-valid suffix file that matches neither is marked with
+    # the file symbol and its reference is preserved unmarked otherwise.
+    assert (
+        _cli._boundary_policy_display({}, "local-policy.yaml") == "local-policy.yaml 📄"
+    )
+
+
+def test_format_ttl_preserves_exact_duration() -> None:
+    assert _cli._format_ttl(900) == "15m"
+    assert _cli._format_ttl(3600) == "1h"
+    assert _cli._format_ttl(5400) == "1h30m"
+    assert _cli._format_ttl(3630) == "1h0m30s"
+    assert _cli._format_ttl(45) == "45s"
+
+
+def test_mask_external_id_never_exposes_raw_value() -> None:
+    assert _cli._mask_external_id("abcdef123456") == "ab…56"
+    assert _cli._mask_external_id("abcde") == "••••"
+    assert _cli._mask_external_id("abcdef") == "ab…ef"
+    for masked in ("ab…56", "••••", "ab…ef"):
+        assert "abcdef123456" not in masked
+
+
+def test_collapse_whitespace_normalizes_without_truncating() -> None:
+    long_text = "word " * 200
+    collapsed = _cli._collapse_whitespace(f"  {long_text}\n\t trailing  ")
+    assert collapsed == f"{'word ' * 200}trailing".strip()
+    assert "  " not in collapsed
+    assert len(collapsed) > 100

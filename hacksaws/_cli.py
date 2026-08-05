@@ -2410,6 +2410,234 @@ def _cascade_remove(data: dict[str, Any], kind: str, name: str, *, yes: bool) ->
     return preview
 
 
+def _collapse_whitespace(value: str) -> str:
+    """Collapse runs of whitespace into single spaces without truncating."""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _target_location_cell(item: dict[str, Any], prefix: str) -> str | None:
+    """Merge a location/directory pair into one icon-marked cell value."""
+    location = item.get(f"{prefix}_location")
+    if location is not None:
+        return f"⌖ {location}"
+    directory = item.get(f"{prefix}_directory")
+    if directory is not None:
+        return f"📁 {directory}"
+    return None
+
+
+def _target_list_text(items: dict[str, dict[str, Any]]) -> str:
+    """Render `target list` as a compact plain-text table with a dynamic legend."""
+    if not items:
+        return "(none)"
+    has_destination_profile = any(
+        "destination_profile" in item for item in items.values()
+    )
+    has_destination_location = any(
+        "destination_location" in item or "destination_directory" in item
+        for item in items.values()
+    )
+    has_boundary = any("boundary" in item for item in items.values())
+    has_region = any("region" in item for item in items.values())
+    has_description = any("description" in item for item in items.values())
+
+    columns = ["NAME", "ACCOUNT", "PROFILE", "LOCATION"]
+    if has_destination_profile:
+        columns.append("→PROFILE")
+    if has_destination_location:
+        columns.append("→LOCATION")
+    if has_boundary:
+        columns.append("BOUNDARY")
+    if has_region:
+        columns.append("REGION")
+    if has_description:
+        columns.append("DESC")
+
+    uses_location = False
+    uses_directory = False
+    rows: list[list[object]] = []
+    for name, item in items.items():
+        source_cell = _target_location_cell(item, "source")
+        uses_location = uses_location or bool(
+            source_cell and source_cell.startswith("⌖")
+        )
+        uses_directory = uses_directory or bool(
+            source_cell and source_cell.startswith("📁")
+        )
+        row: list[object] = [
+            name,
+            item.get("source_account"),
+            item.get("source_profile"),
+            source_cell,
+        ]
+        if has_destination_profile:
+            row.append(item.get("destination_profile"))
+        if has_destination_location:
+            destination_cell = _target_location_cell(item, "destination")
+            uses_location = uses_location or bool(
+                destination_cell and destination_cell.startswith("⌖")
+            )
+            uses_directory = uses_directory or bool(
+                destination_cell and destination_cell.startswith("📁")
+            )
+            row.append(destination_cell)
+        if has_boundary:
+            row.append(item.get("boundary"))
+        if has_region:
+            row.append(item.get("region"))
+        if has_description:
+            description = item.get("description")
+            row.append(
+                _collapse_whitespace(description)
+                if isinstance(description, str) and description
+                else None
+            )
+        rows.append(row)
+
+    legend_items: list[tuple[str, str]] = []
+    if uses_location:
+        legend_items.append(("⌖", "location"))
+    if uses_directory:
+        legend_items.append(("📁", "directory"))
+    if has_destination_profile or has_destination_location:
+        legend_items.append(("→", "destination"))
+
+    table = _text_table(columns, rows)
+    if not legend_items:
+        return table
+    key = "Key: " + "  ".join(f"{symbol} {meaning}" for symbol, meaning in legend_items)
+    return f"{table}\n\n{key}"
+
+
+_TTL_SECONDS_PER_MINUTE = 60
+_TTL_SECONDS_PER_HOUR = 60 * _TTL_SECONDS_PER_MINUTE
+
+
+def _format_ttl(seconds: int) -> str:
+    """Render whole-second durations compactly while preserving the exact value."""
+    hours, remainder = divmod(seconds, _TTL_SECONDS_PER_HOUR)
+    minutes, secs = divmod(remainder, _TTL_SECONDS_PER_MINUTE)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or (hours and secs):
+        parts.append(f"{minutes}m")
+    if secs:
+        parts.append(f"{secs}s")
+    return "".join(parts) or "0s"
+
+
+_EXTERNAL_ID_UNMASKED_LENGTH = 6
+
+
+def _mask_external_id(value: str) -> str:
+    """Mask an external id so the raw secret never reaches human-facing output."""
+    if len(value) >= _EXTERNAL_ID_UNMASKED_LENGTH:
+        return f"{value[:2]}…{value[-2:]}"
+    return "••••"
+
+
+def _boundary_role_suffix(role_arn: str) -> str:
+    """Return the complete IAM role path/name suffix after `role/`."""
+    _, separator, suffix = role_arn.partition("role/")
+    return suffix if separator else role_arn
+
+
+def _boundary_policy_display(policies: dict[str, Any], policy: str) -> str:
+    """Classify a boundary policy reference with deterministic precedence."""
+    if _state._find_key(policies, policy) is not None:
+        return policy
+    match = _policies.POLICY_ARN.fullmatch(policy)
+    if match:
+        return f"{match.group(3)} ☁"
+    return f"{policy} 📄"
+
+
+def _boundary_list_text(data: dict[str, Any], items: dict[str, dict[str, Any]]) -> str:
+    """Render `boundary list` as a compact plain-text table with a dynamic legend."""
+    if not items:
+        return "(none)"
+    policies = data.get("policies", {})
+    has_policy = any("policy" in item for item in items.values())
+    has_ttl = any("duration" in item for item in items.values())
+    has_external_id = any("external_id" in item for item in items.values())
+    has_verified = any("verified" in item for item in items.values())
+    has_description = any("description" in item for item in items.values())
+
+    columns = ["NAME", "ACCOUNT", "ROLE"]
+    if has_policy:
+        columns.append("POLICY")
+    if has_ttl:
+        columns.append("TTL")
+    if has_external_id:
+        columns.append("EXT ID")
+    if has_verified:
+        columns.append("VERIFIED")
+    if has_description:
+        columns.append("DESC")
+
+    uses_cloud = False
+    uses_file = False
+    uses_verified_true = False
+    uses_verified_false = False
+    rows: list[list[object]] = []
+    for name, item in items.items():
+        role_arn = item.get("role_arn")
+        row: list[object] = [
+            name,
+            item.get("account"),
+            _boundary_role_suffix(role_arn) if isinstance(role_arn, str) else None,
+        ]
+        if has_policy:
+            policy = item.get("policy")
+            policy_cell = (
+                _boundary_policy_display(policies, policy)
+                if isinstance(policy, str)
+                else None
+            )
+            if policy_cell is not None:
+                uses_cloud = uses_cloud or policy_cell.endswith("☁")
+                uses_file = uses_file or policy_cell.endswith("📄")
+            row.append(policy_cell)
+        if has_ttl:
+            duration = item.get("duration")
+            row.append(_format_ttl(duration) if isinstance(duration, int) else None)
+        if has_external_id:
+            external_id = item.get("external_id")
+            row.append(
+                _mask_external_id(external_id) if isinstance(external_id, str) else None
+            )
+        if has_verified:
+            verified = item.get("verified") is True
+            uses_verified_true = uses_verified_true or verified
+            uses_verified_false = uses_verified_false or not verified
+            row.append("✓" if verified else "?")
+        if has_description:
+            description = item.get("description")
+            row.append(
+                _collapse_whitespace(description)
+                if isinstance(description, str) and description
+                else None
+            )
+        rows.append(row)
+
+    legend_items: list[tuple[str, str]] = []
+    if uses_cloud:
+        legend_items.append(("☁", "AWS-managed policy"))
+    if uses_file:
+        legend_items.append(("📄", "policy file"))
+    if uses_verified_true:
+        legend_items.append(("✓", "verified"))
+    if uses_verified_false:
+        legend_items.append(("?", "unverified"))
+
+    table = _text_table(columns, rows)
+    if not legend_items:
+        return table
+    key = "Key: " + "  ".join(f"{symbol} {meaning}" for symbol, meaning in legend_items)
+    return f"{table}\n\n{key}"
+
+
 def _run_resource(args: argparse.Namespace) -> _configs.Result:
     kind = args.access_type
     action = args.resource_action
@@ -2458,10 +2686,12 @@ def _run_resource(args: argparse.Namespace) -> _configs.Result:
             raise _UsageError(f"{rendered} require --from-session PROFILE.")
     data = _state.load_config()
     if action == "list":
-        values = [
-            {"name": name, **item}
-            for name, item in data[_state.collection_name(kind)].items()
-        ]
+        items = data[_state.collection_name(kind)]
+        if not args.json and kind == "target":
+            return _configs.Result("RESOURCE_LIST", _target_list_text(items))
+        if not args.json and kind == "boundary":
+            return _configs.Result("RESOURCE_LIST", _boundary_list_text(data, items))
+        values = [{"name": name, **item} for name, item in items.items()]
         return _configs.Result("RESOURCE_LIST", _json_or_text(values, args.json))
     if action == "get":
         name, item = _state.get_resource(data, kind, args.resource_name)

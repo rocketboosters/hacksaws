@@ -694,3 +694,152 @@ def test_config_option_layers_round_trip_and_resolve_precedence() -> None:
         _state.set_config_option(data, "output", {})
     with pytest.raises(_configs.OperationalError, match="IAM role ARN must be text"):
         _state.parse_role_arn(None)
+
+
+def test_target_and_boundary_list_render_compact_tables_not_json_lines(
+    state_home: Path,
+) -> None:
+    _seed_connected(state_home)
+
+    target_listing = _run(["target", "list"])
+    assert target_listing.code == "RESOURCE_LIST"
+    message = target_listing.message
+    assert not message.lstrip().startswith(("{", "["))
+    header = message.splitlines()[0]
+    assert header.split() == [
+        "NAME",
+        "ACCOUNT",
+        "PROFILE",
+        "LOCATION",
+        "→PROFILE",
+        "→LOCATION",
+        "BOUNDARY",
+    ]
+    assert "Deploy" in message
+    assert "Key: ⌖ location  📁 directory  → destination" in message
+
+    boundary_listing = _run(["boundary", "list"])
+    assert boundary_listing.code == "RESOURCE_LIST"
+    boundary_message = boundary_listing.message
+    assert not boundary_message.lstrip().startswith(("{", "["))
+    boundary_header = boundary_message.splitlines()[0]
+    assert boundary_header.split() == [
+        "NAME",
+        "ACCOUNT",
+        "ROLE",
+        "POLICY",
+        "TTL",
+        "EXT",
+        "ID",
+        "VERIFIED",
+    ]
+    assert "Guard" in boundary_message
+    # The seeded boundary's raw external id ("original") must never surface.
+    assert "original" not in boundary_message
+    assert "or…al" in boundary_message
+    assert "15m" in boundary_message
+    assert "?" in boundary_message
+    assert "Key: ? unverified" in boundary_message
+
+
+def test_target_list_local_and_global_json_flags_are_exactly_equivalent(
+    state_home: Path,
+) -> None:
+    _seed_connected(state_home)
+    local = _run(["target", "list", "--json"])
+    remote = _run(["--json", "target", "list"])
+    assert local.message == remote.message
+    parsed = json.loads(local.message)
+    assert parsed == [
+        {
+            "name": "Deploy",
+            "source_account": "Prod",
+            "source_profile": "source",
+            "source_directory": str((state_home / "source").absolute()),
+            "destination_location": "old",
+            "destination_profile": "destination",
+            "boundary": "Guard",
+        }
+    ]
+
+
+def test_boundary_list_local_and_global_json_flags_are_exactly_equivalent(
+    state_home: Path,
+) -> None:
+    _seed_connected(state_home)
+    local = _run(["boundary", "list", "--json"])
+    remote = _run(["--json", "boundary", "list"])
+    assert local.message == remote.message
+    parsed = json.loads(local.message)
+    assert parsed == [
+        {
+            "name": "Guard",
+            "role_arn": ROLE_ARN,
+            "account": "Prod",
+            "policy": "Guard",
+            "external_id": "original",
+            "duration": 900,
+            "verified": False,
+        }
+    ]
+
+
+def test_boundary_list_standard_output_policy_precedence_and_masking(
+    state_home: Path,
+) -> None:
+    data = _state.default_config()
+    data["accounts"]["Prod"] = {"id": ACCOUNT_ID, "partition": "aws"}
+    data["policies"]["Custom.json"] = {
+        "file": "stored_session_policies/Custom.json.yaml"
+    }
+    data["boundaries"]["Guard"] = {
+        "role_arn": ROLE_ARN,
+        "account": "Prod",
+        # Casing differs from the configured "Custom.json" entry; a
+        # configured name must still win, unmarked, despite ending in .json.
+        "policy": "custom.json",
+        "external_id": "abcdef123456",
+        "duration": 900,
+        "verified": True,
+    }
+    data["boundaries"]["Managed"] = {
+        "role_arn": f"arn:aws:iam::{ACCOUNT_ID}:role/Managed",
+        "account": "Prod",
+        "policy": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+    }
+    data["boundaries"]["FileBacked"] = {
+        "role_arn": f"arn:aws:iam::{ACCOUNT_ID}:role/FileBacked",
+        "account": "Prod",
+        "policy": "local-policy.yaml",
+    }
+    _state.save_config(data)
+
+    message = _run(["boundary", "list"]).message
+    assert "custom.json 📄" not in message
+    assert "custom.json ☁" not in message
+    assert "custom.json" in message
+    assert "ReadOnlyAccess ☁" in message
+    assert "local-policy.yaml 📄" in message
+    assert "abcdef123456" not in message
+    assert "ab…56" in message
+    assert "15m" in message
+    assert "✓" in message
+    assert "Key: ☁ AWS-managed policy  📄 policy file  ✓ verified  ? unverified" in (
+        message
+    )
+
+
+def test_account_list_output_is_unaffected_by_target_and_boundary_table_changes(
+    state_home: Path,
+) -> None:
+    _seed_connected(state_home)
+    standard = _run(["account", "list"])
+    assert standard.message == (
+        f'{{"name": "Prod", "id": "{ACCOUNT_ID}", "partition": "aws"}}'
+    )
+    local_json = _run(["account", "list", "--json"])
+    remote_json = _run(["--json", "account", "list"])
+    assert local_json.message == remote_json.message
+    assert json.loads(local_json.message) == [
+        {"name": "Prod", "id": ACCOUNT_ID, "partition": "aws"}
+    ]
