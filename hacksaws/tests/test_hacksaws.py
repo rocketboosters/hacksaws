@@ -272,6 +272,105 @@ def test_podman_without_ecr_does_not_run_container_commands(
     ecr_login.assert_not_called()
 
 
+def test_historical_mfa_location_command_renews_expired_legacy_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renew the exact historical command through legacy source resolution."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HACKSAWS_HOME", str(tmp_path / "state"))
+    _state.save_config(_state.default_config())
+    aws = home / ".aws-horizon"
+    aws.mkdir()
+    _write_ini(
+        aws / "config",
+        {
+            "profile admin": {
+                "region": "us-west-2",
+                "mfa_serial": MFA_SERIAL,
+            },
+            "profile other": {"region": "us-east-1"},
+        },
+    )
+    _write_ini(
+        aws / "credentials",
+        {
+            "admin": {
+                "aws_access_key_id": "ASIAEXPIRED000000",
+                "aws_secret_access_key": TEMPORARY_SECRET_KEY,
+                "aws_session_token": SESSION_TOKEN,
+            },
+            "other": {
+                "aws_access_key_id": "AKIAOTHEREXAMPLE",
+                "aws_secret_access_key": "other-value",
+            },
+        },
+    )
+    _write_ini(
+        aws / "admin.store.credentials",
+        {
+            "admin": {
+                "aws_access_key_id": STATIC_ACCESS_KEY,
+                "aws_secret_access_key": STATIC_SECRET_KEY,
+            },
+        },
+    )
+    source_sts = MagicMock()
+    source_sts.get_caller_identity.return_value = _identity_response()
+    source_sts.get_session_token.return_value = {
+        "Credentials": _temporary_credentials()
+    }
+    source = _session(region_name="us-west-2", clients={"sts": source_sts})
+    authenticated_sts = MagicMock()
+    authenticated_sts.get_caller_identity.return_value = _identity_response()
+    authenticated = _authenticated_session(clients={"sts": authenticated_sts})
+
+    def session_factory(**values: object) -> MagicMock:
+        access_key = values.get("aws_access_key_id")
+        if access_key == "ASIAEXPIRED000000":
+            pytest.fail("expired installed credentials reached STS")
+        if access_key == STATIC_ACCESS_KEY:
+            return source
+        if access_key == TEMPORARY_ACCESS_KEY:
+            return authenticated
+        pytest.fail(f"unexpected credentials selected: {access_key}")
+
+    with (
+        patch("hacksaws._cli.sys.stdin.isatty", return_value=True),
+        patch("hacksaws._cli.getpass.getpass", return_value="123456") as prompt,
+        patch("hacksaws._sessions.boto3.Session", side_effect=session_factory),
+        patch("hacksaws._sessions._discover_save_accounts", return_value=(None, None)),
+        patch(
+            "hacksaws._sessions._finish_session_save",
+            side_effect=lambda result, **_kwargs: result,
+        ),
+    ):
+        result = hacksaws.console_main(["mfa", "in", "admin", "--name=horizon"])
+
+    assert result.code == "MFA_LOGIN"
+    prompt.assert_called_once_with("MFA token code: ")
+    source_sts.get_caller_identity.assert_called_once_with()
+    source_sts.get_session_token.assert_called_once_with(
+        DurationSeconds=43200,
+        SerialNumber=MFA_SERIAL,
+        TokenCode="123456",
+    )
+    credentials = _read_ini(aws / "credentials")
+    assert credentials["admin"] == {
+        "aws_access_key_id": TEMPORARY_ACCESS_KEY,
+        "aws_secret_access_key": TEMPORARY_SECRET_KEY,
+        "aws_session_token": SESSION_TOKEN,
+    }
+    assert credentials["other"] == {
+        "aws_access_key_id": "AKIAOTHEREXAMPLE",
+        "aws_secret_access_key": "other-value",
+    }
+    assert not (aws / "admin.store.credentials").exists()
+    assert f"{aws.absolute()}::admin" in _state.load_sessions()
+
+
 def test_mfa_without_action_prints_command_help(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -300,7 +399,15 @@ def test_login_exchanges_and_stores_credentials(
     with (
         patch(
             "hacksaws._sessions._persistent_source",
-            return_value=(raw, source_config),
+            return_value=(
+                raw,
+                source_config,
+                None,
+                {
+                    "aws_access_key_id": STATIC_ACCESS_KEY,
+                    "aws_secret_access_key": STATIC_SECRET_KEY,
+                },
+            ),
         ),
         patch(
             "hacksaws._sessions._identity",
@@ -447,7 +554,15 @@ def test_ecr_regions_and_container_commands_are_ordered_and_exact(
         stack,
         patch(
             "hacksaws._sessions._persistent_source",
-            return_value=(raw, source_config),
+            return_value=(
+                raw,
+                source_config,
+                None,
+                {
+                    "aws_access_key_id": STATIC_ACCESS_KEY,
+                    "aws_secret_access_key": STATIC_SECRET_KEY,
+                },
+            ),
         ),
         patch(
             "hacksaws._sessions._identity",

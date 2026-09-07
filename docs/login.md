@@ -39,6 +39,18 @@ source was argument, stdin, or prompt.
 The source credentials should have only bootstrap permissions. See
 [Security model](security-model.md).
 
+For compatibility with MFA sessions created by older Hacksaws releases, login
+uses a valid managed original first, then the matching
+`PROFILE.store.credentials` legacy backup, and finally a live static profile
+when no saved provenance exists. It never treats credentials containing a
+session token as long-lived. A successful in-place renewal migrates the legacy
+backup into managed logout/re-login provenance; a separate `--to` destination
+leaves the source and its legacy backup untouched.
+
+If an expired live MFA session has no usable managed original or matching legacy
+backup, restore that profile's original static credentials or its matching
+legacy backup, then run the same MFA login command again.
+
 ## Roles and session policies
 
 `--role ARN_OR_NAME` assumes a role after authentication. `--policy` optionally

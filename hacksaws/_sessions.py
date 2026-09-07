@@ -469,6 +469,7 @@ def _section_backup(
     profile: str,
     journal: dict[str, Any],
     previous: dict[str, Any] | None,
+    original_override: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     previous_sections = previous.get("section_backup", {}) if previous else {}
@@ -479,7 +480,9 @@ def _section_backup(
         path = destination / filename
         section = _section(profile, config=is_config)
         previous_item = previous_sections.get(kind)
-        if isinstance(previous_item, dict) and isinstance(
+        if original_override and kind in original_override:
+            original = copy.deepcopy(original_override[kind])
+        elif isinstance(previous_item, dict) and isinstance(
             previous_item.get("original"), dict
         ):
             original = copy.deepcopy(previous_item["original"])
@@ -1210,6 +1213,7 @@ def _record(
     previous_override: dict[str, Any] | None = None,
     inherit_runtime_state: bool = True,
     retain_file_backup: bool = True,
+    section_original_override: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     sessions = _state.load_sessions()
     key = f"{destination.absolute()}::{profile}"
@@ -1269,7 +1273,13 @@ def _record(
         "auth_method": method,
         "started_at": _state.iso_now(),
         "backup": original_backup,
-        "section_backup": _section_backup(destination, profile, journal, previous),
+        "section_backup": _section_backup(
+            destination,
+            profile,
+            journal,
+            previous,
+            section_original_override,
+        ),
         "ecr": list(dict.fromkeys([*previous_ecr, *(ecr or [])])),
         "ecr_engine": (
             previous.get("ecr_engine") if previous and not ecr_engine else ecr_engine
@@ -1331,33 +1341,80 @@ def _parser_from_bytes(value: bytes | None, path: Path) -> configparser.ConfigPa
 
 def _persistent_source(
     source_dir: Path, profile: str, *, region_name: str | None = None
-) -> tuple[Any, configparser.ConfigParser]:
-    """Build a session from original persistent credentials, never installed output."""
+) -> tuple[Any, configparser.ConfigParser, Path | None, dict[str, str]]:
+    """Choose managed original, legacy backup, then live static credentials."""
     credentials_path = source_dir / "credentials"
     config_path = source_dir / "config"
-    credentials = _parser_from_bytes(
-        _original_file(credentials_path, profile), credentials_path
-    )
-    config = _parser_from_bytes(_original_file(config_path, profile), config_path)
-    if profile not in credentials:
-        raise _configs.OperationalError(
-            f"Persistent source profile {profile!r} is missing from {credentials_path}."
+    key = f"{source_dir.absolute()}::{profile}"
+    managed = _state.load_sessions().get(key)
+    legacy_path = source_dir / f"{profile}.store.credentials"
+    candidates: list[tuple[str, dict[str, str]]] = []
+    if managed:
+        parser = _parser_from_bytes(
+            _original_file(credentials_path, profile), credentials_path
         )
-    values = credentials[profile]
-    if "aws_access_key_id" not in values or "aws_secret_access_key" not in values:
-        raise _configs.OperationalError(
-            f"Persistent source profile {profile!r} must contain readable access keys "
-            "for transactional MFA re-login."
+        if profile in parser:
+            candidates.append(("managed original", dict(parser[profile].items())))
+    if legacy_path.exists():
+        try:
+            legacy = _legacy_source_backup(source_dir, profile)
+        except _configs.OperationalError:
+            if not candidates:
+                raise
+        else:
+            if legacy:
+                candidates.append(("legacy backup", legacy[1]))
+    if not managed and not legacy_path.exists():
+        live = _read_ini(credentials_path)
+        if profile in live:
+            candidates.append(("live profile", dict(live[profile].items())))
+
+    errors: list[_configs.OperationalError] = []
+    for label, values in candidates:
+        try:
+            _validate_mfa_source_credentials(values, f"{label} for profile {profile!r}")
+        except _configs.OperationalError as error:
+            errors.append(error)
+            continue
+        config = _parser_from_bytes(_original_file(config_path, profile), config_path)
+        section = _section(profile, config=True)
+        region = region_name or config.get(section, "region", fallback=None)
+        return (
+            boto3.Session(
+                aws_access_key_id=values["aws_access_key_id"],
+                aws_secret_access_key=values["aws_secret_access_key"],
+                region_name=region,
+            ),
+            config,
+            legacy_path if legacy_path.exists() else None,
+            values,
         )
-    config_section = _section(profile, config=True)
-    region = region_name or config.get(config_section, "region", fallback=None)
-    source = boto3.Session(
-        aws_access_key_id=values["aws_access_key_id"],
-        aws_secret_access_key=values["aws_secret_access_key"],
-        aws_session_token=values.get("aws_session_token"),
-        region_name=region,
+    if errors:
+        raise errors[-1]
+    raise _configs.OperationalError(
+        f"Persistent source profile {profile!r} is missing. Restore its matching "
+        "legacy credential backup before logging in."
     )
-    return source, config
+
+
+def _validate_mfa_source_credentials(values: dict[str, str], label: str) -> None:
+    """Require complete long-lived keys before any MFA source reaches AWS."""
+    if any(
+        values.get(name, "").strip()
+        for name in ("aws_session_token", "aws_security_token")
+    ):
+        raise _configs.OperationalError(
+            f"Persistent MFA source {label} contains a session token. Log out first, "
+            "or restore its matching legacy credential backup."
+        )
+    if (
+        not values.get("aws_access_key_id", "").strip()
+        or not values.get("aws_secret_access_key", "").strip()
+    ):
+        raise _configs.OperationalError(
+            f"Persistent MFA source {label} does not contain complete, readable access "
+            "keys. Restore its matching legacy credential backup before logging in."
+        )
 
 
 def _mfa_session(
@@ -1412,7 +1469,7 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
         destination_profile=destination_profile,
         region=region.canonical,
     )
-    raw, source_config = _persistent_source(
+    raw, source_config, legacy_path, source_values = _persistent_source(
         source_dir, source_profile, region_name=region.canonical
     )
     source_account, partition, _ = _identity(raw, label="MFA source credentials")
@@ -1436,13 +1493,20 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
         source_account=source_account,
         source_partition=partition,
     )
-    journal = _begin(
-        [
-            destination_dir / "credentials",
-            destination_dir / "config",
-            _state.sessions_path(),
-        ]
+    migrate_legacy = (
+        legacy_path
+        if source_dir.absolute() == destination_dir.absolute()
+        and source_profile == destination_profile
+        else None
     )
+    journal_paths = [
+        destination_dir / "credentials",
+        destination_dir / "config",
+        _state.sessions_path(),
+    ]
+    if migrate_legacy:
+        journal_paths.append(migrate_legacy)
+    journal = _begin(journal_paths)
     ecr_registries = []
     try:
         if args.ecr:
@@ -1512,7 +1576,19 @@ def mfa_login(context: _configs.Context) -> _configs.Result:
             method="mfa",
             ecr=ecr_registries,
             ecr_engine=context.container_engine if ecr_registries else None,
+            section_original_override=(
+                {
+                    "credentials": {
+                        "exists": True,
+                        "values": source_values,
+                    }
+                }
+                if migrate_legacy
+                else None
+            ),
         )
+        if migrate_legacy:
+            migrate_legacy.unlink()
         _commit()
     except Exception:
         _rollback(journal)

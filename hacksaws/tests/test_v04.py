@@ -615,7 +615,18 @@ def test_expanded_mfa_write_failure_restores_existing_destination(
         "SessionToken": "final-token",
     }
     with (
-        patch("hacksaws._sessions._persistent_source", return_value=(raw, MagicMock())),
+        patch(
+            "hacksaws._sessions._persistent_source",
+            return_value=(
+                raw,
+                MagicMock(),
+                None,
+                {
+                    "aws_access_key_id": "ORIGINAL",
+                    "aws_secret_access_key": "original-secret",
+                },
+            ),
+        ),
         patch(
             "hacksaws._sessions._identity",
             return_value=("123456789012", "aws", "arn:aws:iam::123456789012:user/dev"),

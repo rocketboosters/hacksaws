@@ -9,6 +9,7 @@ import os
 import subprocess
 import tomllib
 import zipfile
+from contextlib import ExitStack
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -578,6 +579,283 @@ def test_persistent_source_and_mfa_session_validate_inputs(
         _sessions._mfa_session(source, config, "dev", "000000", 3600)
 
 
+def _fake_mfa_session() -> MagicMock:
+    session = MagicMock(region_name="us-west-2")
+    frozen = session.get_credentials.return_value.get_frozen_credentials.return_value
+    credentials = _credentials()
+    frozen.access_key = credentials["AccessKeyId"]
+    frozen.secret_key = credentials["SecretAccessKey"]
+    frozen.token = credentials["SessionToken"]
+    return session
+
+
+def _write_expired_legacy_mfa_source(aws: Path) -> Path:
+    _write_source(aws)
+    (aws / "credentials").write_text(
+        "[dev]\naws_access_key_id=ASIAEXPIRED\n"
+        "aws_secret_access_key=expired-secret\n"
+        "aws_session_token=expired-token\n[other]\nvalue=preserved\n",
+        encoding="utf-8",
+    )
+    legacy = aws / "dev.store.credentials"
+    legacy.write_text(
+        "[dev]\naws_access_key_id=AKIASTATIC\naws_secret_access_key=static-secret\n",
+        encoding="utf-8",
+    )
+    return legacy
+
+
+def test_mfa_legacy_renewal_migrates_original_for_relogin_and_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    legacy = _write_expired_legacy_mfa_source(aws)
+    credentials = aws / "credentials"
+    key = f"{aws.absolute()}::dev"
+    _state.save_sessions(
+        {
+            key: {
+                "section_backup": {
+                    "credentials": {
+                        "original": {
+                            "exists": True,
+                            "values": {
+                                "aws_access_key_id": "OLD-TEMP",
+                                "aws_secret_access_key": "old-temp-secret",
+                                "aws_session_token": "old-temp-token",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    )
+    with (
+        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch("hacksaws._sessions._mfa_session", return_value=_fake_mfa_session()),
+        patch("hacksaws._sessions.boto3.Session") as factory,
+    ):
+        context = _configs.Context(_args(directory=str(aws), profile="dev"))
+        _sessions.mfa_login(context)
+        assert factory.call_args.kwargs["aws_access_key_id"] == "AKIASTATIC"
+        assert "aws_session_token" not in factory.call_args.kwargs
+        assert not legacy.exists()
+        _sessions.mfa_login(context)
+        assert factory.call_args.kwargs["aws_access_key_id"] == "AKIASTATIC"
+
+    assert _sessions.logout(_configs.Context(_args(directory=str(aws), profile="dev")))
+    restored = _sessions._read_ini(credentials)
+    assert restored["dev"]["aws_access_key_id"] == "AKIASTATIC"
+    assert restored["other"]["value"] == "preserved"
+
+
+def test_mfa_valid_managed_original_wins_and_discards_stale_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    _write_source(aws)
+    legacy = aws / "dev.store.credentials"
+    legacy.write_text("malformed legacy", encoding="utf-8")
+    key = f"{aws.absolute()}::dev"
+    _state.save_sessions(
+        {
+            key: {
+                "section_backup": {
+                    "credentials": {
+                        "original": {
+                            "exists": True,
+                            "values": {
+                                "aws_access_key_id": "MANAGED",
+                                "aws_secret_access_key": "managed-secret",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    )
+    with (
+        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch("hacksaws._sessions._mfa_session", return_value=_fake_mfa_session()),
+        patch("hacksaws._sessions.boto3.Session") as factory,
+    ):
+        _sessions.mfa_login(_configs.Context(_args(directory=str(aws), profile="dev")))
+    assert factory.call_args.kwargs["aws_access_key_id"] == "MANAGED"
+    assert not legacy.exists()
+    original = _state.load_sessions()[key]["section_backup"]["credentials"]["original"]
+    assert original["values"]["aws_access_key_id"] == "MANAGED"
+
+
+@pytest.mark.parametrize(
+    ("legacy_text", "message"),
+    [
+        (
+            (
+                "[dev]\naws_access_key_id=AKIASTATIC\n"
+                "aws_secret_access_key=static-secret\naws_session_token=token\n"
+            ),
+            "session token",
+        ),
+        (
+            (
+                "[dev]\naws_access_key_id=AKIASTATIC\n"
+                "aws_secret_access_key=static-secret\naws_security_token=token\n"
+            ),
+            "session token",
+        ),
+        (
+            "[dev]\naws_access_key_id=\naws_secret_access_key=static-secret\n",
+            "complete, readable access keys",
+        ),
+        ("[dev]\naws_access_key_id=AKIASTATIC\n", "incomplete persistent"),
+        ("malformed legacy", "Unable to parse AWS file"),
+        (None, "session token"),
+    ],
+)
+def test_mfa_rejects_invalid_persistent_sources_before_boto_or_state_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_text: str | None,
+    message: str,
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    _write_source(aws)
+    credentials = aws / "credentials"
+    credentials.write_text(
+        "[dev]\naws_access_key_id=ASIAEXPIRED\n"
+        "aws_secret_access_key=expired-secret\n"
+        "aws_session_token=temp-token\n",
+        encoding="utf-8",
+    )
+    legacy = aws / "dev.store.credentials"
+    if legacy_text is not None:
+        legacy.write_text(legacy_text, encoding="utf-8")
+    _state.save_sessions({"unrelated": {"auth_method": "mfa"}})
+    tracked = [credentials, aws / "config", _state.sessions_path(), legacy]
+    before = {path: path.read_bytes() if path.exists() else None for path in tracked}
+    with (
+        patch("hacksaws._sessions.boto3.Session") as factory,
+        pytest.raises(_configs.OperationalError, match=message),
+    ):
+        _sessions.mfa_login(_configs.Context(_args(directory=str(aws), profile="dev")))
+    factory.assert_not_called()
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in tracked
+    } == before
+
+
+@pytest.mark.parametrize("failure", ["identity", "mfa", "role", "record", "commit"])
+def test_mfa_legacy_renewal_failures_restore_all_transaction_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    _home(tmp_path, monkeypatch)
+    aws = tmp_path / "aws"
+    legacy = _write_expired_legacy_mfa_source(aws)
+    _state.save_sessions({"unrelated": {"auth_method": "mfa"}})
+    tracked = [
+        aws / "credentials",
+        aws / "config",
+        _state.sessions_path(),
+        legacy,
+    ]
+    before = {path: path.read_bytes() for path in tracked}
+    args = _args(
+        directory=str(aws),
+        profile="dev",
+        role=ROLE if failure == "role" else None,
+    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("hacksaws._sessions.boto3.Session", return_value=MagicMock())
+        )
+        identity = stack.enter_context(
+            patch(
+                "hacksaws._sessions._identity",
+                return_value=(ACCOUNT, "aws", f"arn:aws:iam::{ACCOUNT}:user/dev"),
+            )
+        )
+        mfa = stack.enter_context(
+            patch("hacksaws._sessions._mfa_session", return_value=_fake_mfa_session())
+        )
+        stack.enter_context(
+            patch(
+                "hacksaws._sessions._discover_save_accounts", return_value=(None, None)
+            )
+        )
+        if failure == "identity":
+            identity.side_effect = OSError("identity failed")
+        elif failure == "mfa":
+            mfa.side_effect = OSError("mfa failed")
+        elif failure == "role":
+            stack.enter_context(
+                patch("hacksaws._sessions._assume", side_effect=OSError("role failed"))
+            )
+        elif failure == "record":
+            stack.enter_context(
+                patch(
+                    "hacksaws._sessions._record",
+                    side_effect=OSError("record failed"),
+                )
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "hacksaws._sessions._commit",
+                    side_effect=OSError("commit failed after legacy deletion"),
+                )
+            )
+        with pytest.raises(OSError, match="failed"):
+            _sessions.mfa_login(_configs.Context(args))
+
+    assert {path: path.read_bytes() for path in tracked} == before
+    assert not _sessions._journal_path().exists()
+
+
+def test_mfa_separate_destination_preserves_source_and_destination_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    legacy = _write_expired_legacy_mfa_source(source)
+    source_credentials = source / "credentials"
+    destination.mkdir()
+    destination_credentials = destination / "credentials"
+    destination_credentials.write_text(
+        "[out]\naws_access_key_id=DEST\naws_secret_access_key=dest-secret\n",
+        encoding="utf-8",
+    )
+    source_before, legacy_before = source_credentials.read_bytes(), legacy.read_bytes()
+    with (
+        patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
+        patch("hacksaws._sessions._mfa_session", return_value=_fake_mfa_session()),
+    ):
+        _sessions.mfa_login(
+            _configs.Context(
+                _args(
+                    directory=str(source),
+                    profile="dev",
+                    to_directory=str(destination),
+                    to_profile="out",
+                )
+            )
+        )
+    assert source_credentials.read_bytes() == source_before
+    assert legacy.read_bytes() == legacy_before
+    assert _sessions.logout(
+        _configs.Context(_args(directory=str(destination), profile="out"))
+    )
+    assert (
+        _sessions._read_ini(destination_credentials)["out"]["aws_access_key_id"]
+        == "DEST"
+    )
+
+
 def test_mfa_session_and_raw_login_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -604,7 +882,18 @@ def test_mfa_session_and_raw_login_success(
     assert factory.call_args.kwargs["region_name"] == "us-west-2"
 
     with (
-        patch("hacksaws._sessions._persistent_source", return_value=(raw, config)),
+        patch(
+            "hacksaws._sessions._persistent_source",
+            return_value=(
+                raw,
+                config,
+                None,
+                {
+                    "aws_access_key_id": "AKIAORIGINAL",
+                    "aws_secret_access_key": "original-secret",
+                },
+            ),
+        ),
         patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
         patch("hacksaws._sessions._mfa_session", return_value=intermediate),
     ):
@@ -634,7 +923,18 @@ def test_bounded_mfa_login_records_ecr_and_final_tier(
         return [registry]
 
     with (
-        patch("hacksaws._sessions._persistent_source", return_value=(raw, MagicMock())),
+        patch(
+            "hacksaws._sessions._persistent_source",
+            return_value=(
+                raw,
+                MagicMock(),
+                None,
+                {
+                    "aws_access_key_id": "AKIAORIGINAL",
+                    "aws_secret_access_key": "original-secret",
+                },
+            ),
+        ),
         patch("hacksaws._sessions._identity", return_value=(ACCOUNT, "aws", "arn")),
         patch("hacksaws._sessions._mfa_session", return_value=intermediate),
         patch(
