@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.13, <3.15"
 
 [[package]]
@@ -211,7 +211,7 @@ wheels = [
 
 [[package]]
 name = "hacksaws"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "." }
 dependencies = [
     { name = "boto3", extra = ["crt"] },
